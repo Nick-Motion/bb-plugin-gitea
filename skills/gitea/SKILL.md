@@ -43,7 +43,7 @@ Typed RPCs: `listMyPullRequests`, `setAutomation` (`repo`, `number`, and `fix`, 
 
 Sessions and preferences from earlier versions are kept: an earlier babysitter keeps both options on, and an earlier auto-babysit preference sets both defaults.
 
-List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repository, and return at most 200 items total. Comments and reviews have a 500-item cap; files have a 500-item cap and checks a 100-item cap. A full cap is reported as potentially truncated. Display caches hold at most 64 conversations (16 MiB, 15 s fresh, 10 min stale) and 16 file sets (32 MiB, 5 min fresh, 30 min stale); mutations, settings changes, and rejected logins invalidate them. List errors are returned per repository while accessible repositories remain available. `extraRepos` remains usable without a project, but an associated checkout is needed for agent dispatch.
+List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repository, and return at most 200 items total. Comments and reviews have a 500-item cap; files have a 500-item cap and checks a 100-item cap. A full cap is reported as potentially truncated. Display caches hold at most 64 conversations (16 MiB, 15 s fresh, 10 min stale), 16 file sets (32 MiB, 5 min fresh, 30 min stale), and 32 lists of each kind (15 s fresh, 10 min stale) for the panel; mutations, settings changes, and rejected logins invalidate them. The `issues`, `prs`, and `my-prs` commands always reread Gitea. List errors are returned per repository while accessible repositories remain available. `extraRepos` remains usable without a project, but an associated checkout is needed for agent dispatch.
 
 ## Settings
 

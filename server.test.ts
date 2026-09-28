@@ -453,13 +453,9 @@ it("accepts plain HTTP only for loopback instances", async () => {
   const { host, calls } = await start(() => ({ json: [] }), {
     settings: { baseUrl: "http://remote.example" },
   });
-  const result = await listItems(host, { repo: "acme/widgets" });
-  expect(result.errors).toEqual([
-    {
-      repo: "acme/widgets",
-      message: expect.stringContaining("must use HTTPS"),
-    },
-  ]);
+  await expect(listItems(host, { repo: "acme/widgets" })).rejects.toThrow(
+    "must use HTTPS",
+  );
   expect(calls).toEqual([]);
 });
 
@@ -582,12 +578,16 @@ it.each([
     message: "tea returned invalid JSON from Gitea.",
   },
 ])(
-  "reports $name as a safe repository error without tea output",
+  "reports $name as a safe list failure without tea output",
   async ({ reply, message }) => {
     const { host } = await start(() => reply);
-    const result = await listItems(host, { repo: "acme/widgets" });
-    expect(result.errors).toEqual([{ repo: "acme/widgets", message }]);
-    expect(JSON.stringify(result)).not.toContain("hunter2");
+    const failure = await listItems(host, { repo: "acme/widgets" }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toEqual(message);
+    expect((failure as Error).message).not.toContain("hunter2");
   },
 );
 
@@ -1081,6 +1081,149 @@ it("keys cached content by account and clears it when settings change or Gitea r
   expect(displaySignals(host)).toHaveLength(announced);
 });
 
+async function myPulls(host: Host, input: Record<string, unknown> = {}) {
+  return giteaRpcContract.listMyPullRequests.output.parse(
+    await host.harness.behavior.callRpc("listMyPullRequests", {
+      state: "open",
+      query: "",
+      ...input,
+    }),
+  );
+}
+
+function listGitea(pulls: () => TeaReply) {
+  return ({ endpoint }: TeaCall): TeaReply => {
+    const path = endpoint.split("?")[0]!;
+    if (path === "/api/v1/user") return { json: { login: "dev" } };
+    if (path.endsWith("/issues") && page(endpoint) === 1) return pulls();
+    return { json: [] };
+  };
+}
+
+const readsList = (call: TeaCall) => call.endpoint.includes("type=pulls");
+
+function authoredPull(number: number, title: string, author = "dev") {
+  return {
+    ...issue(number, title),
+    user: { login: author },
+    pull_request: { merged: false },
+  };
+}
+
+it("serves a remembered pull request list without Gitea reads and refreshes a stale one once in the background", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  cleanups.push(() => {
+    vi.useRealTimers();
+  });
+  let title = "First";
+  let failing = false;
+  const { host, calls } = await start(
+    listGitea(() =>
+      failing
+        ? { status: 502 }
+        : {
+            json: [authoredPull(4, title), authoredPull(5, "Theirs", "ana")],
+          },
+    ),
+  );
+  const cold = await myPulls(host);
+  expect(cold.items.map((item) => item.title)).toEqual(["First"]);
+  expect(cold.freshness.state).toBe("fresh");
+  const warm = calls.length;
+  const narrowed = await myPulls(host, { query: "nothing matches" });
+  expect(narrowed.items).toEqual([]);
+  expect(narrowed.account).toBe(cold.account);
+  expect(calls).toHaveLength(warm);
+
+  title = "Second";
+  vi.setSystemTime(Date.now() + 20_000);
+  const stale = await Promise.all([myPulls(host), myPulls(host)]);
+  expect(stale.map((list) => [list.freshness.state, list.items[0]?.title]))
+    .toEqual([
+      ["refreshing", "First"],
+      ["refreshing", "First"],
+    ]);
+  await vi.waitFor(() =>
+    expect(displaySignals(host).at(-1)?.payload).toEqual({ item: "lists" }),
+  );
+  expect(calls.slice(warm).filter(readsList)).toHaveLength(1);
+  expect(await myPulls(host)).toMatchObject({
+    freshness: { state: "fresh" },
+    items: [{ title: "Second" }],
+  });
+
+  failing = true;
+  vi.setSystemTime(Date.now() + 20_000);
+  expect((await myPulls(host)).freshness.state).toBe("refreshing");
+  await vi.waitFor(() => expect(displaySignals(host)).toHaveLength(2));
+  expect(await myPulls(host)).toMatchObject({
+    freshness: {
+      state: "stale-error",
+      error: "Gitea API returned HTTP 502.",
+    },
+    items: [{ title: "Second" }],
+  });
+  const settled = calls.length;
+  await myPulls(host);
+  expect(calls).toHaveLength(settled);
+});
+
+it("rereads pull request lists after Refresh, list-changing mutations, account changes, and a rejected login", async () => {
+  let rejected = false;
+  const { host, calls } = await start(
+    ({ endpoint, method }) => {
+      if (rejected) return { status: 401 };
+      if (method !== "GET") return { json: {} };
+      return listGitea(() => ({ json: [authoredPull(4, "Mine")] }))({
+        endpoint,
+      } as TeaCall);
+    },
+    {
+      profiles: [
+        ...defaultProfiles,
+        { name: "ops", url: "https://gitea.example/prefix", user: "ops" },
+      ],
+      settings: { teaProfile: "work" },
+    },
+  );
+  const listReads = () => calls.filter(readsList).length;
+  const first = await myPulls(host);
+  await myPulls(host, { refresh: true });
+  expect(listReads()).toBe(2);
+
+  await host.harness.behavior.callRpc("comment", {
+    repo: "acme/widgets",
+    number: 4,
+    body: "noted",
+  });
+  await myPulls(host);
+  expect(listReads()).toBe(2);
+  await host.harness.behavior.callRpc("setState", {
+    repo: "acme/widgets",
+    number: 4,
+    state: "closed",
+  });
+  expect(displaySignals(host).at(-1)?.payload).toEqual({ item: "lists" });
+  await myPulls(host);
+  expect(listReads()).toBe(3);
+
+  await host.harness.behavior.setSettings({ teaProfile: "ops" });
+  const other = await myPulls(host);
+  expect(other.account).not.toBe(first.account);
+  expect(calls.filter(readsList).at(-1)?.login).toBe("ops");
+  await expect(status(host)).resolves.toMatchObject({
+    ready: true,
+    account: other.account,
+  });
+
+  rejected = true;
+  await expect(status(host)).resolves.toMatchObject({
+    ready: false,
+    account: null,
+  });
+  await expect(myPulls(host)).rejects.toThrow("Gitea rejected tea login");
+});
+
 it("reports a revision change instead of binding old diffs to the conversation", async () => {
   const moved = "c".repeat(40);
   let head = headSha;
@@ -1463,6 +1606,22 @@ it("decides babysitter lifecycle from live Gitea state rather than cached displa
     "the pull request is merged",
   );
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+});
+
+it("starts automatic babysitters from a live pull request list rather than the remembered display list", async () => {
+  const { host, settle } = await startBabysitters();
+  const shown = await myPulls(host);
+  expect(shown.items.map((item) => item.number).sort()).toEqual([42, 44, 7]);
+  settle("acme/widgets#44", false);
+  expect((await myPulls(host)).items.map((item) => item.number)).toContain(
+    44,
+  );
+  await rpc(host, "setAutoAutomation", { fix: true });
+  expect(
+    host.harness.sdk
+      .callsTo("threads.spawn")
+      .map((call) => (call[0] as { title: string }).title),
+  ).toEqual(["Gitea babysitter: acme/widgets#42: Change 42"]);
 });
 
 it("fails an unconfirmed marker and resumes the retained thread on retry", async () => {

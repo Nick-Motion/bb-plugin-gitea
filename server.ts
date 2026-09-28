@@ -82,6 +82,8 @@ const listOutputSchema = z.object({
   truncated: z.boolean(),
   errors: z.array(z.object({ repo: repositorySchema, message: z.string() })),
 });
+type ListItem = z.infer<typeof itemSchema>;
+type ItemPage = z.infer<typeof listOutputSchema> & { reachable: number };
 const commentSchema = z.object({
   author: z.string(),
   body: z.string(),
@@ -171,6 +173,7 @@ export const giteaRpcContract = defineRpcContract({
       ready: z.boolean(),
       error: z.string().nullable(),
       login: z.string().nullable(),
+      account: z.string().nullable(),
       repos: z.array(
         z.object({ repo: repositorySchema, projectId: z.string().nullable() }),
       ),
@@ -182,8 +185,12 @@ export const giteaRpcContract = defineRpcContract({
       repo: repositorySchema.optional(),
       state: z.enum(["open", "closed", "all"]).default("open"),
       query: z.string().max(200).default(""),
+      refresh: z.boolean().default(false),
     }),
-    output: listOutputSchema,
+    output: listOutputSchema.extend({
+      account: z.string(),
+      freshness: freshnessSchema,
+    }),
   },
   detail: {
     input: z.object({
@@ -287,8 +294,11 @@ export const giteaRpcContract = defineRpcContract({
       repo: repositorySchema.optional(),
       state: z.enum(["open", "closed", "all"]).default("open"),
       query: z.string().max(200).default(""),
+      refresh: z.boolean().default(false),
     }),
     output: listOutputSchema.extend({
+      account: z.string(),
+      freshness: freshnessSchema,
       login: z.string(),
       items: z.array(itemSchema.extend({ babysit: babysitViewSchema })),
       preferences: babysitPreferencesSchema,
@@ -342,6 +352,12 @@ const conversationPolicy: FreshnessPolicy = {
   retainMs: 10 * 60_000,
   retryMs: 30_000,
 };
+const listPolicy: FreshnessPolicy = {
+  freshMs: 15_000,
+  retainMs: 10 * 60_000,
+  retryMs: 30_000,
+};
+const listTag = "lists";
 const filesPolicy: FreshnessPolicy = {
   freshMs: 5 * 60_000,
   retainMs: 30 * 60_000,
@@ -398,6 +414,23 @@ function freshnessView(freshness: Display<unknown>["freshness"]) {
   return freshness.state === "stale-error"
     ? { state: freshness.state, fetchedAt, error: freshness.error }
     : { state: freshness.state, fetchedAt };
+}
+
+function pickItems(page: ItemPage, query: string) {
+  const term = query.trim().toLowerCase();
+  return listOutputSchema.parse({
+    items: page.items
+      .filter(
+        (item) =>
+          !term ||
+          `${item.title} ${item.body} ${item.repo} ${item.author}`
+            .toLowerCase()
+            .includes(term),
+      )
+      .slice(0, 200),
+    truncated: page.truncated || page.items.length > 200,
+    errors: page.errors,
+  });
 }
 
 function checkStatus(state: string): Check["status"] {
@@ -573,8 +606,26 @@ export default async function plugin(bb: BbPluginApi) {
     classify: classifyDisplayFailure,
     onBackgroundSettled: publishDisplay,
   });
+  const listBounds = {
+    maxEntries: 32,
+    maxBytes: 32 * mebibyte,
+    maxEntryBytes: 8 * mebibyte,
+  };
+  const itemLists = new DisplayCache<ItemPage>({
+    bounds: listBounds,
+    now: Date.now,
+    classify: classifyDisplayFailure,
+    onBackgroundSettled: publishDisplay,
+  });
+  const myPullLists = new DisplayCache<{ login: string; page: ItemPage }>({
+    bounds: listBounds,
+    now: Date.now,
+    classify: classifyDisplayFailure,
+    onBackgroundSettled: publishDisplay,
+  });
+  const displays = [conversations, pullFiles, itemLists, myPullLists];
   function forgetDisplay() {
-    const removed = [conversations.clear(), pullFiles.clear()];
+    const removed = displays.map((cache) => cache.clear());
     if (removed.includes(true)) publishDisplay(null);
   }
   function forgetDisplayItem(repo: string, number: number) {
@@ -583,15 +634,18 @@ export default async function plugin(bb: BbPluginApi) {
     pullFiles.invalidate(tag);
     publishDisplay(tag);
   }
+  function forgetLists() {
+    itemLists.invalidate(listTag);
+    myPullLists.invalidate(listTag);
+    publishDisplay(listTag);
+  }
   bb.onDispose(() => {
-    conversations.dispose();
-    pullFiles.dispose();
+    for (const cache of displays) cache.dispose();
   });
   settings.onChange((next) => {
     config = next;
     loginLookup = null;
-    conversations.clear();
-    pullFiles.clear();
+    for (const cache of displays) cache.clear();
     publishDisplay(null);
   });
   let teaPath: string | null = null;
@@ -896,7 +950,7 @@ export default async function plugin(bb: BbPluginApi) {
     return { files, raw, truncated: page.truncated };
   }
 
-  async function displayKey(scope: string, repo: string, number: number) {
+  async function displayAccount() {
     const login = await teaLogin().catch((error: unknown) => {
       forgetDisplay();
       throw error;
@@ -905,6 +959,12 @@ export default async function plugin(bb: BbPluginApi) {
       cleanBaseUrl(config.baseUrl).href,
       login.name,
       login.user,
+    ]);
+  }
+
+  async function displayKey(scope: string, repo: string, number: number) {
+    return JSON.stringify([
+      await displayAccount(),
       scope,
       repo.toLowerCase(),
       number,
@@ -1134,13 +1194,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return { values, truncated: true };
   }
-  async function listItems(
+  async function fetchItems(
     kind: "issue" | "pr",
     repo: string | undefined,
     state: "open" | "closed" | "all",
-    query: string,
     signal?: AbortSignal,
-  ) {
+  ): Promise<ItemPage> {
     const discovered = repo ? [{ repo, projectId: null }] : await repos();
     const candidates = discovered.slice(0, maxListRepositories);
     const settled = await Promise.allSettled(
@@ -1152,7 +1211,7 @@ export default async function plugin(bb: BbPluginApi) {
         return { repo: name, page: await paginated(endpointPath, signal) };
       }),
     );
-    const result: Array<z.infer<typeof itemSchema>> = [];
+    const result: ListItem[] = [];
     const errors: Array<{ repo: string; message: string }> = [];
     let truncated = discovered.length > candidates.length;
     for (let index = 0; index < settled.length; index += 1) {
@@ -1181,20 +1240,59 @@ export default async function plugin(bb: BbPluginApi) {
           ),
       );
     }
-    const term = query.trim().toLowerCase();
-    return listOutputSchema.parse({
-      items: result
-        .filter(
-          (item) =>
-            !term ||
-            `${item.title} ${item.body} ${item.repo} ${item.author}`
-              .toLowerCase()
-              .includes(term),
-        )
-        .slice(0, 200),
-      truncated: truncated || result.length > 200,
+    return {
+      items: result,
+      truncated,
       errors,
+      reachable: candidates.length - errors.length,
+    };
+  }
+  async function listItems(
+    kind: "issue" | "pr",
+    repo: string | undefined,
+    state: "open" | "closed" | "all",
+    query: string,
+    signal?: AbortSignal,
+  ) {
+    return pickItems(await fetchItems(kind, repo, state, signal), query);
+  }
+  async function readItemPage(
+    kind: "issue" | "pr",
+    repo: string | undefined,
+    state: "open" | "closed" | "all",
+    signal: AbortSignal,
+  ): Promise<ItemPage> {
+    const page = await fetchItems(kind, repo, state, signal);
+    if (page.reachable === 0 && page.errors.length > 0)
+      throw new Error(page.errors[0]!.message);
+    return page;
+  }
+  async function readList<T>(
+    cache: DisplayCache<T>,
+    scope: string,
+    repo: string | undefined,
+    state: "open" | "closed" | "all",
+    refresh: boolean,
+    load: (signal: AbortSignal) => Promise<T>,
+    signal: AbortSignal | undefined,
+  ) {
+    if (refresh) cache.invalidate(listTag);
+    const account = await displayAccount();
+    const key = JSON.stringify([
+      account,
+      scope,
+      repo?.toLowerCase() ?? null,
+      state,
+    ]);
+    const display = await cache.read(key, listTag, load, {
+      policy: listPolicy,
+      signal,
     });
+    return {
+      value: display.value,
+      account,
+      freshness: freshnessView(display.freshness),
+    };
   }
   const babysitPrefix = "babysit:";
   const babysitIntervalMs = 5 * 60_000;
@@ -1826,6 +1924,7 @@ export default async function plugin(bb: BbPluginApi) {
           ready: true,
           error: null,
           login: text(user.login) || null,
+          account: await displayAccount(),
           repos: discovered,
         };
       } catch (error) {
@@ -1836,14 +1935,30 @@ export default async function plugin(bb: BbPluginApi) {
               ? error.message
               : "Could not authenticate to Gitea.",
           login: null,
+          account: null,
           repos: discovered,
         };
       }
     },
     listItems: async (
-      { kind, repo, state, query },
+      { kind, repo, state, query, refresh },
       { experimental_signal: signal }: RpcContext = {},
-    ) => await listItems(kind, repo, state, query, signal),
+    ) => {
+      const list = await readList(
+        itemLists,
+        kind,
+        repo,
+        state,
+        refresh,
+        (loadSignal) => readItemPage(kind, repo, state, loadSignal),
+        signal,
+      );
+      return {
+        ...pickItems(list.value, query),
+        account: list.account,
+        freshness: list.freshness,
+      };
+    },
     detail: async (
       { repo, number, kind },
       { experimental_signal: signal }: RpcContext = {},
@@ -1958,17 +2073,15 @@ export default async function plugin(bb: BbPluginApi) {
     createIssue: async (
       { repo, title, body },
       { experimental_signal: signal }: RpcContext = {},
-    ) =>
-      mapItem(
-        repo,
-        await api(repoPath(repo, "issues"), {
-          method: "POST",
-          body: { title, body },
-          signal,
-        }),
-        "issue",
-        cleanBaseUrl(config.baseUrl),
-      ),
+    ) => {
+      const created = await api(repoPath(repo, "issues"), {
+        method: "POST",
+        body: { title, body },
+        signal,
+      });
+      forgetLists();
+      return mapItem(repo, created, "issue", cleanBaseUrl(config.baseUrl));
+    },
     comment: async (
       { repo, number, body },
       { experimental_signal: signal }: RpcContext = {},
@@ -1996,6 +2109,7 @@ export default async function plugin(bb: BbPluginApi) {
         });
       } finally {
         forgetDisplayItem(repo, number);
+        forgetLists();
       }
       return { ok: true as const };
     },
@@ -2018,6 +2132,7 @@ export default async function plugin(bb: BbPluginApi) {
         ]);
       } finally {
         forgetDisplayItem(repo, number);
+        forgetLists();
       }
       return { ok: true as const };
     },
@@ -2102,20 +2217,39 @@ export default async function plugin(bb: BbPluginApi) {
       (await bb.storage.kv.get(`thread-link:${threadId}`)) ?? null,
     refresh: async () => ({ repos: (await repos()).length, items: 0 }),
     listMyPullRequests: async (
-      { repo, state, query },
+      { repo, state, query, refresh },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      const [login, tracked, list, preferences] = await Promise.all([
-        currentLogin(signal),
+      const [mine, tracked, preferences] = await Promise.all([
+        readList(
+          myPullLists,
+          "my-prs",
+          repo,
+          state,
+          refresh,
+          async (loadSignal) => {
+            const [login, page] = await Promise.all([
+              currentLogin(loadSignal),
+              readItemPage("pr", repo, state, loadSignal),
+            ]);
+            return {
+              login,
+              page: {
+                ...page,
+                items: page.items.filter((item) => item.author === login),
+              },
+            };
+          },
+          signal,
+        ),
         repos(),
-        listItems("pr", repo, state, query, signal),
         getPreferences(),
       ]);
+      const { login, page } = mine.value;
+      const list = pickItems(page, query);
       const projects = trackedProjects(tracked);
       const items = await Promise.all(
-        list.items
-          .filter((item) => item.author === login)
-          .map(async (item) => ({
+        list.items.map(async (item) => ({
             ...item,
             babysit: babysitView(
               await getSession(item.repo, item.number),
@@ -2128,7 +2262,14 @@ export default async function plugin(bb: BbPluginApi) {
             ),
           })),
       );
-      return { ...list, login, items, preferences };
+      return {
+        ...list,
+        account: mine.account,
+        freshness: mine.freshness,
+        login,
+        items,
+        preferences,
+      };
     },
     setAutomation: ({ repo, number, fix, merge }) =>
       setAutomation(repo, number, { fix, merge }),
@@ -2397,6 +2538,7 @@ export default async function plugin(bb: BbPluginApi) {
             ...(values[0] ? { repo: values[0] } : {}),
             state,
             query,
+            refresh: true,
           });
           const value = await handlers.listItems(input);
           return succeed(
@@ -2542,6 +2684,7 @@ export default async function plugin(bb: BbPluginApi) {
             ...(values[0] ? { repo: values[0] } : {}),
             state,
             query,
+            refresh: true,
           });
           const value = await handlers.listMyPullRequests(input);
           return succeed(

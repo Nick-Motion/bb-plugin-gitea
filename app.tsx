@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type ReactNode,
 } from "react";
@@ -12,13 +13,15 @@ import {
   experimental_ProviderModelPicker as ProviderModelPicker,
   useBbNavigate,
   useRealtime,
+  useRealtimeConnectionState,
   useRpc,
+  useSettings,
   UrlLink,
   type ExperimentalProviderModelPickerValue,
   type PluginNavPanelProps,
   type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
-import type { PluginRpcResult } from "@get-bb/plugin-sdk/app";
+import type { PluginRpcClient, PluginRpcResult } from "@get-bb/plugin-sdk/app";
 import type { giteaRpcContract } from "./server.js";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -72,6 +75,250 @@ type BabysitSessions = PluginRpcResult<
 >["sessions"];
 type View = "my-prs" | "babysitters" | "issues" | "pulls";
 type DetailSection = "conversation" | "files";
+type Status = PluginRpcResult<(typeof giteaRpcContract)["status"]>;
+type ItemState = "open" | "closed" | "all";
+type ListFilters = {
+  view: View;
+  state: ItemState;
+  repo: string;
+  query: string;
+};
+type ItemList = {
+  account: string;
+  items: Item[];
+  babysits: Map<string, BabysitView>;
+  truncated: boolean;
+  errors: Array<{ repo: string; message: string }>;
+  freshness: Freshness;
+};
+
+type Scope = { state: "unverified" } | { state: "verified"; account: string };
+type DisplayMemory = {
+  epoch: number;
+  scope: Scope;
+  settings: string | null;
+  knownSettings: string | null;
+  status: Status | null;
+  lists: ReadonlyMap<string, ItemList>;
+};
+type ScopeEvent =
+  | { type: "revoke" }
+  | { type: "doubt" }
+  | { type: "settings"; key: string | null }
+  | { type: "status"; epoch: number; status: Status }
+  | { type: "list"; epoch: number; key: string; list: ItemList }
+  | { type: "list-failed"; epoch: number; key: string };
+
+const rememberedLists = 16;
+const unverified = { state: "unverified" } as const;
+
+function holdsPrivate(memory: DisplayMemory) {
+  return (
+    memory.scope.state === "verified" ||
+    memory.lists.size > 0 ||
+    memory.status?.ready === true
+  );
+}
+
+function revoke(memory: DisplayMemory, status: Status | null = null) {
+  return holdsPrivate(memory)
+    ? {
+        ...memory,
+        epoch: memory.epoch + 1,
+        scope: unverified,
+        status,
+        lists: new Map<string, ItemList>(),
+      }
+    : { ...memory, status };
+}
+
+function invalidate(memory: DisplayMemory) {
+  return {
+    ...memory,
+    epoch: memory.epoch + 1,
+    scope: unverified,
+    status: null,
+    lists: new Map<string, ItemList>(),
+  };
+}
+
+function doubt(memory: DisplayMemory): DisplayMemory {
+  return holdsPrivate(memory)
+    ? { ...memory, epoch: memory.epoch + 1, scope: unverified }
+    : memory;
+}
+
+function trust(memory: DisplayMemory, account: string): DisplayMemory {
+  const base =
+    memory.scope.state === "verified" && memory.scope.account !== account
+      ? revoke(memory)
+      : memory;
+  return {
+    ...base,
+    scope: { state: "verified", account },
+    status: base.status?.account === account ? base.status : null,
+    lists: new Map(
+      [...base.lists].filter(([, list]) => list.account === account),
+    ),
+  };
+}
+
+function nextMemory(memory: DisplayMemory, event: ScopeEvent): DisplayMemory {
+  switch (event.type) {
+    case "revoke":
+      return invalidate(memory);
+    case "doubt":
+      return doubt(memory);
+    case "settings": {
+      if (event.key === memory.settings) return memory;
+      const changed =
+        event.key !== null &&
+        memory.knownSettings !== null &&
+        event.key !== memory.knownSettings;
+      return {
+        ...(changed ? invalidate(memory) : doubt(memory)),
+        settings: event.key,
+        knownSettings: event.key ?? memory.knownSettings,
+      };
+    }
+    case "status": {
+      if (event.epoch !== memory.epoch) return memory;
+      const { status } = event;
+      return status.ready && status.account !== null
+        ? { ...trust(memory, status.account), status }
+        : revoke(memory, status);
+    }
+    case "list": {
+      if (event.epoch !== memory.epoch) return memory;
+      const trusted = trust(memory, event.list.account);
+      const lists = new Map(trusted.lists);
+      lists.delete(event.key);
+      lists.set(event.key, event.list);
+      for (const oldest of lists.keys()) {
+        if (lists.size <= rememberedLists) break;
+        lists.delete(oldest);
+      }
+      return { ...trusted, lists };
+    }
+    case "list-failed": {
+      if (event.epoch !== memory.epoch || !memory.lists.has(event.key))
+        return memory;
+      const lists = new Map(memory.lists);
+      lists.delete(event.key);
+      return { ...memory, lists };
+    }
+  }
+}
+
+function trustedAccount(memory: DisplayMemory, settings: string | null) {
+  return memory.scope.state === "verified" && settings === memory.settings
+    ? memory.scope.account
+    : null;
+}
+
+function trustedList(
+  memory: DisplayMemory,
+  settings: string | null,
+  key: string,
+) {
+  const list = memory.lists.get(key);
+  return list && list.account === trustedAccount(memory, settings)
+    ? list
+    : undefined;
+}
+
+function trustedStatus(memory: DisplayMemory, settings: string | null) {
+  const { status } = memory;
+  if (!status) return undefined;
+  return !status.ready || status.account === trustedAccount(memory, settings)
+    ? status
+    : undefined;
+}
+
+let displayMemory: DisplayMemory = {
+  epoch: 0,
+  scope: unverified,
+  settings: null,
+  knownSettings: null,
+  status: null,
+  lists: new Map(),
+};
+const memoryListeners = new Set<() => void>();
+let scopeWatchers = 0;
+const panelMemory: { filters: ListFilters; preferences: Preferences | null } = {
+  filters: { view: "my-prs", state: "open", repo: "all", query: "" },
+  preferences: null,
+};
+
+function dispatch(event: ScopeEvent) {
+  const next = nextMemory(displayMemory, event);
+  if (next === displayMemory) return;
+  displayMemory = next;
+  for (const listener of memoryListeners) listener();
+}
+
+function subscribeMemory(listener: () => void) {
+  memoryListeners.add(listener);
+  return () => {
+    memoryListeners.delete(listener);
+  };
+}
+
+function useDisplayMemory() {
+  return useSyncExternalStore(subscribeMemory, () => displayMemory);
+}
+
+async function verifyScope(rpc: PluginRpcClient<typeof giteaRpcContract>) {
+  const { epoch } = displayMemory;
+  dispatch({ type: "status", epoch, status: await rpc.call("status", null) });
+}
+
+function settingsKey(
+  values: Record<string, string | number | boolean> | undefined,
+) {
+  return values === undefined
+    ? null
+    : JSON.stringify(
+        Object.entries(values).sort(([left], [right]) =>
+          left.localeCompare(right),
+        ),
+      );
+}
+
+function useScopeWatch() {
+  const settings = settingsKey(useSettings().values);
+  const connection = useRealtimeConnectionState();
+  const seenConnection = useRef(connection);
+  useEffect(() => {
+    scopeWatchers += 1;
+    return () => {
+      scopeWatchers -= 1;
+      if (scopeWatchers === 0) dispatch({ type: "doubt" });
+    };
+  }, []);
+  useEffect(() => dispatch({ type: "settings", key: settings }), [settings]);
+  useEffect(() => {
+    if (seenConnection.current === connection) return;
+    seenConnection.current = connection;
+    dispatch({ type: "doubt" });
+  }, [connection]);
+  const onChange = useCallback((payload: unknown) => {
+    if (changedItem(payload) === null) dispatch({ type: "revoke" });
+  }, []);
+  useRealtime("display-changed", onChange);
+  return settings;
+}
+
+function DisplayScopeWatch() {
+  useScopeWatch();
+  return null;
+}
+
+function listKey({ view, state, repo, query }: ListFilters) {
+  return view === "babysitters"
+    ? null
+    : JSON.stringify([view, repo, state, query]);
+}
 
 function useIsDarkTheme() {
   const [dark, setDark] = useState(() =>
@@ -238,6 +485,104 @@ function errorText(error: unknown, fallback: string) {
 
 const loading = { state: "loading" } as const;
 
+async function readItemList(
+  rpc: PluginRpcClient<typeof giteaRpcContract>,
+  { view, state, repo, query }: ListFilters,
+  refresh: boolean,
+): Promise<ItemList> {
+  const input = { state, query, refresh, ...(repo === "all" ? {} : { repo }) };
+  if (view === "my-prs") {
+    const { account, items, truncated, errors, freshness } = await rpc.call(
+      "listMyPullRequests",
+      input,
+    );
+    return {
+      account,
+      items,
+      babysits: new Map(
+        items.map((item) => [itemKey(item), item.babysit] as const),
+      ),
+      truncated,
+      errors,
+      freshness,
+    };
+  }
+  const { account, items, truncated, errors, freshness } = await rpc.call(
+    "listItems",
+    { kind: view === "issues" ? "issue" : "pr", ...input },
+  );
+  return { account, items, babysits: new Map(), truncated, errors, freshness };
+}
+
+function useItemList(
+  filters: ListFilters,
+  memory: DisplayMemory,
+  settings: string | null,
+  onFailure: () => void,
+) {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const key = listKey(filters);
+  const { view, state, repo, query } = filters;
+  const { epoch } = memory;
+  const [failure, setFailure] = useState<{
+    key: string;
+    epoch: number;
+    message: string;
+  } | null>(null);
+  const [pending, setPending] = useState<string | null>(null);
+  const run = useRef(0);
+  const load = useCallback(
+    async (refresh: boolean) => {
+      if (key === null) return;
+      const current = ++run.current;
+      const started = displayMemory.epoch;
+      setPending(key);
+      try {
+        const list = await readItemList(
+          rpc,
+          { view, state, repo, query },
+          refresh,
+        );
+        if (current !== run.current) return;
+        dispatch({ type: "list", epoch: started, key, list });
+        setFailure(null);
+      } catch (error) {
+        if (current !== run.current) return;
+        dispatch({ type: "list-failed", epoch: started, key });
+        setFailure({
+          key,
+          epoch: started,
+          message: errorText(error, "Could not load Gitea items"),
+        });
+        if (holdsPrivate(displayMemory)) onFailure();
+      }
+      setPending(null);
+    },
+    [key, rpc, view, state, repo, query, epoch, onFailure],
+  );
+  useEffect(() => {
+    void load(false);
+    return () => {
+      run.current += 1;
+    };
+  }, [load]);
+  const onChange = useCallback(
+    (payload: unknown) => {
+      if (changedItem(payload) === "lists") void load(false);
+    },
+    [load],
+  );
+  useRealtime("display-changed", onChange);
+  const remembered =
+    key === null ? undefined : trustedList(memory, settings, key);
+  const list: Loadable<ItemList> = remembered
+    ? { state: "ready", value: remembered }
+    : failure?.key === key && failure.epoch === epoch
+      ? { state: "error", message: failure.message }
+      : loading;
+  return { list, updating: key !== null && pending === key, load };
+}
+
 function useItemDisplay(target: ItemRef | null, wantFiles: boolean) {
   const rpc = useRpc<typeof giteaRpcContract>();
   const key = target ? `${target.kind}:${itemTag(target)}` : null;
@@ -345,7 +690,7 @@ function FreshnessNote({
   onRefresh,
 }: {
   freshness: Freshness;
-  onRefresh: () => void;
+  onRefresh?: () => void;
 }) {
   const time = new Date(freshness.fetchedAt).toLocaleTimeString();
   return (
@@ -360,14 +705,16 @@ function FreshnessNote({
         : freshness.state === "refreshing"
           ? `Updating · shown from ${time}`
           : `Refresh failed · shown from ${time}`}
-      <Button
-        size="sm"
-        variant="ghost"
-        className="h-7 px-2"
-        onClick={onRefresh}
-      >
-        Refresh
-      </Button>
+      {onRefresh && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 px-2"
+          onClick={onRefresh}
+        >
+          Refresh
+        </Button>
+      )}
     </span>
   );
 }
@@ -787,12 +1134,19 @@ function BabysitPreferencesControl() {
     | { state: "loading" }
     | { state: "ready"; preferences: Preferences }
     | { state: "error"; message: string }
-  >({ state: "loading" });
+  >(() =>
+    panelMemory.preferences
+      ? { state: "ready", preferences: panelMemory.preferences }
+      : { state: "loading" },
+  );
   const [saving, setSaving] = useState(false);
   const load = useCallback(() => {
     void rpc
       .call("getBabysitPreferences", null)
-      .then((preferences) => setLoaded({ state: "ready", preferences }))
+      .then((preferences) => {
+        panelMemory.preferences = preferences;
+        setLoaded({ state: "ready", preferences });
+      })
       .catch((error: unknown) =>
         setLoaded({
           state: "error",
@@ -824,8 +1178,10 @@ function BabysitPreferencesControl() {
       </div>
     );
   const { preferences } = loaded;
-  const setPreferences = (next: Preferences) =>
+  const setPreferences = (next: Preferences) => {
+    panelMemory.preferences = next;
     setLoaded({ state: "ready", preferences: next });
+  };
   const save = async (
     update: () => Promise<Preferences>,
     optimistic: Preferences,
@@ -973,26 +1329,33 @@ function BabysitterSessions() {
 function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
-  const [view, setView] = useState<View>("my-prs");
-  const [state, setState] = useState<"open" | "closed" | "all">("open");
-  const [repo, setRepo] = useState("all");
-  const [query, setQuery] = useState("");
-  const [items, setItems] = useState<Item[]>([]);
-  const [babysits, setBabysits] = useState<Map<string, BabysitView>>(
-    () => new Map(),
+  const [view, setView] = useState(panelMemory.filters.view);
+  const [state, setState] = useState(panelMemory.filters.state);
+  const [repo, setRepo] = useState(panelMemory.filters.repo);
+  const [query, setQuery] = useState(panelMemory.filters.query);
+  useEffect(() => {
+    panelMemory.filters = { view, state, repo, query };
+  }, [view, state, repo, query]);
+  const settings = useScopeWatch();
+  const memory = useDisplayMemory();
+  const status = trustedStatus(memory, settings);
+  const loadStatus = useCallback(async () => {
+    try {
+      await verifyScope(rpc);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Could not connect to Gitea",
+      );
+    }
+  }, [rpc]);
+  const verify = useCallback(() => void loadStatus(), [loadStatus]);
+  const itemList = useItemList(
+    { view, state, repo, query },
+    memory,
+    settings,
+    verify,
   );
-  const [listNotice, setListNotice] = useState<{
-    truncated: boolean;
-    errors: Array<{ repo: string; message: string }>;
-  }>({ truncated: false, errors: [] });
-  const [listError, setListError] = useState<string | null>(null);
-  const [status, setStatus] = useState<{
-    ready: boolean;
-    error: string | null;
-    login: string | null;
-    repos: Array<{ repo: string; projectId: string | null }>;
-  }>();
-  const [loading, setLoading] = useState(true);
+  const { list, load: loadList } = itemList;
   const [draft, setDraft] = useState("");
   const [newIssue, setNewIssue] = useState(false);
   const [newTitle, setNewTitle] = useState("");
@@ -1018,54 +1381,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     setAssigneesDraft(detail?.assignees.join(", ") ?? "");
   }, [detail]);
 
-  const loadStatus = useCallback(async () => {
-    try {
-      setStatus(await rpc.call("status", null));
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Could not connect to Gitea",
-      );
-    }
-  }, [rpc]);
-  const loadItems = useCallback(async () => {
-    if (view === "babysitters") return;
-    setLoading(true);
-    try {
-      const filters = { state, query, ...(repo === "all" ? {} : { repo }) };
-      const mine =
-        view === "my-prs"
-          ? await rpc.call("listMyPullRequests", filters)
-          : null;
-      const result =
-        mine ??
-        (await rpc.call("listItems", {
-          kind: view === "issues" ? "issue" : "pr",
-          ...filters,
-        }));
-      setItems(result.items);
-      setBabysits(
-        new Map(
-          (mine?.items ?? []).map(
-            (item) => [itemKey(item), item.babysit] as const,
-          ),
-        ),
-      );
-      setListNotice({ truncated: result.truncated, errors: result.errors });
-      setListError(null);
-    } catch (error) {
-      setListError(
-        error instanceof Error ? error.message : "Could not load Gitea items",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [rpc, view, state, query, repo]);
+  const loadItems = useCallback(() => loadList(false), [loadList]);
+  const { epoch } = memory;
   useEffect(() => {
     void loadStatus();
-  }, [loadStatus]);
-  useEffect(() => {
-    void loadItems();
-  }, [loadItems]);
+  }, [loadStatus, epoch]);
   const reloadBabysits = useCallback(() => {
     if (view === "my-prs") void loadItems();
   }, [loadItems, view]);
@@ -1089,9 +1409,8 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     setDetailSection("conversation");
   }, [route, subPath]);
   const refresh = useCallback(async () => {
-    await loadStatus();
-    await loadItems();
-  }, [loadItems, loadStatus]);
+    await Promise.all([loadStatus(), loadList(true)]);
+  }, [loadList, loadStatus]);
   const submitComment = useCallback(async () => {
     if (!detail || !draft.trim()) return;
     try {
@@ -1208,7 +1527,8 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     }
   }, [loadItems, newBody, newTitle, openItem, repo, rpc]);
 
-  const visibleItems = items;
+  const shownList = list.state === "ready" ? list.value : null;
+  const visibleItems = shownList?.items ?? [];
   const count = visibleItems.filter((item) => item.state === "open").length;
   if (newIssue) {
     return (
@@ -1661,21 +1981,22 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               {status?.error ?? "Checking Gitea configuration…"}
             </div>
           )}
-          {(listNotice.truncated || listNotice.errors.length > 0) && (
-            <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              {listNotice.truncated && (
-                <div>
-                  The bounded result window is full; older items may be outside
-                  it.
-                </div>
-              )}
-              {listNotice.errors.map((entry) => (
-                <div key={entry.repo}>
-                  {entry.repo}: {entry.message}
-                </div>
-              ))}
-            </div>
-          )}
+          {shownList &&
+            (shownList.truncated || shownList.errors.length > 0) && (
+              <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                {shownList.truncated && (
+                  <div>
+                    The bounded result window is full; older items may be
+                    outside it.
+                  </div>
+                )}
+                {shownList.errors.map((entry) => (
+                  <div key={entry.repo}>
+                    {entry.repo}: {entry.message}
+                  </div>
+                ))}
+              </div>
+            )}
           {(view === "my-prs" || view === "babysitters") && (
             <BabysitPreferencesControl />
           )}
@@ -1716,22 +2037,41 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   placeholder="Search title, body, repository"
                   className="max-w-sm"
                 />
+                {shownList && (
+                  <span className="ml-auto text-xs text-muted-foreground">
+                    <FreshnessNote
+                      freshness={
+                        itemList.updating
+                          ? {
+                              state: "refreshing",
+                              fetchedAt: shownList.freshness.fetchedAt,
+                            }
+                          : shownList.freshness
+                      }
+                    />
+                  </span>
+                )}
               </div>
               <div className="overflow-hidden rounded-lg border border-border bg-card">
                 <div className="divide-y divide-border">
-                  {loading ? (
-                    Array.from({ length: 6 }, (_, index) => (
-                      <div key={index} className="space-y-2 px-3 py-3">
-                        <Skeleton className="h-4 w-3/4" />
-                        <Skeleton className="h-3 w-1/2" />
-                      </div>
-                    ))
-                  ) : listError ? (
+                  {list.state === "loading" ? (
+                    <div
+                      data-testid="bb-list-loading"
+                      className="divide-y divide-border"
+                    >
+                      {Array.from({ length: 6 }, (_, index) => (
+                        <div key={index} className="space-y-2 px-3 py-3">
+                          <Skeleton className="h-4 w-3/4" />
+                          <Skeleton className="h-3 w-1/2" />
+                        </div>
+                      ))}
+                    </div>
+                  ) : list.state === "error" ? (
                     <div
                       role="alert"
                       className="p-8 text-center text-muted-foreground"
                     >
-                      {listError}
+                      {list.message}
                     </div>
                   ) : visibleItems.length ? (
                     visibleItems.map((item) => (
@@ -1775,12 +2115,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                             ))}
                           </span>
                         </button>
-                        {babysits.has(itemKey(item)) && (
+                        {shownList?.babysits.has(itemKey(item)) && (
                           <span className="px-3 pb-3 sm:p-0">
                             <BabysitControls
                               repo={item.repo}
                               number={item.number}
-                              view={babysits.get(itemKey(item))!}
+                              view={shownList.babysits.get(itemKey(item))!}
                               onChanged={reloadBabysits}
                             />
                           </span>
@@ -1950,5 +2290,9 @@ export default definePluginApp((app) => {
     title: "Gitea issue or PR",
     icon: "GitPullRequest",
     component: GiteaThreadPanel,
+  });
+  app.slots.experimental_appOverlay({
+    id: "display-scope",
+    component: DisplayScopeWatch,
   });
 });
