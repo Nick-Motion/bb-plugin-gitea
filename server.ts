@@ -1463,10 +1463,25 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
 
+  async function withdrawQueued(threadId: string) {
+    const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
+    for (const entry of queued)
+      if (entry.originPluginId === bb.pluginId)
+        await bb.sdk.threads.queuedMessages.delete({
+          threadId,
+          queuedMessageId: entry.id,
+        });
+  }
+
   async function archiveAndStop(
     threadId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const failures: string[] = [];
+    try {
+      await withdrawQueued(threadId);
+    } catch (error) {
+      failures.push(`withdraw: ${message(error)}`);
+    }
     try {
       await bb.sdk.threads.stop({ threadId });
     } catch (error) {
@@ -1679,6 +1694,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (presence.archived || cleanupFirst)
       await bb.sdk.threads.unarchive({ threadId: session.threadId });
+    await withdrawQueued(session.threadId);
     if (!sameSession(session, await getSession(repo, number))) return result;
     await bb.sdk.threads.send({
       threadId: session.threadId,
@@ -1715,8 +1731,9 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(
         `The babysitter for ${repo}#${number} changed while its automation was updated; try again.`,
       );
-    const delivery = await bb.sdk.threads
-      .send({
+    const steer = async () => {
+      await withdrawQueued(session.threadId);
+      return await bb.sdk.threads.send({
         threadId: session.threadId,
         mode: "steer",
         input: [
@@ -1726,24 +1743,15 @@ export default async function plugin(bb: BbPluginApi) {
             mentions: [],
           },
         ],
-      })
-      .catch(async (error: unknown) => {
-        await stopBabysitter(repo, number);
-        throw new Error(
-          `Could not deliver the automation change, so the babysitter was stopped: ${message(error)}`,
-        );
       });
-    if (delivery.delivery === "sent") return;
-    await bb.sdk.threads.queuedMessages
-      .delete({
-        threadId: session.threadId,
-        queuedMessageId: delivery.queuedMessage.id,
-      })
-      .catch((error: unknown) =>
-        bb.log.warn(
-          `Could not withdraw the queued automation change for ${repo}#${number}: ${message(error)}`,
-        ),
+    };
+    const delivery = await steer().catch(async (error: unknown) => {
+      await stopBabysitter(repo, number);
+      throw new Error(
+        `Could not deliver the automation change, so the babysitter was stopped: ${message(error)}`,
       );
+    });
+    if (delivery.delivery === "sent") return;
     await stopBabysitter(repo, number);
     throw new Error(
       `The babysitter for ${repo}#${number} could not take the automation change immediately, so it was stopped; turn Auto-fix or Auto-merge on again to restart it.`,
@@ -1892,9 +1900,15 @@ export default async function plugin(bb: BbPluginApi) {
         if (thread.state === "deleted")
           await forgetDeletedThread(session.threadId);
         else if (session.status === "stopped" && session.cleanupPending)
-          await serialized(session.repo, session.number, () =>
-            stopBabysitter(session.repo, session.number),
-          );
+          await serialized(session.repo, session.number, async () => {
+            const current = await getSession(session.repo, session.number);
+            if (
+              current?.status === "stopped" &&
+              current.cleanupPending &&
+              current.threadId === session.threadId
+            )
+              await finishStop(current);
+          });
         else if (session.status !== "watching") continue;
         else if (thread.archived) await handleArchived(session.threadId);
         else if (thread.status === "idle")

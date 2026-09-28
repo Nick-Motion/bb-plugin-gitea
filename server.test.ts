@@ -1138,11 +1138,12 @@ it("serves a remembered pull request list without Gitea reads and refreshes a st
   title = "Second";
   vi.setSystemTime(Date.now() + 20_000);
   const stale = await Promise.all([myPulls(host), myPulls(host)]);
-  expect(stale.map((list) => [list.freshness.state, list.items[0]?.title]))
-    .toEqual([
-      ["refreshing", "First"],
-      ["refreshing", "First"],
-    ]);
+  expect(
+    stale.map((list) => [list.freshness.state, list.items[0]?.title]),
+  ).toEqual([
+    ["refreshing", "First"],
+    ["refreshing", "First"],
+  ]);
   await vi.waitFor(() =>
     expect(displaySignals(host).at(-1)?.payload).toEqual({ item: "lists" }),
   );
@@ -1272,8 +1273,14 @@ type ThreadState = {
   spawned: number;
   archiveFailures: number;
   getFailure: Error | null;
+  getGate: Promise<void> | null;
   sendGate: Promise<void> | null;
   queueSends: boolean;
+  queued: Map<
+    string,
+    Array<{ id: string; originPluginId: string; text: string }>
+  >;
+  withdrawFailures: number;
   onStop: ((threadId: string) => Promise<void>) | null;
   output: string;
   threads: Map<string, Partial<ReturnType<typeof makeThreadResponse>>>;
@@ -1308,8 +1315,11 @@ async function startBabysitters() {
     spawned: 0,
     archiveFailures: 0,
     getFailure: null,
+    getGate: null,
     sendGate: null,
     queueSends: false,
+    queued: new Map(),
+    withdrawFailures: 0,
     onStop: null,
     output: "",
     threads: new Map(),
@@ -1321,15 +1331,26 @@ async function startBabysitters() {
     state.threads.set(threadId, { ...state.threads.get(threadId), ...patch });
   const threads: FakeSdkOverrides["threads"] = {
     spawn: async () => ({ id: `babysit-${++state.spawned}` }),
-    send: async ({ threadId }) => {
+    send: async ({ threadId, input }) => {
       await state.sendGate;
-      return state.queueSends
-        ? {
-            ok: true,
-            delivery: "queued",
-            queuedMessage: { id: `queued-${threadId}`, threadId },
-          }
-        : { ok: true, delivery: "sent" };
+      if (!state.queueSends) return { ok: true, delivery: "sent" };
+      const entries = state.queued.get(threadId) ?? [];
+      const id = `queued-${threadId}-${entries.length + 1}`;
+      state.queued.set(threadId, [
+        ...entries,
+        {
+          id,
+          originPluginId: "gitea",
+          text: input
+            .flatMap((part) => (part.type === "text" ? [part.text] : []))
+            .join(""),
+        },
+      ]);
+      return {
+        ok: true,
+        delivery: "queued",
+        queuedMessage: { id, threadId },
+      };
     },
     stop: async ({ threadId }) => {
       await state.onStop?.(threadId);
@@ -1348,6 +1369,9 @@ async function startBabysitters() {
       return { ok: true };
     },
     get: async ({ threadId }) => {
+      const gate = state.getGate;
+      state.getGate = null;
+      await gate;
       if (state.getFailure) throw state.getFailure;
       if (state.threads.get(threadId)?.deletedAt)
         throw Object.assign(new Error("HTTP 404: Thread not found"), {
@@ -1360,7 +1384,25 @@ async function startBabysitters() {
       });
     },
     output: async () => ({ output: state.output }),
-    queuedMessages: { delete: async () => ({ ok: true }) },
+    queuedMessages: {
+      list: async ({ threadId }) => [
+        ...(state.queued.get(threadId) ?? []),
+        { id: `user-${threadId}`, originPluginId: null, text: "" },
+      ],
+      delete: async ({ threadId, queuedMessageId }) => {
+        if (state.withdrawFailures > 0) {
+          state.withdrawFailures -= 1;
+          throw new Error("queue unavailable");
+        }
+        state.queued.set(
+          threadId,
+          (state.queued.get(threadId) ?? []).filter(
+            (entry) => entry.id !== queuedMessageId,
+          ),
+        );
+        return { ok: true };
+      },
+    },
   };
   const { host, calls } = await start(
     ({ endpoint }) => {
@@ -1630,9 +1672,7 @@ it("starts automatic babysitters from a live pull request list rather than the r
   const shown = await myPulls(host);
   expect(shown.items.map((item) => item.number).sort()).toEqual([42, 44, 7]);
   settle("acme/widgets#44", false);
-  expect((await myPulls(host)).items.map((item) => item.number)).toContain(
-    44,
-  );
+  expect((await myPulls(host)).items.map((item) => item.number)).toContain(44);
   await rpc(host, "setAutoAutomation", { fix: true });
   expect(
     host.harness.sdk
@@ -2006,12 +2046,87 @@ it("withdraws a queued authority change and stops the babysitter", async () => {
     "could not take the automation change immediately, so it was stopped",
   );
   expect(host.harness.sdk.callsTo("threads.queuedMessages.delete")).toEqual([
-    [{ threadId: "babysit-1", queuedMessageId: "queued-babysit-1" }],
+    [{ threadId: "babysit-1", queuedMessageId: "queued-babysit-1-1" }],
   ]);
+  expect(state.queued.get("babysit-1")).toEqual([]);
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "stopped",
     cleanupPending: false,
     automation: off,
+  });
+});
+
+it("keeps cleanup pending until a queued authority change is withdrawn", async () => {
+  const { host, state } = await startBabysitters();
+  await setAutomation(host, pr42, { fix: true });
+  state.queueSends = true;
+  state.withdrawFailures = 1;
+  await expect(setAutomation(host, pr42, { merge: true })).rejects.toThrow(
+    "Cleanup failed: withdraw: ",
+  );
+  expect(state.queued.get("babysit-1")).toHaveLength(1);
+  await expect(babysitStatus(host)).resolves.toMatchObject({
+    status: "stopped",
+    cleanupPending: true,
+    automation: off,
+  });
+  state.queueSends = false;
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
+    { status: "watching", policy: { fix: true, merge: false } },
+  );
+  expect(state.queued.get("babysit-1")).toEqual([]);
+  expect(
+    host.harness.sdk.callsTo("threads.queuedMessages.delete"),
+  ).toHaveLength(2);
+});
+
+it("withdraws a queued resume before the babysitter runs under other options", async () => {
+  const { host, state } = await startBabysitters();
+  await enable(host, pr42);
+  await idle(host, "Stopped unexpectedly.");
+  state.queueSends = true;
+  await expect(rpc(host, "retryBabysit", pr42)).resolves.toEqual({
+    threadId: "babysit-1",
+  });
+  expect(state.queued.get("babysit-1")?.[0]?.text).toContain("tea pulls merge");
+  await disable(host, pr42);
+  expect(state.queued.get("babysit-1")).toEqual([]);
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
+    { status: "watching", policy: { fix: true, merge: false } },
+  );
+  const pending = state.queued.get("babysit-1") ?? [];
+  expect(pending).toHaveLength(1);
+  expect(pending[0]?.text).not.toContain("tea pulls merge");
+});
+
+it("lets an explicit enable win over background cleanup that read the session earlier", async () => {
+  const { host, state } = await startBabysitters();
+  await enable(host, pr42);
+  state.archiveFailures = 1;
+  await expect(disable(host, pr42)).rejects.toThrow("Cleanup failed");
+  let release!: () => void;
+  state.getGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const reads = host.harness.sdk.callsTo("threads.get").length;
+  const service = host.harness.behavior.runService("babysitters");
+  await vi.waitFor(() =>
+    expect(host.harness.sdk.callsTo("threads.get").length).toBeGreaterThan(
+      reads,
+    ),
+  );
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
+    { status: "watching", policy: { fix: true, merge: false } },
+  );
+  const stops = host.harness.sdk.callsTo("threads.stop").length;
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  service.controller.abort();
+  await service.done;
+  expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(stops);
+  await expect(babysitStatus(host)).resolves.toMatchObject({
+    status: "watching",
+    policy: { fix: true, merge: false },
   });
 });
 
