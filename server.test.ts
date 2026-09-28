@@ -303,7 +303,61 @@ it("paginates pull request comments, files, and reviews and stops on a short pag
   expect(calls.map((call) => call.endpoint)).toContain(
     "/api/v1/repos/acme/widgets/pulls/9/files?limit=50&page=2",
   );
-  expect(calls.some((call) => call.endpoint.includes("page=3"))).toBe(false);
+  expect(
+    calls.some(
+      (call) =>
+        !call.endpoint.includes("/files") && call.endpoint.includes("page=3"),
+    ),
+  ).toBe(false);
+});
+
+it("reads a large pull request's files in concurrent page batches after a full first page", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const { host, calls } = await start(async ({ endpoint }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/issues/9")) return { json: issue(9, "Large change") };
+    if (path.endsWith("/pulls/9"))
+      return {
+        json: {
+          head: { ref: "feature", sha: headSha },
+          base: { ref: "main", sha: baseSha },
+        },
+      };
+    if (!path.endsWith("/files")) return { json: [] };
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    inFlight -= 1;
+    const offset = (page(endpoint) - 1) * 50;
+    return {
+      json: Array.from(
+        { length: Math.max(0, Math.min(50, 420 - offset)) },
+        (_, index) => ({
+          filename: `src/${offset + index}.ts`,
+          status: "modified",
+          additions: 1,
+          deletions: 0,
+          patch: "@@ -1 +1 @@\n-old\n+new",
+        }),
+      ),
+    };
+  });
+  const result = giteaRpcContract.detail.output.parse(
+    await host.harness.behavior.callRpc("detail", {
+      repo: "acme/widgets",
+      number: 9,
+      kind: "pr",
+    }),
+  );
+  expect(result.files.map((file) => file.path)).toEqual(
+    Array.from({ length: 420 }, (_, index) => `src/${index}.ts`),
+  );
+  expect(result.filesTruncated).toBe(false);
+  expect(peak).toBe(4);
+  expect(
+    calls.filter((call) => call.endpoint.includes("/pulls/9/files")).length,
+  ).toBe(9);
 });
 
 it("marks a full bounded issue result window as potentially truncated", async () => {
@@ -1218,6 +1272,25 @@ function rpc(host: Host, method: string, input: unknown = null) {
 }
 
 const pr42 = { repo: "acme/widgets", number: 42 };
+const off = { fix: false, merge: false };
+
+async function setAutomation(
+  host: Host,
+  ref: { repo: string; number: number },
+  patch: { fix?: boolean; merge?: boolean },
+) {
+  return giteaRpcContract.setAutomation.output.parse(
+    await rpc(host, "setAutomation", { ...ref, ...patch }),
+  );
+}
+
+function enable(host: Host, ref: { repo: string; number: number }) {
+  return setAutomation(host, ref, { fix: true, merge: true });
+}
+
+function disable(host: Host, ref: { repo: string; number: number }) {
+  return setAutomation(host, ref, off);
+}
 
 async function babysitStatus(host: Host, ref = pr42) {
   return giteaRpcContract.getBabysitStatus.output.parse(
@@ -1238,7 +1311,7 @@ it("lists authored pull requests and starts one hidden pinned babysitter for con
     await rpc(host, "listMyPullRequests", { state: "open", query: "" }),
   );
   expect(mine.login).toBe("dev");
-  expect(mine.preferences.autoBabysit).toBe(false);
+  expect(mine.preferences).toMatchObject({ autoFix: false, autoMerge: false });
   expect(
     mine.items
       .map((item) => [
@@ -1253,16 +1326,14 @@ it("lists authored pull requests and starts one hidden pinned babysitter for con
     ["ops/api#7", "idle", []],
   ]);
 
-  const starts = await Promise.all([
-    rpc(host, "startBabysit", pr42),
-    rpc(host, "startBabysit", pr42),
+  const starts = await Promise.all([enable(host, pr42), enable(host, pr42)]);
+  expect(starts.map((view) => "threadId" in view && view.threadId)).toEqual([
+    "babysit-1",
+    "babysit-1",
   ]);
-  expect(starts).toEqual([
-    { threadId: "babysit-1" },
-    { threadId: "babysit-1" },
-  ]);
-  await expect(rpc(host, "startBabysit", pr42)).resolves.toEqual({
+  await expect(enable(host, pr42)).resolves.toMatchObject({
     threadId: "babysit-1",
+    automation: { fix: true, merge: true },
   });
   const spawns = host.harness.sdk.callsTo("threads.spawn");
   expect(spawns).toHaveLength(1);
@@ -1285,9 +1356,9 @@ it("lists authored pull requests and starts one hidden pinned babysitter for con
   expect((spawns[0]?.[0] as { prompt: string }).prompt).toContain(
     "tea pulls --login work --repo acme/widgets --comments 42",
   );
-  await expect(
-    rpc(host, "startBabysit", { repo: "ops/api", number: 7 }),
-  ).rejects.toThrow("no BB project has a checkout");
+  await expect(enable(host, { repo: "ops/api", number: 7 })).rejects.toThrow(
+    "no BB project has a checkout",
+  );
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "watching",
     threadId: "babysit-1",
@@ -1320,11 +1391,12 @@ it("keeps automatic babysitting off by default and starts only eligible authored
   };
   const [, enabled] = await Promise.all([
     rpc(host, "setBabysitExecution", sol),
-    rpc(host, "setAutoBabysit", { enabled: true }),
+    rpc(host, "setAutoAutomation", { fix: true }),
   ]);
-  expect(enabled).toEqual({ autoBabysit: true, execution: sol });
+  expect(enabled).toEqual({ autoFix: true, autoMerge: false, execution: sol });
   await expect(rpc(host, "getBabysitPreferences")).resolves.toEqual({
-    autoBabysit: true,
+    autoFix: true,
+    autoMerge: false,
     execution: sol,
   });
   const spawned = host.harness.sdk
@@ -1335,15 +1407,19 @@ it("keeps automatic babysitting off by default and starts only eligible authored
     "Gitea babysitter: acme/widgets#44: Change 44",
   ]);
   expect(spawned.every((call) => call.model === "gpt-5.6-sol")).toBe(true);
-  await rpc(host, "setAutoBabysit", { enabled: false });
-  await rpc(host, "setAutoBabysit", { enabled: true });
+  await expect(babysitStatus(host)).resolves.toMatchObject({
+    policy: { fix: true, merge: false },
+    automation: { fix: true, merge: false },
+  });
+  await rpc(host, "setAutoAutomation", { fix: false });
+  await rpc(host, "setAutoAutomation", { fix: true, merge: true });
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
   expect(calls.every((call) => call.method === "GET")).toBe(true);
 });
 
 it("confirms terminal state with Gitea, cleans up, and refuses to restart a merged pull request", async () => {
   const { host, settle } = await startBabysitters();
-  await rpc(host, "startBabysit", pr42);
+  await enable(host, pr42);
   settle("acme/widgets#42", true);
   await idle(host, "Merged.\nBB_GITEA_BABYSIT: MERGED");
   await expect(babysitStatus(host)).resolves.toMatchObject({
@@ -1359,13 +1435,15 @@ it("confirms terminal state with Gitea, cleans up, and refuses to restart a merg
     method: "notifyBabysitter",
     input: { threadId: "babysit-1", event: "idle" },
   });
-  await expect(rpc(host, "startBabysit", pr42)).rejects.toThrow(
+  await expect(enable(host, pr42)).rejects.toThrow(
     "the pull request is merged",
   );
   await expect(rpc(host, "retryBabysit", pr42)).rejects.toThrow(
     "the pull request is merged",
   );
-  await expect(rpc(host, "stopBabysit", pr42)).resolves.toEqual({ ok: true });
+  await expect(disable(host, pr42)).resolves.toMatchObject({
+    status: "merged",
+  });
   await expect(
     rpc(host, "babysitThread", { threadId: "babysit-1" }),
   ).resolves.toMatchObject({ status: "merged", number: 42 });
@@ -1381,7 +1459,7 @@ it("decides babysitter lifecycle from live Gitea state rather than cached displa
   await expect(
     conversation(host, { number: 42, kind: "pr" }),
   ).resolves.toMatchObject({ conversation: { state: "open" } });
-  await expect(rpc(host, "startBabysit", pr42)).rejects.toThrow(
+  await expect(enable(host, pr42)).rejects.toThrow(
     "the pull request is merged",
   );
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
@@ -1389,7 +1467,7 @@ it("decides babysitter lifecycle from live Gitea state rather than cached displa
 
 it("fails an unconfirmed marker and resumes the retained thread on retry", async () => {
   const { host } = await startBabysitters();
-  await rpc(host, "startBabysit", pr42);
+  await enable(host, pr42);
   await idle(host, "BB_GITEA_BABYSIT: MERGED");
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "failed",
@@ -1398,8 +1476,9 @@ it("fails an unconfirmed marker and resumes the retained thread on retry", async
     cleanupPending: false,
     actions: ["stop", "retry"],
   });
-  await expect(rpc(host, "startBabysit", pr42)).resolves.toEqual({
+  await expect(enable(host, pr42)).resolves.toMatchObject({
     threadId: "babysit-1",
+    status: "failed",
   });
   await expect(rpc(host, "retryBabysit", pr42)).resolves.toEqual({
     threadId: "babysit-1",
@@ -1437,7 +1516,7 @@ it("fails an unconfirmed marker and resumes the retained thread on retry", async
 
 it("reports cleanup failures and cleans up before resuming or stopping", async () => {
   const { host, state } = await startBabysitters();
-  await rpc(host, "startBabysit", pr42);
+  await enable(host, pr42);
   state.archiveFailures = 1;
   await idle(host, "Stopped unexpectedly.");
   const failed = await babysitStatus(host);
@@ -1453,23 +1532,21 @@ it("reports cleanup failures and cleans up before resuming or stopping", async (
   });
 
   state.archiveFailures = 1;
-  await expect(rpc(host, "stopBabysit", pr42)).rejects.toThrow(
-    "Cleanup failed",
-  );
+  await expect(disable(host, pr42)).rejects.toThrow("Cleanup failed");
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "failed",
     cleanupPending: true,
   });
-  await expect(rpc(host, "stopBabysit", pr42)).resolves.toEqual({ ok: true });
-  await expect(babysitStatus(host)).resolves.toMatchObject({
+  await expect(disable(host, pr42)).resolves.toMatchObject({
     status: "stopped",
     actions: ["retry"],
+    automation: off,
   });
 });
 
-it("keeps a stop that lands while a retry is resuming the thread", async () => {
+it("applies a stop requested while a retry is resuming the thread after the retry", async () => {
   const { host, state } = await startBabysitters();
-  await rpc(host, "startBabysit", pr42);
+  await enable(host, pr42);
   await idle(host, "Stopped unexpectedly.");
   let release!: () => void;
   state.sendGate = new Promise((resolve) => {
@@ -1479,13 +1556,11 @@ it("keeps a stop that lands while a retry is resuming the thread", async () => {
   await vi.waitFor(() =>
     expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1),
   );
-  await rpc(host, "stopBabysit", pr42);
+  const stopping = disable(host, pr42);
   release();
   await expect(retry).resolves.toEqual({ threadId: "babysit-1" });
-  await expect(babysitStatus(host)).resolves.toMatchObject({
-    status: "stopped",
-  });
-  expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(3);
+  await expect(stopping).resolves.toMatchObject({ status: "stopped" });
+  expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(2);
   await idle(host, "late idle");
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "stopped",
@@ -1494,8 +1569,8 @@ it("keeps a stop that lands while a retry is resuming the thread", async () => {
 
 it("retains sessions across a restart and reconciles threads that settled while unloaded", async () => {
   const { host, state, settle } = await startBabysitters();
-  await rpc(host, "startBabysit", pr42);
-  await rpc(host, "startBabysit", { repo: "acme/widgets", number: 44 });
+  await enable(host, pr42);
+  await enable(host, { repo: "acme/widgets", number: 44 });
   settle("acme/widgets#42", false);
   state.output = "BB_GITEA_BABYSIT: CLOSED";
   state.threads.set("babysit-1", { status: "idle" });
@@ -1527,16 +1602,17 @@ it("retains sessions across a restart and reconciles threads that settled while 
 it("reports Gitea API failures without spawning or guessing a terminal state", async () => {
   const { host, gitea } = await startBabysitters();
   gitea.pullFailure = 500;
-  await expect(rpc(host, "startBabysit", pr42)).rejects.toThrow(
+  await expect(enable(host, pr42)).rejects.toThrow(
     "Gitea API returned HTTP 500.",
   );
   await expect(babysitStatus(host)).resolves.toEqual({
     status: "idle",
     actions: [],
+    automation: off,
   });
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
   gitea.pullFailure = null;
-  await rpc(host, "startBabysit", pr42);
+  await enable(host, pr42);
   gitea.pullFailure = 500;
   await idle(host, "BB_GITEA_BABYSIT: CLOSED");
   await expect(babysitStatus(host)).resolves.toMatchObject({
@@ -1546,38 +1622,67 @@ it("reports Gitea API failures without spawning or guessing a terminal state", a
   });
 });
 
-it("exposes babysitter actions through bb gitea commands", async () => {
+it("exposes Auto-fix and Auto-merge through bb gitea commands", async () => {
   const { host } = await startBabysitters();
   const cli = (argv: string[]) => host.harness.behavior.runCli(argv);
-  await expect(cli(["auto-babysit"])).resolves.toMatchObject({
+  await expect(cli(["automation-defaults"])).resolves.toMatchObject({
     exitCode: 0,
-    stdout: expect.stringContaining("Automatic babysitting: off"),
+    stdout: expect.stringContaining(
+      "Turn on Auto-fix for my PRs: off\nTurn on Auto-merge for my PRs: off",
+    ),
   });
   await expect(cli(["my-prs"])).resolves.toMatchObject({
     exitCode: 0,
-    stdout: expect.stringContaining("acme/widgets#42 open babysit:idle"),
-  });
-  await expect(cli(["babysit", "acme/widgets", "42"])).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining("thread babysit-1"),
+    stdout: expect.stringContaining(
+      "acme/widgets#42 open fix:off merge:off babysit:idle",
+    ),
   });
   await expect(
-    cli(["babysit-status", "acme/widgets", "42", "--json"]),
+    cli(["auto-merge", "acme/widgets", "42", "on"]),
   ).resolves.toMatchObject({
     exitCode: 0,
-    stdout: expect.stringContaining('"status":"watching"'),
+    stdout: expect.stringContaining(
+      "acme/widgets#42 watching · Auto-fix off · Auto-merge on thread babysit-1",
+    ),
+  });
+  await expect(
+    cli(["auto-fix", "acme/widgets", "42", "on", "--json"]),
+  ).resolves.toMatchObject({
+    exitCode: 0,
+    stdout: expect.stringContaining('"automation":{"fix":true,"merge":true}'),
   });
   await expect(cli(["babysit-thread", "babysit-1"])).resolves.toMatchObject({
     exitCode: 0,
-    stdout: expect.stringContaining("acme/widgets#42 watching"),
+    stdout: expect.stringContaining(
+      "acme/widgets#42 watching · Auto-fix on · Auto-merge on",
+    ),
   });
   await expect(
-    cli(["babysit-stop", "acme/widgets", "42"]),
-  ).resolves.toMatchObject({ exitCode: 0 });
+    cli(["auto-fix", "acme/widgets", "42", "maybe"]),
+  ).resolves.toMatchObject({ exitCode: 1 });
+  await cli(["auto-fix", "acme/widgets", "42", "off"]);
+  await expect(
+    cli(["auto-merge", "acme/widgets", "42", "off"]),
+  ).resolves.toMatchObject({
+    exitCode: 0,
+    stdout: expect.stringContaining(
+      "acme/widgets#42 stopped · Auto-fix off · Auto-merge off",
+    ),
+  });
   await expect(cli(["babysit-sessions"])).resolves.toMatchObject({
     exitCode: 0,
     stdout: expect.stringContaining("acme/widgets#42 stopped"),
   });
+  await expect(
+    cli(["automation-defaults", "merge", "off"]),
+  ).resolves.toMatchObject({
+    exitCode: 0,
+    stdout: expect.stringContaining("Turn on Auto-merge for my PRs: off"),
+  });
+  await expect(
+    cli(["automation-defaults", "land", "on"]),
+  ).resolves.toMatchObject({ exitCode: 1 });
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
   await expect(
     cli(["babysit-execution", "codex", "gpt-5.6-sol", "medium", "fast"]),
   ).resolves.toMatchObject({
@@ -1594,11 +1699,147 @@ it("exposes babysitter actions through bb gitea commands", async () => {
   });
 });
 
+it("grants each babysitter only the authority its Auto-fix and Auto-merge options give", async () => {
+  const { host } = await startBabysitters();
+  const pr44 = { repo: "acme/widgets", number: 44 };
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
+    { status: "watching", automation: { fix: true, merge: false } },
+  );
+  await expect(
+    setAutomation(host, pr44, { merge: true }),
+  ).resolves.toMatchObject({
+    status: "watching",
+    automation: { fix: false, merge: true },
+  });
+  const prompts = host.harness.sdk
+    .callsTo("threads.spawn")
+    .map((call) => (call[0] as { prompt: string }).prompt);
+  expect(prompts[0]).toContain("You can fix, commit, push");
+  expect(prompts[0]).not.toContain("tea pulls merge");
+  expect(prompts[1]).toContain("tea pulls merge");
+  expect(prompts[1]).toContain("Auto-fix is off. Do not change code");
+
+  await expect(rpc(host, "setAutomation", { ...pr42 })).rejects.toThrow();
+  await expect(
+    rpc(host, "setAutomation", { ...pr42, fix: true, land: true }),
+  ).rejects.toThrow();
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
+});
+
+it("updates a running babysitter's authority in place and stops it when both options are off", async () => {
+  const { host } = await startBabysitters();
+  await enable(host, pr42);
+  await expect(
+    setAutomation(host, pr42, { merge: false }),
+  ).resolves.toMatchObject({
+    status: "watching",
+    threadId: "babysit-1",
+    policy: { fix: true, merge: false },
+  });
+  const sends = host.harness.sdk.callsTo("threads.send");
+  expect(sends).toHaveLength(1);
+  expect(sends[0]?.[0]).toMatchObject({
+    threadId: "babysit-1",
+    mode: "steer",
+    input: [
+      {
+        type: "text",
+        text: expect.stringContaining(
+          "Auto-merge is off. Never merge this pull request",
+        ),
+      },
+    ],
+  });
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
+    { status: "watching" },
+  );
+  expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+  await expect(
+    setAutomation(host, pr42, { fix: false }),
+  ).resolves.toMatchObject({ status: "stopped", automation: off });
+  expect(host.harness.sdk.callsTo("threads.archive")).toHaveLength(1);
+  await expect(
+    setAutomation(host, pr42, { merge: true }),
+  ).resolves.toMatchObject({
+    status: "watching",
+    threadId: "babysit-1",
+    policy: { fix: false, merge: true },
+  });
+  expect(host.harness.sdk.callsTo("threads.send")[1]?.[0]).toMatchObject({
+    mode: "start",
+    input: [
+      { text: expect.stringContaining("Auto-fix is off. Do not change code") },
+    ],
+  });
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+});
+
+it("stops a running babysitter whose authority change cannot be delivered", async () => {
+  const { host, state } = await startBabysitters();
+  await enable(host, pr42);
+  state.sendGate = Promise.reject(new Error("host offline"));
+  state.sendGate.catch(() => undefined);
+  await expect(setAutomation(host, pr42, { merge: false })).rejects.toThrow(
+    "Could not deliver the automation change, so the babysitter was stopped: host offline",
+  );
+  await expect(babysitStatus(host)).resolves.toMatchObject({
+    status: "stopped",
+    automation: off,
+  });
+});
+
+it("reads babysitter data written before Auto-fix and Auto-merge without losing it", async () => {
+  const { host } = await startBabysitters();
+  const execution = {
+    providerId: "claude",
+    model: "claude-sonnet-5",
+    reasoningLevel: "high",
+    serviceTier: "default",
+  };
+  await host.bb.storage.kv.set("babysit-preferences", {
+    autoBabysit: false,
+    execution,
+  });
+  await host.bb.storage.kv.set("babysit:acme/widgets#42", {
+    repo: "acme/widgets",
+    number: 42,
+    threadId: "legacy-1",
+    updatedAt: "2026-09-01T00:00:00Z",
+    status: "needs_you",
+    note: "Need approval.",
+  });
+  await host.bb.storage.kv.set("babysit-thread:legacy-1", pr42);
+  await expect(rpc(host, "getBabysitPreferences")).resolves.toEqual({
+    autoFix: false,
+    autoMerge: false,
+    execution,
+  });
+  await expect(babysitStatus(host)).resolves.toMatchObject({
+    status: "needs_you",
+    threadId: "legacy-1",
+    note: "Need approval.",
+    policy: { fix: true, merge: true },
+    automation: { fix: true, merge: true },
+  });
+  await expect(
+    setAutomation(host, pr42, { merge: false }),
+  ).resolves.toMatchObject({
+    status: "watching",
+    threadId: "legacy-1",
+    policy: { fix: true, merge: false },
+  });
+  const service = host.harness.behavior.runService("babysitters");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  service.controller.abort();
+  await service.done;
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+});
+
 it("replaces a closed babysitter once Gitea reports the pull request reopened", async () => {
   const { host, settle, reopen } = await startBabysitters();
   const pr44 = { repo: "acme/widgets", number: 44 };
-  await rpc(host, "startBabysit", pr42);
-  await rpc(host, "startBabysit", pr44);
+  await enable(host, pr42);
+  await enable(host, pr44);
   settle("acme/widgets#42", false);
   settle("acme/widgets#44", false);
   await idle(host, "BB_GITEA_BABYSIT: CLOSED", "babysit-1");
@@ -1607,7 +1848,7 @@ it("replaces a closed babysitter once Gitea reports the pull request reopened", 
     status: "closed",
     actions: [],
   });
-  await expect(rpc(host, "startBabysit", pr42)).rejects.toThrow(
+  await expect(enable(host, pr42)).rejects.toThrow(
     "the pull request is closed",
   );
   await expect(rpc(host, "retryBabysit", pr42)).rejects.toThrow(
@@ -1643,7 +1884,7 @@ it("replaces a closed babysitter once Gitea reports the pull request reopened", 
     rpc(host, "babysitThread", { threadId: "babysit-1" }),
   ).resolves.toBeNull();
 
-  await rpc(host, "setAutoBabysit", { enabled: true });
+  await rpc(host, "setAutoAutomation", { fix: true, merge: true });
   await expect(babysitStatus(host, pr44)).resolves.toMatchObject({
     status: "watching",
     threadId: "babysit-4",
@@ -1655,7 +1896,7 @@ it("replaces a closed babysitter once Gitea reports the pull request reopened", 
 it("forgets a deleted babysitter thread and spawns a fresh one without touching the dead thread", async () => {
   const { host, state, patchThread } = await startBabysitters();
   const pr44 = { repo: "acme/widgets", number: 44 };
-  await rpc(host, "startBabysit", pr42);
+  await enable(host, pr42);
   patchThread("babysit-1", { deletedAt: 1 });
   await host.harness.behavior.emitThreadEvent("thread.deleted", {
     thread: makeThreadResponse({ id: "babysit-1" }),
@@ -1663,16 +1904,20 @@ it("forgets a deleted babysitter thread and spawns a fresh one without touching 
   await expect(babysitStatus(host)).resolves.toEqual({
     status: "idle",
     actions: ["start"],
+    automation: off,
   });
   await expect(
     rpc(host, "babysitThread", { threadId: "babysit-1" }),
   ).resolves.toBeNull();
-  await expect(rpc(host, "retryBabysit", pr42)).resolves.toEqual({
+  await expect(rpc(host, "retryBabysit", pr42)).rejects.toThrow(
+    "has no babysitter to retry",
+  );
+  await expect(enable(host, pr42)).resolves.toMatchObject({
     threadId: "babysit-2",
   });
 
-  await rpc(host, "startBabysit", pr44);
-  await rpc(host, "stopBabysit", pr44);
+  await enable(host, pr44);
+  await disable(host, pr44);
   patchThread("babysit-3", { deletedAt: 1 });
   state.getFailure = new Error("server restarting");
   await expect(rpc(host, "retryBabysit", pr44)).rejects.toThrow(
@@ -1698,10 +1943,10 @@ it("forgets a deleted babysitter thread and spawns a fresh one without touching 
 it("keeps archived sessions and forgets threads deleted while unloaded only once deletion is confirmed", async () => {
   const { host, state, patchThread } = await startBabysitters();
   const pr44 = { repo: "acme/widgets", number: 44 };
-  await rpc(host, "startBabysit", pr42);
-  await rpc(host, "startBabysit", pr44);
-  await rpc(host, "stopBabysit", pr42);
-  await rpc(host, "stopBabysit", pr44);
+  await enable(host, pr42);
+  await enable(host, pr44);
+  await disable(host, pr42);
+  await disable(host, pr44);
   patchThread("babysit-2", { deletedAt: 1 });
 
   const restarted = await host.harness.lifecycle.reload(plugin);
@@ -1723,6 +1968,7 @@ it("keeps archived sessions and forgets threads deleted while unloaded only once
     expect(babysitStatus(restarted, pr44)).resolves.toEqual({
       status: "idle",
       actions: ["start"],
+      automation: off,
     }),
   );
   service.controller.abort();
@@ -1738,20 +1984,20 @@ it("treats repository spellings that differ only in case as one babysitter", asy
   const { host } = await startBabysitters();
   const upper = { repo: "Acme/Widgets", number: 42 };
   const starts = await Promise.all([
-    rpc(host, "startBabysit", pr42),
-    rpc(host, "startBabysit", upper),
+    enable(host, pr42),
+    enable(host, upper),
     rpc(host, "retryBabysit", { repo: "ACME/widgets", number: 42 }),
   ]);
   expect(starts).toEqual([
-    { threadId: "babysit-1" },
-    { threadId: "babysit-1" },
+    expect.objectContaining({ threadId: "babysit-1" }),
+    expect.objectContaining({ threadId: "babysit-1" }),
     { threadId: "babysit-1" },
   ]);
   await expect(babysitStatus(host, upper)).resolves.toMatchObject({
     status: "watching",
     threadId: "babysit-1",
   });
-  await rpc(host, "setAutoBabysit", { enabled: true });
+  await rpc(host, "setAutoAutomation", { fix: true, merge: true });
   expect(
     host.harness.sdk
       .callsTo("threads.spawn")
@@ -1767,12 +2013,14 @@ it("treats repository spellings that differ only in case as one babysitter", asy
 
 it("commits a manual stop before the stopped thread reports idle", async () => {
   const { host, state } = await startBabysitters();
-  await rpc(host, "startBabysit", pr42);
+  await enable(host, pr42);
   state.onStop = async (threadId) => {
     state.onStop = null;
     await idle(host, "Interrupted without a marker.", threadId);
   };
-  await expect(rpc(host, "stopBabysit", pr42)).resolves.toEqual({ ok: true });
+  await expect(disable(host, pr42)).resolves.toMatchObject({
+    status: "stopped",
+  });
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "stopped",
     actions: ["retry"],

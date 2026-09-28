@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import {
   definePluginApp,
   experimental_ProviderModelPicker as ProviderModelPicker,
@@ -14,7 +22,7 @@ import type { PluginRpcResult } from "@get-bb/plugin-sdk/app";
 import type { giteaRpcContract } from "./server.js";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Select,
   SelectContent,
@@ -31,7 +39,14 @@ import {
   type FileDiffMetadata,
   type FileDiffOptions,
 } from "@pierre/diffs";
-import { FileDiff as PierreFileDiff } from "@pierre/diffs/react";
+import { FileDiff as PierreFileDiff, Virtualizer } from "@pierre/diffs/react";
+import { FileTree, useFileTree } from "@pierre/trees/react";
+import {
+  changeTotals,
+  changedFilesTree,
+  fileCounts,
+  fileLabel,
+} from "./pull-files-view.js";
 
 type Item = PluginRpcResult<
   (typeof giteaRpcContract)["listItems"]
@@ -357,16 +372,61 @@ function FreshnessNote({
   );
 }
 
-function FilesList({
+const PULL_FILE_TREE_STYLE = {
+  "--trees-accent-override": "var(--ring)",
+  "--trees-bg-muted-override":
+    "color-mix(in oklab, var(--muted) 45%, transparent)",
+  "--trees-bg-override": "transparent",
+  "--trees-border-color-override": "var(--border)",
+  "--trees-fg-muted-override": "var(--muted-foreground)",
+  "--trees-fg-override": "var(--foreground)",
+  "--trees-focus-ring-color-override": "var(--ring)",
+  "--trees-font-family-override": "var(--font-sans)",
+  "--trees-font-size-override": "var(--text-xs)",
+  "--trees-icon-width-override": "14px",
+  "--trees-item-margin-x-override": "0",
+  "--trees-padding-inline-override": "0",
+  "--trees-scrollbar-thumb-override":
+    "color-mix(in oklab, var(--muted-foreground) 35%, transparent)",
+  "--trees-selected-bg-override":
+    "color-mix(in oklab, var(--accent) 65%, transparent)",
+  "--trees-selected-fg-override": "var(--foreground)",
+  "--trees-selected-focused-border-color-override": "var(--ring)",
+  height: "100%",
+} as CSSProperties;
+
+function filesCount(files: Loadable<FilesView>) {
+  return files.state === "ready" ? files.value.files.length : null;
+}
+
+function DetailTabsList({
+  comments,
+  files,
+}: {
+  comments: number;
+  files: number | null;
+}) {
+  return (
+    <TabsList aria-label="Pull request sections">
+      <TabsTrigger value="conversation" className="gap-1.5">
+        Conversation <Badge variant="secondary">{comments}</Badge>
+      </TabsTrigger>
+      <TabsTrigger value="files" className="gap-1.5">
+        Files changed{" "}
+        {files !== null && <Badge variant="secondary">{files}</Badge>}
+      </TabsTrigger>
+    </TabsList>
+  );
+}
+
+function PullFilesPane({
   files,
   url,
   moved,
-  compact,
 }: {
   files: Loadable<FilesView>;
   url: string;
   moved: boolean;
-  compact: boolean;
 }) {
   if (files.state === "loading")
     return (
@@ -376,7 +436,11 @@ function FilesList({
       </div>
     );
   if (files.state === "error")
-    return <p className="text-xs text-muted-foreground">{files.message}</p>;
+    return (
+      <p role="alert" className="text-xs text-muted-foreground">
+        {files.message}
+      </p>
+    );
   if (moved)
     return (
       <p role="status" className="text-xs text-muted-foreground">
@@ -385,53 +449,194 @@ function FilesList({
       </p>
     );
   const { value } = files;
+  if (!value.files.length)
+    return (
+      <p className="text-xs text-muted-foreground">
+        This pull request has no changed files.
+      </p>
+    );
   return (
-    <>
-      {value.filesTruncated && (
-        <p className="text-xs text-muted-foreground">
-          The file list reached the 100-file cap and may be incomplete.
+    <ChangedFiles
+      key={`${value.revision.head}:${value.revision.base}`}
+      view={value}
+      url={url}
+    />
+  );
+}
+
+type RevealWhenNear = (node: Element, reveal: () => void) => () => void;
+
+function useRevealWhenNear(root: Element | null): RevealWhenNear | null {
+  const [observe, setObserve] = useState<RevealWhenNear | null>(null);
+  useEffect(() => {
+    if (!root) return;
+    const pending = new Map<Element, () => void>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          pending.get(entry.target)?.();
+          pending.delete(entry.target);
+          observer.unobserve(entry.target);
+        }
+      },
+      { root, rootMargin: "1500px 0px" },
+    );
+    setObserve(() => (node: Element, reveal: () => void) => {
+      pending.set(node, reveal);
+      observer.observe(node);
+      return () => {
+        pending.delete(node);
+        observer.unobserve(node);
+      };
+    });
+    return () => {
+      observer.disconnect();
+      setObserve(null);
+    };
+  }, [root]);
+  return observe;
+}
+
+function DeferredDiff({
+  observe,
+  lines,
+  children,
+}: {
+  observe: RevealWhenNear | null;
+  lines: number;
+  children: ReactNode;
+}) {
+  const [shown, setShown] = useState(false);
+  const placeholder = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (shown || !observe || !placeholder.current) return;
+    return observe(placeholder.current, () => setShown(true));
+  }, [observe, shown]);
+  if (shown) return children;
+  return <div ref={placeholder} style={{ height: lines * 20 + 16 }} />;
+}
+
+function ChangedFiles({ view, url }: { view: FilesView; url: string }) {
+  const cards = useRef(new Map<string, HTMLElement>());
+  const [scrollRoot, setScrollRoot] = useState<Element | null>(null);
+  const observe = useRevealWhenNear(scrollRoot);
+  const diffColumn = useCallback(
+    (node: HTMLDivElement | null) =>
+      setScrollRoot(node?.firstElementChild ?? null),
+    [],
+  );
+  const tree = useMemo(() => changedFilesTree(view.files), [view.files]);
+  const totals = useMemo(() => changeTotals(view.files), [view.files]);
+  const { model } = useFileTree({
+    paths: tree.paths,
+    gitStatus: tree.gitStatus,
+    initialExpansion: "open",
+    flattenEmptyDirectories: true,
+    density: "compact",
+    search: true,
+    onSelectionChange: (paths) => {
+      const path = paths.find((candidate) => cards.current.has(candidate));
+      if (path !== undefined)
+        cards.current.get(path)?.scrollIntoView({ block: "start" });
+    },
+    renderRowDecoration: ({ item }) => {
+      const counts = item.kind === "file" ? tree.counts.get(item.path) : null;
+      return counts ? { text: counts } : null;
+    },
+  });
+  return (
+    <div
+      data-testid="bb-changed-files"
+      className="@container flex h-full min-h-0 flex-col gap-2"
+    >
+      {view.filesTruncated && (
+        <p role="status" className="text-xs text-muted-foreground">
+          The file list reached its size cap and may be incomplete.{" "}
+          {url && (
+            <UrlLink href={url} className="underline hover:text-foreground">
+              View all files on Gitea ↗
+            </UrlLink>
+          )}
         </p>
       )}
-      {value.freshness.state === "stale-error" && (
+      {view.freshness.state === "stale-error" && (
         <p role="status" className="text-xs text-muted-foreground">
           Showing files from{" "}
-          {new Date(value.freshness.fetchedAt).toLocaleTimeString()}. Gitea
-          refresh failed: {value.freshness.error}
+          {new Date(view.freshness.fetchedAt).toLocaleTimeString()}. Gitea
+          refresh failed: {view.freshness.error}
         </p>
       )}
-      <DiffBanner files={value.files} />
-      {value.files.map((file) =>
-        compact ? (
-          <details key={file.path} className="border-b py-2">
-            <summary className="cursor-pointer">{file.path}</summary>
-            <div className="mt-2 overflow-hidden rounded-md border border-border bg-card">
-              <GiteaDiff path={file.path} diff={file.diff} filesUrl={url} />
-            </div>
-          </details>
-        ) : (
-          <article
-            key={file.path}
-            className="overflow-hidden rounded-lg border border-border bg-card"
+      <DiffBanner files={view.files} />
+      <div className="flex min-h-0 flex-1 flex-col gap-3 @[44rem]:flex-row">
+        <aside className="h-40 shrink-0 overflow-hidden rounded-lg border border-border bg-card @[44rem]:h-auto @[44rem]:w-64">
+          <FileTree
+            aria-label="Changed files"
+            className="block h-full min-h-0"
+            header={
+              <div className="border-b border-border px-3 py-2 text-xs font-semibold text-foreground">
+                {view.files.length} file{view.files.length === 1 ? "" : "s"}{" "}
+                <span className="font-normal text-muted-foreground">
+                  {fileCounts(totals)}
+                </span>
+              </div>
+            }
+            model={model}
+            style={PULL_FILE_TREE_STYLE}
+          />
+        </aside>
+        <div ref={diffColumn} className="flex min-h-0 flex-1 flex-col">
+          <Virtualizer
+            className="min-h-0 flex-1 overflow-y-auto"
+            contentClassName="space-y-3 pb-4"
           >
-            <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-2 text-xs">
-              <span className="min-w-0 flex-1 truncate font-mono">
-                {file.previousPath
-                  ? `${file.previousPath} → ${file.path}`
-                  : file.path}
-              </span>
-              <span className="text-green-600 dark:text-green-400">
-                +{file.additions}
-              </span>
-              <span className="text-red-600 dark:text-red-400">
-                −{file.deletions}
-              </span>
-              <Badge variant="secondary">{file.status}</Badge>
-            </div>
-            <GiteaDiff path={file.path} diff={file.diff} filesUrl={url} />
-          </article>
-        ),
-      )}
-    </>
+            {view.files.map((file) => (
+              <section
+                key={file.path}
+                ref={(node) => {
+                  if (node) cards.current.set(file.path, node);
+                  else cards.current.delete(file.path);
+                }}
+                aria-label={fileLabel(file)}
+                data-testid="bb-file-card"
+                data-path={file.path}
+                className="overflow-hidden rounded-lg border border-border bg-card"
+              >
+                <header className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-2 text-xs">
+                  <span
+                    className="min-w-0 flex-1 truncate font-mono"
+                    title={fileLabel(file)}
+                  >
+                    {fileLabel(file)}
+                  </span>
+                  <span className="shrink-0 text-green-600 dark:text-green-400">
+                    +{file.additions}
+                  </span>
+                  <span className="shrink-0 text-red-600 dark:text-red-400">
+                    −{file.deletions}
+                  </span>
+                  <Badge variant="secondary">{file.status}</Badge>
+                </header>
+                {file.diff.kind === "text" ? (
+                  <DeferredDiff
+                    observe={observe}
+                    lines={file.diff.patch.split("\n").length}
+                  >
+                    <GiteaDiff
+                      path={file.path}
+                      diff={file.diff}
+                      filesUrl={url}
+                    />
+                  </DeferredDiff>
+                ) : (
+                  <GiteaDiff path={file.path} diff={file.diff} filesUrl={url} />
+                )}
+              </section>
+            ))}
+          </Virtualizer>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -460,6 +665,21 @@ const babysitLabels = {
   stopped: "stopped",
 } as const;
 
+const automationToggles = [
+  {
+    option: "fix",
+    label: "Auto-fix",
+    description:
+      "Fix CI failures and address review feedback. Auto-fix never merges.",
+  },
+  {
+    option: "merge",
+    label: "Auto-merge",
+    description:
+      "Gitea has no native auto-merge, so the babysitter merges with your tea login once checks, approvals and branch rules allow it. Auto-merge never changes code.",
+  },
+] as const;
+
 function babysitDetail(view: BabysitView) {
   if (view.status === "failed") return view.error;
   if (view.status === "needs_you") return view.note;
@@ -480,25 +700,14 @@ function BabysitControls({
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
   const [busy, setBusy] = useState(false);
-  const run = async (action: BabysitView["actions"][number]) => {
+  const run = async (action: () => Promise<unknown>, done: string) => {
     setBusy(true);
     try {
-      if (action === "stop") await rpc.call("stopBabysit", { repo, number });
-      else
-        await rpc.call(action === "start" ? "startBabysit" : "retryBabysit", {
-          repo,
-          number,
-        });
-      toast.success(
-        action === "stop"
-          ? "Babysitter stopped"
-          : action === "start"
-            ? "Babysitter started"
-            : "Babysitter resumed",
-      );
+      await action();
+      toast.success(done);
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : "Babysitter action failed",
+        error instanceof Error ? error.message : "Automation change failed",
       );
     } finally {
       setBusy(false);
@@ -506,6 +715,7 @@ function BabysitControls({
     }
   };
   const detail = babysitDetail(view);
+  const changeable = view.actions.length > 0;
   return (
     <span
       data-testid="babysit-controls"
@@ -529,22 +739,44 @@ function BabysitControls({
           Thread
         </Button>
       )}
-      {view.actions.map((action) => (
+      {automationToggles.map(({ option, label }) => {
+        const on = view.automation[option];
+        return (
+          <Button
+            key={option}
+            size="sm"
+            variant={on ? "default" : "outline"}
+            className="h-7"
+            aria-pressed={on}
+            disabled={busy || !changeable}
+            onClick={() =>
+              void run(
+                () =>
+                  rpc.call("setAutomation", { repo, number, [option]: !on }),
+                `${label} ${on ? "off" : "on"}`,
+              )
+            }
+          >
+            {label}
+          </Button>
+        );
+      })}
+      {view.actions.includes("retry") && (
         <Button
-          key={action}
           size="sm"
-          variant={action === "stop" ? "outline" : "default"}
+          variant="outline"
           className="h-7"
           disabled={busy}
-          onClick={() => void run(action)}
+          onClick={() =>
+            void run(
+              () => rpc.call("retryBabysit", { repo, number }),
+              "Babysitter resumed",
+            )
+          }
         >
-          {action === "start"
-            ? "Babysit"
-            : action === "stop"
-              ? "Stop"
-              : "Retry"}
+          Retry
         </Button>
-      ))}
+      )}
     </span>
   );
 }
@@ -577,7 +809,7 @@ function BabysitPreferencesControl() {
         role="alert"
         className="flex flex-wrap items-center gap-2 text-xs text-destructive"
       >
-        Could not load babysitter settings: {loaded.message}
+        Could not load automation settings: {loaded.message}
         <Button
           size="sm"
           variant="outline"
@@ -613,39 +845,52 @@ function BabysitPreferencesControl() {
     }
   };
   const execution: ExperimentalProviderModelPickerValue = preferences.execution;
+  const fields = { fix: "autoFix", merge: "autoMerge" } as const;
   return (
-    <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-      <label className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          aria-label="Automatically babysit my pull requests"
-          checked={preferences.autoBabysit}
+    <div className="space-y-1 text-xs text-muted-foreground">
+      <div className="flex flex-wrap items-center gap-3">
+        <span>For my PRs in BB projects:</span>
+        {automationToggles.map(({ option, label }) => {
+          const field = fields[option];
+          return (
+            <label key={option} className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={preferences[field]}
+                disabled={saving}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  void save(
+                    () => rpc.call("setAutoAutomation", { [option]: enabled }),
+                    { ...preferences, [field]: enabled },
+                  );
+                }}
+              />
+              Turn on {label}
+            </label>
+          );
+        })}
+        <ProviderModelPicker
+          value={execution}
           disabled={saving}
-          onChange={(event) => {
-            const enabled = event.target.checked;
-            void save(() => rpc.call("setAutoBabysit", { enabled }), {
+          align="end"
+          onChange={(value) => {
+            const next = {
+              ...value,
+              serviceTier: value.serviceTier ?? "default",
+            };
+            void save(() => rpc.call("setBabysitExecution", next), {
               ...preferences,
-              autoBabysit: enabled,
+              execution: next,
             });
           }}
         />
-        Auto-babysit my PRs in BB projects
-      </label>
-      <ProviderModelPicker
-        value={execution}
-        disabled={saving}
-        align="end"
-        onChange={(value) => {
-          const next = {
-            ...value,
-            serviceTier: value.serviceTier ?? "default",
-          };
-          void save(() => rpc.call("setBabysitExecution", next), {
-            ...preferences,
-            execution: next,
-          });
-        }}
-      />
+      </div>
+      {automationToggles.map(({ option, label, description }) => (
+        <p key={option}>
+          {label}: {description}
+        </p>
+      ))}
     </div>
   );
 }
@@ -682,7 +927,7 @@ function BabysitterSessions() {
   if (!sessions.length)
     return (
       <div className="rounded-lg border border-border bg-card p-8 text-center text-muted-foreground">
-        No babysitter sessions yet. Start one from My PRs.
+        No babysitter sessions yet. Turn on Auto-fix or Auto-merge from My PRs.
       </div>
     );
   return (
@@ -1031,325 +1276,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     );
   }
   const detailRoute = parseSubPath(subPath);
-  if (detailRoute) {
+  if (detailRoute && !detail) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto p-4 text-sm md:p-5">
         <div className="mx-auto w-full max-w-5xl space-y-4">
-          {detail ? (
-            <>
-              <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 px-2"
-                  onClick={() => navigate.toPluginPanel("gitea")}
-                >
-                  ← {detail.kind === "pr" ? "Pull requests" : "Issues"}
-                </Button>
-                <span className="min-w-0 truncate">
-                  {detail.repo} · #{detail.number}
-                </span>
-                <span className="flex-1" />
-                {shown.state === "ready" && (
-                  <FreshnessNote
-                    freshness={shown.value.freshness}
-                    onRefresh={() => void display.refresh()}
-                  />
-                )}
-                {detail.url && (
-                  <UrlLink
-                    href={detail.url}
-                    className="shrink-0 underline hover:text-foreground"
-                  >
-                    Open on Gitea ↗
-                  </UrlLink>
-                )}
-              </div>
-              {shown.state === "ready" &&
-                shown.value.freshness.state === "stale-error" && (
-                  <p
-                    role="status"
-                    className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
-                  >
-                    Showing content from{" "}
-                    {new Date(
-                      shown.value.freshness.fetchedAt,
-                    ).toLocaleTimeString()}
-                    . Gitea refresh failed: {shown.value.freshness.error}
-                  </p>
-                )}
-              <div className="flex flex-wrap items-start gap-3">
-                <h2 className="min-w-0 flex-1 text-xl font-semibold text-foreground">
-                  {detail.title}{" "}
-                  <span className="font-normal text-muted-foreground">
-                    #{detail.number}
-                  </span>
-                </h2>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() =>
-                    void setItemState(
-                      detail.state === "closed" ? "open" : "closed",
-                    )
-                  }
-                >
-                  {detail.state === "closed" ? "Reopen" : "Close"}
-                </Button>
-                <Button size="sm" onClick={() => void sendAgent()}>
-                  {detail.kind === "pr" ? "Review with agent" : "Send agent"}
-                </Button>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <Badge variant="outline" className="gap-1.5 font-normal">
-                  <span
-                    className={`size-2 rounded-full ${detail.state === "open" ? "bg-green-500" : "bg-purple-500"}`}
-                  />
-                  {detail.state.toLowerCase()}
-                </Badge>
-                <span>
-                  {detail.repo} · {detail.author}
-                </span>
-                {detail.kind === "pr" && (
-                  <span className="font-mono">
-                    {detail.baseRefName} ← {detail.headRefName}
-                  </span>
-                )}
-                {detail.threadId && (
-                  <Button
-                    size="sm"
-                    variant="link"
-                    className="h-auto px-1"
-                    onClick={() => navigate.toThread(detail.threadId!)}
-                  >
-                    Open linked BB thread
-                  </Button>
-                )}
-              </div>
-              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
-                <main className="min-w-0 space-y-4">
-                  <article className="rounded-lg border border-border bg-card p-4">
-                    <div className="mb-2 text-xs text-muted-foreground">
-                      {detail.author} · {detail.updatedAt}
-                    </div>
-                    <div className="whitespace-pre-wrap">
-                      {detail.body || "No description"}
-                    </div>
-                  </article>
-                  {detail.kind === "pr" && (
-                    <Tabs
-                      value={detailSection}
-                      onValueChange={(value) =>
-                        setDetailSection(value as DetailSection)
-                      }
-                    >
-                      <TabsList>
-                        <TabsTrigger value="conversation">
-                          Conversation
-                        </TabsTrigger>
-                        <TabsTrigger value="files">
-                          Files{" "}
-                          <Badge variant="secondary" className="ml-1.5">
-                            {detail.changedFiles ??
-                              (display.files.state === "ready"
-                                ? display.files.value.files.length
-                                : "")}
-                          </Badge>
-                        </TabsTrigger>
-                      </TabsList>
-                    </Tabs>
-                  )}
-                  {detail.kind === "pr" && detailSection === "files" ? (
-                    <section className="space-y-3">
-                      <h3 className="text-xs font-semibold text-muted-foreground">
-                        Files changed
-                        {display.files.state === "ready" &&
-                          ` · ${display.files.value.files.length}`}
-                      </h3>
-                      <FilesList
-                        files={display.files}
-                        url={filesUrl(detail)}
-                        moved={display.filesMoved}
-                        compact={false}
-                      />
-                    </section>
-                  ) : (
-                    <section className="space-y-3 rounded-lg border border-border bg-card p-4">
-                      <h3 className="text-xs font-semibold text-muted-foreground">
-                        Conversation
-                      </h3>
-                      {detail.commentsTruncated && (
-                        <p className="text-xs text-muted-foreground">
-                          Conversation history reached the 500-comment cap and
-                          may be incomplete.
-                        </p>
-                      )}
-                      {detail.comments.map((comment, index) => (
-                        <article
-                          key={`${comment.author}-${index}`}
-                          className="rounded-md border border-border p-3"
-                        >
-                          <div className="mb-1 text-xs text-muted-foreground">
-                            {comment.author} · {comment.createdAt}
-                          </div>
-                          <div className="whitespace-pre-wrap">
-                            {comment.body}
-                          </div>
-                        </article>
-                      ))}
-                      <Textarea
-                        value={draft}
-                        onChange={(event) => setDraft(event.target.value)}
-                        placeholder="Write a comment"
-                      />
-                      <div className="flex justify-end">
-                        <Button
-                          disabled={!draft.trim()}
-                          onClick={() => void submitComment()}
-                        >
-                          Comment
-                        </Button>
-                      </div>
-                    </section>
-                  )}
-                </main>
-                <aside className="space-y-3">
-                  <section className="space-y-3 rounded-lg border border-border bg-card p-3">
-                    <div>
-                      <h3 className="mb-2 text-xs font-semibold text-muted-foreground">
-                        Labels
-                      </h3>
-                      <div className="flex flex-wrap gap-1">
-                        {detail.labels.map((label) => (
-                          <Badge
-                            key={label}
-                            variant="secondary"
-                            className="font-normal"
-                          >
-                            {label}
-                          </Badge>
-                        ))}
-                      </div>
-                    </div>
-                    <Input
-                      aria-label="Labels, comma separated"
-                      value={labelsDraft}
-                      onChange={(event) => setLabelsDraft(event.target.value)}
-                      placeholder="Labels, comma separated"
-                    />
-                    <div>
-                      <h3 className="mb-2 text-xs font-semibold text-muted-foreground">
-                        Assignees
-                      </h3>
-                      <Input
-                        aria-label="Assignees, comma separated"
-                        value={assigneesDraft}
-                        onChange={(event) =>
-                          setAssigneesDraft(event.target.value)
-                        }
-                        placeholder="Assignees, comma separated"
-                      />
-                    </div>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="w-full"
-                      onClick={() => void saveMetadata()}
-                    >
-                      Save labels and assignees
-                    </Button>
-                  </section>
-                  {detail.kind === "pr" && (
-                    <>
-                      <section className="overflow-hidden rounded-lg border border-border bg-card">
-                        <h3 className="border-b border-border bg-muted/50 px-3 py-2 text-xs font-semibold text-muted-foreground">
-                          Checks
-                        </h3>
-                        {detail.checksTruncated && (
-                          <p className="px-3 pt-2 text-xs text-muted-foreground">
-                            Check list may be incomplete.
-                          </p>
-                        )}
-                        {detail.checks.length ? (
-                          detail.checks.map((check, index) => (
-                            <div
-                              key={`${check.name}-${index}`}
-                              className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs"
-                            >
-                              <span
-                                className={`size-2 rounded-full ${check.status === "success" ? "bg-green-500" : check.status === "failure" ? "bg-red-500" : "bg-muted-foreground"}`}
-                              />
-                              <span className="min-w-0 flex-1 truncate">
-                                {check.name}
-                              </span>
-                              <Badge variant="secondary">{check.status}</Badge>
-                            </div>
-                          ))
-                        ) : (
-                          <p className="p-3 text-xs text-muted-foreground">
-                            No checks reported.
-                          </p>
-                        )}
-                      </section>
-                      <section className="space-y-2 rounded-lg border border-border bg-card p-3">
-                        <h3 className="text-xs font-semibold text-muted-foreground">
-                          Reviews
-                        </h3>
-                        {detail.reviewsTruncated && (
-                          <p className="text-xs text-muted-foreground">
-                            Review history reached the 500-item cap and may be
-                            incomplete.
-                          </p>
-                        )}
-                        {detail.reviews.map((review, index) => (
-                          <article
-                            key={`${review.author}-${index}`}
-                            className="border-b border-border py-2 text-xs"
-                          >
-                            <div className="font-medium">
-                              {review.author} · {review.state}
-                            </div>
-                            <div className="whitespace-pre-wrap text-muted-foreground">
-                              {review.body}
-                            </div>
-                          </article>
-                        ))}
-                        <Textarea
-                          value={reviewBody}
-                          onChange={(event) =>
-                            setReviewBody(event.target.value)
-                          }
-                          placeholder="Review summary"
-                        />
-                        <div className="flex flex-wrap justify-end gap-1">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => void submitReview("COMMENT")}
-                          >
-                            Comment
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => void submitReview("REQUEST_CHANGES")}
-                          >
-                            Request changes
-                          </Button>
-                          <Button
-                            size="sm"
-                            onClick={() => void submitReview("APPROVED")}
-                          >
-                            Approve
-                          </Button>
-                        </div>
-                      </section>
-                    </>
-                  )}
-                </aside>
-              </div>
-            </>
-          ) : detailError ? (
+          {detailError ? (
             <div className="space-y-3 rounded-lg border border-border bg-card p-4 text-muted-foreground">
               <p>{detailError}</p>
               <Button
@@ -1369,6 +1300,318 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           )}
         </div>
       </div>
+    );
+  }
+  if (detailRoute && detail) {
+    const header = (
+      <div className="shrink-0 px-4 pt-4 md:px-5 md:pt-5">
+        <div className="mx-auto w-full max-w-5xl space-y-3">
+          <div className="flex items-center gap-1 text-xs text-muted-foreground">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2"
+              onClick={() => navigate.toPluginPanel("gitea")}
+            >
+              ← {detail.kind === "pr" ? "Pull requests" : "Issues"}
+            </Button>
+            <span className="min-w-0 truncate">
+              {detail.repo} · #{detail.number}
+            </span>
+            <span className="flex-1" />
+            {shown.state === "ready" && (
+              <FreshnessNote
+                freshness={shown.value.freshness}
+                onRefresh={() => void display.refresh()}
+              />
+            )}
+            {detail.url && (
+              <UrlLink
+                href={detail.url}
+                className="shrink-0 underline hover:text-foreground"
+              >
+                Open on Gitea ↗
+              </UrlLink>
+            )}
+          </div>
+          {shown.state === "ready" &&
+            shown.value.freshness.state === "stale-error" && (
+              <p
+                role="status"
+                className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+              >
+                Showing content from{" "}
+                {new Date(shown.value.freshness.fetchedAt).toLocaleTimeString()}
+                . Gitea refresh failed: {shown.value.freshness.error}
+              </p>
+            )}
+          <div className="flex flex-wrap items-start gap-3">
+            <h2 className="min-w-0 flex-1 text-xl font-semibold text-foreground">
+              {detail.title}{" "}
+              <span className="font-normal text-muted-foreground">
+                #{detail.number}
+              </span>
+            </h2>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                void setItemState(detail.state === "closed" ? "open" : "closed")
+              }
+            >
+              {detail.state === "closed" ? "Reopen" : "Close"}
+            </Button>
+            <Button size="sm" onClick={() => void sendAgent()}>
+              {detail.kind === "pr" ? "Review with agent" : "Send agent"}
+            </Button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <Badge variant="outline" className="gap-1.5 font-normal">
+              <span
+                className={`size-2 rounded-full ${detail.state === "open" ? "bg-green-500" : "bg-purple-500"}`}
+              />
+              {detail.state.toLowerCase()}
+            </Badge>
+            <span>
+              {detail.repo} · {detail.author}
+            </span>
+            {detail.kind === "pr" && (
+              <span className="font-mono">
+                {detail.baseRefName} ← {detail.headRefName}
+              </span>
+            )}
+            {detail.threadId && (
+              <Button
+                size="sm"
+                variant="link"
+                className="h-auto px-1"
+                onClick={() => navigate.toThread(detail.threadId!)}
+              >
+                Open linked BB thread
+              </Button>
+            )}
+          </div>
+          {detail.kind === "pr" && (
+            <DetailTabsList
+              comments={detail.comments.length}
+              files={detail.changedFiles ?? filesCount(display.files)}
+            />
+          )}
+        </div>
+      </div>
+    );
+    const conversation = (
+      <div className="mx-auto w-full max-w-5xl">
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
+          <main className="min-w-0 space-y-4">
+            <article className="rounded-lg border border-border bg-card p-4">
+              <div className="mb-2 text-xs text-muted-foreground">
+                {detail.author} · {detail.updatedAt}
+              </div>
+              <div className="whitespace-pre-wrap">
+                {detail.body || "No description"}
+              </div>
+            </article>
+            <section className="space-y-3 rounded-lg border border-border bg-card p-4">
+              <h3 className="text-xs font-semibold text-muted-foreground">
+                Conversation
+              </h3>
+              {detail.commentsTruncated && (
+                <p className="text-xs text-muted-foreground">
+                  Conversation history reached the 500-comment cap and may be
+                  incomplete.
+                </p>
+              )}
+              {detail.comments.map((comment, index) => (
+                <article
+                  key={`${comment.author}-${index}`}
+                  className="rounded-md border border-border p-3"
+                >
+                  <div className="mb-1 text-xs text-muted-foreground">
+                    {comment.author} · {comment.createdAt}
+                  </div>
+                  <div className="whitespace-pre-wrap">{comment.body}</div>
+                </article>
+              ))}
+              <Textarea
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder="Write a comment"
+              />
+              <div className="flex justify-end">
+                <Button
+                  disabled={!draft.trim()}
+                  onClick={() => void submitComment()}
+                >
+                  Comment
+                </Button>
+              </div>
+            </section>
+          </main>
+          <aside className="space-y-3">
+            <section className="space-y-3 rounded-lg border border-border bg-card p-3">
+              <div>
+                <h3 className="mb-2 text-xs font-semibold text-muted-foreground">
+                  Labels
+                </h3>
+                <div className="flex flex-wrap gap-1">
+                  {detail.labels.map((label) => (
+                    <Badge
+                      key={label}
+                      variant="secondary"
+                      className="font-normal"
+                    >
+                      {label}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+              <Input
+                aria-label="Labels, comma separated"
+                value={labelsDraft}
+                onChange={(event) => setLabelsDraft(event.target.value)}
+                placeholder="Labels, comma separated"
+              />
+              <div>
+                <h3 className="mb-2 text-xs font-semibold text-muted-foreground">
+                  Assignees
+                </h3>
+                <Input
+                  aria-label="Assignees, comma separated"
+                  value={assigneesDraft}
+                  onChange={(event) => setAssigneesDraft(event.target.value)}
+                  placeholder="Assignees, comma separated"
+                />
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                onClick={() => void saveMetadata()}
+              >
+                Save labels and assignees
+              </Button>
+            </section>
+            {detail.kind === "pr" && (
+              <>
+                <section className="overflow-hidden rounded-lg border border-border bg-card">
+                  <h3 className="border-b border-border bg-muted/50 px-3 py-2 text-xs font-semibold text-muted-foreground">
+                    Checks
+                  </h3>
+                  {detail.checksTruncated && (
+                    <p className="px-3 pt-2 text-xs text-muted-foreground">
+                      Check list may be incomplete.
+                    </p>
+                  )}
+                  {detail.checks.length ? (
+                    detail.checks.map((check, index) => (
+                      <div
+                        key={`${check.name}-${index}`}
+                        className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs"
+                      >
+                        <span
+                          className={`size-2 rounded-full ${check.status === "success" ? "bg-green-500" : check.status === "failure" ? "bg-red-500" : "bg-muted-foreground"}`}
+                        />
+                        <span className="min-w-0 flex-1 truncate">
+                          {check.name}
+                        </span>
+                        <Badge variant="secondary">{check.status}</Badge>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="p-3 text-xs text-muted-foreground">
+                      No checks reported.
+                    </p>
+                  )}
+                </section>
+                <section className="space-y-2 rounded-lg border border-border bg-card p-3">
+                  <h3 className="text-xs font-semibold text-muted-foreground">
+                    Reviews
+                  </h3>
+                  {detail.reviewsTruncated && (
+                    <p className="text-xs text-muted-foreground">
+                      Review history reached the 500-item cap and may be
+                      incomplete.
+                    </p>
+                  )}
+                  {detail.reviews.map((review, index) => (
+                    <article
+                      key={`${review.author}-${index}`}
+                      className="border-b border-border py-2 text-xs"
+                    >
+                      <div className="font-medium">
+                        {review.author} · {review.state}
+                      </div>
+                      <div className="whitespace-pre-wrap text-muted-foreground">
+                        {review.body}
+                      </div>
+                    </article>
+                  ))}
+                  <Textarea
+                    value={reviewBody}
+                    onChange={(event) => setReviewBody(event.target.value)}
+                    placeholder="Review summary"
+                  />
+                  <div className="flex flex-wrap justify-end gap-1">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void submitReview("COMMENT")}
+                    >
+                      Comment
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void submitReview("REQUEST_CHANGES")}
+                    >
+                      Request changes
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => void submitReview("APPROVED")}
+                    >
+                      Approve
+                    </Button>
+                  </div>
+                </section>
+              </>
+            )}
+          </aside>
+        </div>
+      </div>
+    );
+    const scroller = "min-h-0 flex-1 overflow-y-auto px-4 py-4 md:px-5";
+    if (detail.kind !== "pr")
+      return (
+        <div className="flex h-full min-h-0 flex-1 flex-col text-sm">
+          {header}
+          <div className={scroller}>{conversation}</div>
+        </div>
+      );
+    return (
+      <Tabs
+        value={detailSection}
+        onValueChange={(value) => setDetailSection(value as DetailSection)}
+        className="flex h-full min-h-0 flex-1 flex-col text-sm"
+      >
+        {header}
+        <TabsContent value="conversation" className={`mt-0 ${scroller}`}>
+          {conversation}
+        </TabsContent>
+        <TabsContent
+          value="files"
+          className="mt-0 min-h-0 flex-1 px-4 py-3 md:px-5"
+        >
+          <div className="mx-auto h-full w-full max-w-5xl">
+            <PullFilesPane
+              files={display.files}
+              url={filesUrl(detail)}
+              moved={display.filesMoved}
+            />
+          </div>
+        </TabsContent>
+      </Tabs>
     );
   }
   return (
@@ -1591,7 +1834,12 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
       current = false;
     };
   }, [rpc, threadId]);
-  const display = useItemDisplay(item, item?.kind === "pr");
+  const [section, setSection] = useState<DetailSection>("conversation");
+  useEffect(() => setSection("conversation"), [threadId]);
+  const display = useItemDisplay(
+    item,
+    item?.kind === "pr" && section === "files",
+  );
   const shown = display.conversation;
   if (error || shown.state === "error")
     return (
@@ -1606,20 +1854,28 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
       </div>
     );
   const detail = shown.value.conversation;
-  return (
-    <div className="flex h-full min-h-0 flex-col overflow-auto text-sm">
-      <header className="border-b p-4">
-        <div className="font-semibold">{detail.title}</div>
-        <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
-          <span className="flex-1">
-            {detail.repo}#{detail.number} · {detail.kind} · {detail.state}
-          </span>
-          <FreshnessNote
-            freshness={shown.value.freshness}
-            onRefresh={() => void display.refresh()}
-          />
-        </div>
-      </header>
+  const header = (
+    <header className="shrink-0 space-y-2 border-b p-4">
+      <div className="font-semibold">{detail.title}</div>
+      <div className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+        <span className="flex-1">
+          {detail.repo}#{detail.number} · {detail.kind} · {detail.state}
+        </span>
+        <FreshnessNote
+          freshness={shown.value.freshness}
+          onRefresh={() => void display.refresh()}
+        />
+      </div>
+      {detail.kind === "pr" && (
+        <DetailTabsList
+          comments={detail.comments.length}
+          files={detail.changedFiles ?? filesCount(display.files)}
+        />
+      )}
+    </header>
+  );
+  const conversation = (
+    <>
       <article className="border-b p-4">
         <div className="mb-2 text-xs text-muted-foreground">
           {detail.author}
@@ -1628,7 +1884,7 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
           {detail.body || "No description"}
         </div>
       </article>
-      <section className="border-b p-4">
+      <section className="p-4">
         <h3 className="mb-2 font-medium">Conversation</h3>
         {detail.commentsTruncated && (
           <div className="mb-2 text-xs text-muted-foreground">
@@ -1648,21 +1904,36 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
           </article>
         ))}
       </section>
-      {detail.kind === "pr" && (
-        <section className="space-y-2 p-4">
-          <h3 className="mb-2 font-medium">
-            Files changed
-            {detail.changedFiles !== null && ` · ${detail.changedFiles}`}
-          </h3>
-          <FilesList
-            files={display.files}
-            url={filesUrl(detail)}
-            moved={display.filesMoved}
-            compact
-          />
-        </section>
-      )}
-    </div>
+    </>
+  );
+  if (detail.kind !== "pr")
+    return (
+      <div className="flex h-full min-h-0 flex-col text-sm">
+        {header}
+        <div className="min-h-0 flex-1 overflow-y-auto">{conversation}</div>
+      </div>
+    );
+  return (
+    <Tabs
+      value={section}
+      onValueChange={(value) => setSection(value as DetailSection)}
+      className="flex h-full min-h-0 flex-col text-sm"
+    >
+      {header}
+      <TabsContent
+        value="conversation"
+        className="mt-0 min-h-0 flex-1 overflow-y-auto"
+      >
+        {conversation}
+      </TabsContent>
+      <TabsContent value="files" className="mt-0 min-h-0 flex-1 p-3">
+        <PullFilesPane
+          files={display.files}
+          url={filesUrl(detail)}
+          moved={display.filesMoved}
+        />
+      </TabsContent>
+    </Tabs>
   );
 }
 

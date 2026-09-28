@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  activePolicy,
   autoStartTargets,
+  babysitPolicySchema,
   babysitSessionSchema,
   babysitView,
   buildBabysitterPrompt,
+  decideAutomation,
   decideRetry,
   decideStart,
   decideStop,
@@ -13,6 +16,9 @@ import {
   onIdle,
   parseLifecycle,
   parseMarker,
+  parseStoredPreferences,
+  parseStoredSession,
+  type BabysitPolicy,
   type BabysitSession,
 } from "./babysitter";
 
@@ -22,6 +28,7 @@ const watching: BabysitSession = {
   number: 42,
   threadId: "thread-1",
   updatedAt: "2026-09-27T00:00:00Z",
+  policy: { fix: true, merge: true },
   status: "watching",
 };
 const open = { state: "open" } as const;
@@ -118,7 +125,10 @@ describe("decisions", () => {
         lifecycle: closed,
       }),
     ).toEqual({ kind: "reject", reason: "closed" });
-    expect(decideRetry(closedSession)).toEqual({ kind: "start" });
+    expect(decideRetry(closedSession)).toEqual({
+      kind: "start",
+      policy: closedSession.policy,
+    });
     expect(
       decideRetry({ ...watching, status: "merged", mergedAt: now }),
     ).toEqual({ kind: "reject", reason: "merged" });
@@ -139,7 +149,7 @@ describe("decisions", () => {
       kind: "existing",
       threadId: "thread-1",
     });
-    expect(decideRetry(null)).toEqual({ kind: "start" });
+    expect(decideRetry(null)).toEqual({ kind: "reject", reason: "idle" });
   });
 
   it("stops only live or retained non-terminal workers", () => {
@@ -161,6 +171,7 @@ describe("transitions", () => {
       number: 42,
       threadId: "thread-1",
       updatedAt: now,
+      policy: { fix: true, merge: true },
       status: "merged",
       mergedAt: merged.mergedAt,
     });
@@ -244,9 +255,9 @@ describe("views and automation", () => {
       closedAt: now,
     };
     expect(babysitView(null, openFacts).actions).toEqual(["start"]);
-    expect(babysitView(null, { ...openFacts, projectId: null }).actions).toEqual(
-      [],
-    );
+    expect(
+      babysitView(null, { ...openFacts, projectId: null }).actions,
+    ).toEqual([]);
     expect(babysitView(null, null).actions).toEqual([]);
     expect(babysitView(watching, openFacts).actions).toEqual(["stop"]);
     expect(
@@ -311,13 +322,14 @@ describe("views and automation", () => {
     ).toEqual([1, 2, 8]);
   });
 
-  it("instructs tea with explicit flags and forbids auto-merge", () => {
+  it("instructs tea with explicit flags and never enables a Gitea auto-merge", () => {
     const prompt = buildBabysitterPrompt({
       repo: "acme/widgets",
       number: 42,
       title: "Fix it",
       baseUrl: "https://gitea.example/prefix/",
       login: "work",
+      policy: { fix: true, merge: true },
     });
     expect(prompt).toContain(
       "tea pulls --login work --repo acme/widgets --comments 42",
@@ -329,7 +341,217 @@ describe("views and automation", () => {
     expect(prompt).toContain(
       "tea pulls edit --login work --repo acme/widgets --ready 42",
     );
-    expect(prompt).not.toContain("mark the PR ready");
     expect(prompt).not.toMatch(/\bgh\s+pr\b/);
+  });
+
+  it("grants code changes only with Auto-fix and merging only with Auto-merge", () => {
+    const prompt = (policy: BabysitPolicy) =>
+      buildBabysitterPrompt({
+        repo: "acme/widgets",
+        number: 42,
+        title: "Fix it",
+        baseUrl: "https://gitea.example/",
+        login: "work",
+        policy,
+      });
+    const mergeCommand = "tea pulls merge";
+    const pushGrant = "You can fix, commit, push";
+    const fixOnly = prompt({ fix: true, merge: false });
+    expect(fixOnly).toContain(pushGrant);
+    expect(fixOnly).not.toContain(mergeCommand);
+    expect(fixOnly).toContain(
+      "Auto-merge is off. Never merge this pull request",
+    );
+    const mergeOnly = prompt({ fix: false, merge: true });
+    expect(mergeOnly).not.toContain(pushGrant);
+    expect(mergeOnly).toContain("Auto-fix is off. Do not change code");
+    expect(mergeOnly).toContain(mergeCommand);
+    const both = prompt({ fix: true, merge: true });
+    expect(both).toContain(pushGrant);
+    expect(both).toContain(mergeCommand);
+    for (const text of [fixOnly, mergeOnly, both])
+      expect(text).toContain("replace any earlier instructions in this thread");
+  });
+});
+
+describe("Auto-fix and Auto-merge policy", () => {
+  it("cannot represent an active session that may neither fix nor merge", () => {
+    expect(activePolicy({ fix: false, merge: false })).toBeNull();
+    expect(activePolicy({ fix: true, merge: false })).toEqual({
+      fix: true,
+      merge: false,
+    });
+    expect(activePolicy({ fix: false, merge: true })).toEqual({
+      fix: false,
+      merge: true,
+    });
+    expect(
+      babysitPolicySchema.safeParse({ fix: false, merge: false }).success,
+    ).toBe(false);
+    expect(
+      babysitSessionSchema.safeParse({
+        ...watching,
+        policy: { fix: false, merge: false },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("reads legacy sessions with their original fix-and-merge authority", () => {
+    const { policy: _policy, ...legacy } = watching;
+    expect(parseStoredSession(legacy)).toEqual(watching);
+    expect(
+      parseStoredSession({ ...watching, policy: { fix: false, merge: true } }),
+    ).toEqual({ ...watching, policy: { fix: false, merge: true } });
+    expect(parseStoredSession({ status: "watching" })).toBeNull();
+  });
+
+  it("maps legacy automatic babysitting to both automatic options without losing execution", () => {
+    const execution = {
+      providerId: "claude",
+      model: "claude-sonnet-5",
+      reasoningLevel: "high",
+      serviceTier: "fast",
+    } as const;
+    expect(parseStoredPreferences({ autoBabysit: false, execution })).toEqual({
+      autoFix: false,
+      autoMerge: false,
+      execution,
+    });
+    expect(parseStoredPreferences({ autoBabysit: true, execution })).toEqual({
+      autoFix: true,
+      autoMerge: true,
+      execution,
+    });
+    expect(
+      parseStoredPreferences({ autoFix: false, autoMerge: true, execution }),
+    ).toEqual({ autoFix: false, autoMerge: true, execution });
+    expect(parseStoredPreferences(undefined)).toMatchObject({
+      autoFix: false,
+      autoMerge: false,
+    });
+  });
+
+  it("shows automation as on only while a session is live or waiting on you", () => {
+    const fixOnly: BabysitSession = {
+      ...watching,
+      policy: { fix: true, merge: false },
+    };
+    expect(babysitView(null, null).automation).toEqual({
+      fix: false,
+      merge: false,
+    });
+    expect(babysitView(fixOnly, null).automation).toEqual({
+      fix: true,
+      merge: false,
+    });
+    expect(
+      babysitView({ ...fixOnly, status: "needs_you", note: "" }, null)
+        .automation,
+    ).toEqual({ fix: true, merge: false });
+    for (const retained of [
+      { ...fixOnly, status: "stopped" as const },
+      { ...fixOnly, status: "merged" as const, mergedAt: now },
+      { ...fixOnly, status: "closed" as const, closedAt: now },
+    ])
+      expect(babysitView(retained, null).automation).toEqual({
+        fix: false,
+        merge: false,
+      });
+  });
+
+  it("decides every Auto-fix and Auto-merge combination", () => {
+    const combinations = [
+      [{ fix: false, merge: false }, null],
+      [
+        { fix: true, merge: false },
+        { fix: true, merge: false },
+      ],
+      [
+        { fix: false, merge: true },
+        { fix: false, merge: true },
+      ],
+      [
+        { fix: true, merge: true },
+        { fix: true, merge: true },
+      ],
+    ] as const;
+    for (const [patch, policy] of combinations) {
+      expect(decideAutomation(null, patch)).toEqual(
+        policy ? { kind: "start", policy } : { kind: "unchanged" },
+      );
+      expect(decideAutomation(watching, patch)).toEqual(
+        policy === null
+          ? { kind: "stop" }
+          : policy.fix && policy.merge
+            ? { kind: "unchanged" }
+            : { kind: "update", session: watching, policy },
+      );
+      const stopped: BabysitSession = { ...watching, status: "stopped" };
+      expect(decideAutomation(stopped, patch)).toEqual(
+        policy
+          ? { kind: "resume", session: stopped, policy, cleanupFirst: false }
+          : { kind: "unchanged" },
+      );
+    }
+  });
+
+  it("patches one option and keeps the other", () => {
+    const mergeOnly: BabysitSession = {
+      ...watching,
+      policy: { fix: false, merge: true },
+    };
+    expect(decideAutomation(mergeOnly, { fix: true })).toEqual({
+      kind: "update",
+      session: mergeOnly,
+      policy: { fix: true, merge: true },
+    });
+    expect(decideAutomation(mergeOnly, { merge: false })).toEqual({
+      kind: "stop",
+    });
+    expect(decideAutomation(watching, { merge: false })).toEqual({
+      kind: "update",
+      session: watching,
+      policy: { fix: true, merge: false },
+    });
+    expect(decideAutomation(null, { merge: true })).toEqual({
+      kind: "start",
+      policy: { fix: false, merge: true },
+    });
+    const failed: BabysitSession = {
+      ...watching,
+      status: "failed",
+      error: "x",
+      cleanupPending: true,
+    };
+    expect(decideAutomation(failed, { fix: true })).toEqual({
+      kind: "unchanged",
+    });
+    expect(decideAutomation(failed, { merge: false })).toEqual({
+      kind: "resume",
+      session: failed,
+      policy: { fix: true, merge: false },
+      cleanupFirst: true,
+    });
+  });
+
+  it("never re-enables a merged pull request and replaces a closed session", () => {
+    const mergedSession: BabysitSession = {
+      ...watching,
+      status: "merged",
+      mergedAt: now,
+    };
+    expect(decideAutomation(mergedSession, { fix: true })).toEqual({
+      kind: "reject",
+      reason: "merged",
+    });
+    expect(decideAutomation(mergedSession, { fix: false })).toEqual({
+      kind: "unchanged",
+    });
+    expect(
+      decideAutomation(
+        { ...watching, status: "closed", closedAt: now },
+        { merge: true },
+      ),
+    ).toEqual({ kind: "start", policy: { fix: false, merge: true } });
   });
 });

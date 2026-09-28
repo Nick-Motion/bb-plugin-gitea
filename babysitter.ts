@@ -17,12 +17,71 @@ export const babysitExecutionSchema = z
     serviceTier: z.enum(["fast", "default"]),
   })
   .strict();
+export const babysitPolicySchema = z.union([
+  z.object({ fix: z.literal(true), merge: z.boolean() }).strict(),
+  z.object({ fix: z.literal(false), merge: z.literal(true) }).strict(),
+]);
+export type BabysitPolicy = z.infer<typeof babysitPolicySchema>;
+export const automationSchema = z
+  .object({ fix: z.boolean(), merge: z.boolean() })
+  .strict();
+export type Automation = z.infer<typeof automationSchema>;
+export const automationOptions = {
+  fix: z.boolean().optional(),
+  merge: z.boolean().optional(),
+};
+export const setsAutomationOption = [
+  (patch: { fix?: boolean; merge?: boolean }) =>
+    patch.fix !== undefined || patch.merge !== undefined,
+  { message: "Set fix, merge, or both." },
+] as const;
+export const automationPatchSchema = z
+  .object(automationOptions)
+  .strict()
+  .refine(...setsAutomationOption);
+export type AutomationPatch = z.infer<typeof automationPatchSchema>;
+const legacyPolicy: BabysitPolicy = { fix: true, merge: true };
+const automationOff: Automation = { fix: false, merge: false };
+
+export function activePolicy(automation: Automation): BabysitPolicy | null {
+  if (automation.fix) return { fix: true, merge: automation.merge };
+  return automation.merge ? { fix: false, merge: true } : null;
+}
+
+export function applyAutomationPatch(
+  current: Automation,
+  patch: AutomationPatch,
+): Automation {
+  return {
+    fix: patch.fix ?? current.fix,
+    merge: patch.merge ?? current.merge,
+  };
+}
+
 export const babysitPreferencesSchema = z
-  .object({ autoBabysit: z.boolean(), execution: babysitExecutionSchema })
+  .object({
+    autoFix: z.boolean(),
+    autoMerge: z.boolean(),
+    execution: babysitExecutionSchema,
+  })
   .strict();
 export type BabysitPreferences = z.infer<typeof babysitPreferencesSchema>;
+const storedPreferencesSchema = z.union([
+  babysitPreferencesSchema,
+  z
+    .object({ autoBabysit: z.boolean(), execution: babysitExecutionSchema })
+    .strict()
+    .transform(
+      ({ autoBabysit, execution }): BabysitPreferences => ({
+        autoFix: autoBabysit,
+        autoMerge: autoBabysit,
+        execution,
+      }),
+    ),
+]);
 export const defaultBabysitPreferences: BabysitPreferences = {
-  autoBabysit: false,
+  autoFix: false,
+  autoMerge: false,
   execution: {
     providerId: "codex",
     model: "gpt-5.6-luna",
@@ -36,6 +95,7 @@ const sessionBase = z.object({
   number: z.number().int().positive(),
   threadId: z.string().min(1),
   updatedAt: z.string().min(1),
+  policy: babysitPolicySchema,
 });
 export const babysitSessionSchema = z.discriminatedUnion("status", [
   sessionBase.extend({ status: z.literal("watching") }),
@@ -50,9 +110,39 @@ export const babysitSessionSchema = z.discriminatedUnion("status", [
   sessionBase.extend({ status: z.literal("stopped") }),
 ]);
 export type BabysitSession = z.infer<typeof babysitSessionSchema>;
+const storedSessionSchema = z.preprocess(
+  (raw) =>
+    typeof raw === "object" && raw !== null && !("policy" in raw)
+      ? { ...raw, policy: legacyPolicy }
+      : raw,
+  babysitSessionSchema,
+);
+
+export function parseStoredSession(raw: unknown): BabysitSession | null {
+  const parsed = storedSessionSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+export function parseStoredPreferences(raw: unknown): BabysitPreferences {
+  const parsed = storedPreferencesSchema.safeParse(raw);
+  return parsed.success ? parsed.data : defaultBabysitPreferences;
+}
+
+export function sessionAutomation(session: BabysitSession | null): Automation {
+  switch (session?.status) {
+    case "watching":
+    case "needs_you":
+    case "failed":
+      return { fix: session.policy.fix, merge: session.policy.merge };
+    default:
+      return automationOff;
+  }
+}
+
 export type BabysitAction = "start" | "stop" | "retry";
 const actionsSchema = z.object({
   actions: z.array(z.enum(["start", "stop", "retry"])),
+  automation: automationSchema,
 });
 export const babysitSessionViewSchema = z.intersection(
   babysitSessionSchema,
@@ -174,28 +264,83 @@ export function babysitView(
     }).kind === "spawn"
       ? ["start"]
       : [];
+  const automation = sessionAutomation(session);
   return session === null
-    ? { status: "idle", actions: start }
-    : { ...session, actions: [...sessionActions(session), ...start] };
+    ? { status: "idle", actions: start, automation }
+    : {
+        ...session,
+        actions: [...sessionActions(session), ...start],
+        automation,
+      };
+}
+
+export function sessionView(session: BabysitSession) {
+  return {
+    ...session,
+    actions: sessionActions(session),
+    automation: sessionAutomation(session),
+  };
+}
+
+export type AutomationDecision =
+  | { kind: "unchanged" }
+  | { kind: "stop" }
+  | { kind: "start"; policy: BabysitPolicy }
+  | { kind: "update"; session: WatchingSession; policy: BabysitPolicy }
+  | {
+      kind: "resume";
+      session: ResumableSession;
+      policy: BabysitPolicy;
+      cleanupFirst: boolean;
+    }
+  | { kind: "reject"; reason: "merged" };
+type WatchingSession = Extract<BabysitSession, { status: "watching" }>;
+
+export function decideAutomation(
+  session: BabysitSession | null,
+  patch: AutomationPatch,
+): AutomationDecision {
+  const policy = activePolicy(
+    applyAutomationPatch(sessionAutomation(session), patch),
+  );
+  if (policy === null)
+    return decideStop(session) ? { kind: "stop" } : { kind: "unchanged" };
+  if (session?.status === "merged") return { kind: "reject", reason: "merged" };
+  if (session === null || session.status === "closed")
+    return { kind: "start", policy };
+  if (session.status !== "stopped" && samePolicy(session.policy, policy))
+    return { kind: "unchanged" };
+  return session.status === "watching"
+    ? { kind: "update", session, policy }
+    : {
+        kind: "resume",
+        session,
+        policy,
+        cleanupFirst: session.status === "failed" && session.cleanupPending,
+      };
+}
+
+function samePolicy(left: BabysitPolicy, right: BabysitPolicy): boolean {
+  return left.fix === right.fix && left.merge === right.merge;
 }
 
 export type RetryDecision =
-  | { kind: "start" }
+  | { kind: "start"; policy: BabysitPolicy }
   | { kind: "existing"; threadId: string }
-  | { kind: "reject"; reason: "merged" }
+  | { kind: "reject"; reason: "merged" | "idle" }
   | { kind: "resume"; session: ResumableSession; cleanupFirst: boolean };
-type ResumableSession = Extract<
+export type ResumableSession = Extract<
   BabysitSession,
   { status: "needs_you" | "failed" | "stopped" }
 >;
 
 export function decideRetry(session: BabysitSession | null): RetryDecision {
-  if (session === null) return { kind: "start" };
+  if (session === null) return { kind: "reject", reason: "idle" };
   switch (session.status) {
     case "merged":
       return { kind: "reject", reason: "merged" };
     case "closed":
-      return { kind: "start" };
+      return { kind: "start", policy: session.policy };
     case "watching":
       return { kind: "existing", threadId: session.threadId };
     case "failed":
@@ -223,17 +368,22 @@ export function decideStop(
     : null;
 }
 
+function retained(session: BabysitSession, now: string) {
+  return {
+    repo: session.repo,
+    number: session.number,
+    threadId: session.threadId,
+    updatedAt: now,
+    policy: session.policy,
+  };
+}
+
 function terminal(
   session: BabysitSession,
   lifecycle: Exclude<PullLifecycle, { state: "open" }>,
   now: string,
 ): BabysitSession {
-  const base = {
-    repo: session.repo,
-    number: session.number,
-    threadId: session.threadId,
-    updatedAt: now,
-  };
+  const base = retained(session, now);
   return lifecycle.state === "merged"
     ? { ...base, status: "merged", mergedAt: lifecycle.mergedAt }
     : { ...base, status: "closed", closedAt: lifecycle.closedAt };
@@ -246,10 +396,7 @@ function failed(
   cleanupPending = false,
 ): BabysitSession {
   return {
-    repo: session.repo,
-    number: session.number,
-    threadId: session.threadId,
-    updatedAt: now,
+    ...retained(session, now),
     status: "failed",
     error: clip(error),
     cleanupPending,
@@ -327,15 +474,7 @@ export function onArchived(
   session: BabysitSession,
   now: string,
 ): BabysitSession | null {
-  return session.status === "watching"
-    ? {
-        repo: session.repo,
-        number: session.number,
-        threadId: session.threadId,
-        updatedAt: now,
-        status: "stopped",
-      }
-    : null;
+  return session.status === "watching" ? stopped(session, now) : null;
 }
 
 export function onCleanupFailed(
@@ -350,24 +489,19 @@ export function onCleanupFailed(
   return failed(session, `Cleanup failed: ${detail}${previous}`, now, true);
 }
 
-export function stopped(session: BabysitSession, now: string): BabysitSession {
-  return {
-    repo: session.repo,
-    number: session.number,
-    threadId: session.threadId,
-    updatedAt: now,
-    status: "stopped",
-  };
+export function stopped(
+  session: BabysitSession,
+  now: string,
+): Extract<BabysitSession, { status: "stopped" }> {
+  return { ...retained(session, now), status: "stopped" };
 }
 
-export function watching(session: BabysitSession, now: string): BabysitSession {
-  return {
-    repo: session.repo,
-    number: session.number,
-    threadId: session.threadId,
-    updatedAt: now,
-    status: "watching",
-  };
+export function watching(
+  session: BabysitSession,
+  policy: BabysitPolicy,
+  now: string,
+): BabysitSession {
+  return { ...retained(session, now), policy, status: "watching" };
 }
 
 export function sameSession(
@@ -380,7 +514,8 @@ export function sameSession(
     right.number === left.number &&
     right.threadId === left.threadId &&
     right.status === left.status &&
-    right.updatedAt === left.updatedAt
+    right.updatedAt === left.updatedAt &&
+    samePolicy(right.policy, left.policy)
   );
 }
 
@@ -404,12 +539,41 @@ export function autoStartTargets<
   );
 }
 
+function policyInstructions(
+  policy: BabysitPolicy,
+  flags: string,
+  api: string,
+  number: number,
+): string[] {
+  const fix = policy.fix
+    ? [
+        "Auto-fix is on. Fix failing CI checks and address review feedback.",
+        `You can fix, commit, push, rebase, reply to review comments (\`tea pulls reply ${flags} ${number} <comment id> <reply>\`), resolve addressed review comments (\`tea pulls resolve ${flags} <comment id>\`), and mark a WIP pull request ready for review (\`tea pulls edit ${flags} --ready ${number}\`, which only strips a leading \`WIP: \` or \`[WIP]\` title prefix). Do not change the title otherwise.`,
+        "Test each code change before you push it.",
+      ]
+    : [
+        "Auto-fix is off. Do not change code, commit, push, rebase, reply to or resolve review comments, or edit the pull request.",
+        "If a required check fails, changes are requested, or the branch conflicts with its base, finish with NEEDS_YOU and say what blocks the merge.",
+      ];
+  const merge = policy.merge
+    ? [
+        "Auto-merge is on. Gitea has no auto-merge setting that you may enable; do not try to schedule one.",
+        `Merge only with \`tea pulls merge ${flags} --style <style> ${number}\`, and only when your Gitea permissions allow it, branch protection is satisfied, every required status check passes, and required approvals are present.`,
+        `Use the repository's default merge style (\`default_merge_style\` from \`${api}\`). Use squash only if the repository or a human requires it.`,
+      ]
+    : [
+        "Auto-merge is off. Never merge this pull request, and do not enable or schedule a merge. A human merges it; keep watching until Gitea reports it merged or closed.",
+      ];
+  return [...fix, ...merge];
+}
+
 export function buildBabysitterPrompt(input: {
   repo: string;
   number: number;
   title: string;
   baseUrl: string;
   login: string;
+  policy: BabysitPolicy;
 }): string {
   const ref = `${input.repo}#${input.number}`;
   const flags = `--login ${input.login} --repo ${input.repo}`;
@@ -428,15 +592,12 @@ export function buildBabysitterPrompt(input: {
     "",
     "Repeat these steps while the PR is open:",
     "1. Read the current PR state.",
-    "2. Complete the next action that can advance the PR.",
-    "3. Test each code change before you push it.",
-    "4. After each state change, return to step 1.",
-    "5. If no action is possible, run `sleep 300`. Then return to step 1.",
+    "2. Complete the next permitted action that can advance the PR.",
+    "3. After each state change, return to step 1.",
+    "4. If no permitted action is possible, run `sleep 300`. Then return to step 1.",
     "",
-    `You can fix, commit, push, rebase, reply to review comments (\`tea pulls reply ${flags} ${input.number} <comment id> <reply>\`), resolve addressed review comments (\`tea pulls resolve ${flags} <comment id>\`), and mark a WIP pull request ready for review (\`tea pulls edit ${flags} --ready ${input.number}\`, which only strips a leading \`WIP: \` or \`[WIP]\` title prefix). Do not change the title otherwise.`,
-    "Gitea has no auto-merge setting that this babysitter may enable; do not try to schedule one.",
-    `Merge only with \`tea pulls merge ${flags} --style <style> ${input.number}\`, and only when your Gitea permissions allow it, branch protection is satisfied, every required status check passes, and required approvals are present.`,
-    `Use the repository's default merge style (\`default_merge_style\` from \`${api}\`). Use squash only if the repository or a human requires it.`,
+    "These Auto-fix and Auto-merge settings replace any earlier instructions in this thread:",
+    ...policyInstructions(input.policy, flags, api, input.number),
     "Only missing credentials, missing permissions, destructive choices, and product or scope decisions require a human.",
     "Stay in this turn until the PR is merged, closed, manually stopped, or requires a human.",
     "",

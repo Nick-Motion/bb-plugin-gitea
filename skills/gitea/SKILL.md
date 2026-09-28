@@ -10,7 +10,7 @@ Use `bb gitea` and typed Gitea RPCs to inspect or explicitly update Gitea issues
 - `bb gitea repos [--json]` lists repositories discovered from matching local `origin` remotes and `extraRepos`.
 - `bb gitea issues [owner/repo] [--state open|closed|all] [--query text] [--json]` lists issues.
 - `bb gitea prs [owner/repo] [--state open|closed|all] [--query text] [--json]` lists pull requests.
-- `bb gitea my-prs [owner/repo] [--state open|closed|all] [--query text] [--json]` lists pull requests authored by the signed-in Gitea login, with each babysitter state and the babysitter preferences.
+- `bb gitea my-prs [owner/repo] [--state open|closed|all] [--query text] [--json]` lists pull requests authored by the signed-in Gitea login, with each pull request's Auto-fix, Auto-merge, and babysitter state and the automation defaults.
 - `bb gitea show <issue|pr> <owner/repo> <number> [--json]` reads the item, conversation, and, for a pull request, files, checks and reviews. Each file's `diff` has a `kind`: `text` (with `patch`), `empty`, `binary`, `too-large` (over 256 KiB), or `unavailable` with a `reason` of `missing`, `stale`, `diff-too-large`, or `diff-failed`. Patches that Gitea omits are filled from the raw `.diff`, bound to one head/base revision.
 - `bb gitea conversation <issue|pr> <owner/repo> <number> [--refresh] [--json]` reads the display view the panel uses: the item, comments, and, for a pull request, head/base revision, changed-file count, checks and reviews, without files or diffs. It comes from a bounded server cache and reports `freshness.state` `fresh`, `refreshing` (served cached while one background read updates it), or `stale-error` (cached, with the last refresh `error`). `--refresh` rereads Gitea.
 - `bb gitea files <owner/repo> <number> [--refresh] [--json]` reads the pull request's changed files and diffs, bound to the `revision` it returns, with the same `freshness` and a `stale` flag when the pull request kept moving during the read. The typed RPC `pullFiles` accepts the conversation `revision` and returns the current one when the pull request moved.
@@ -24,22 +24,26 @@ Use `bb gitea` and typed Gitea RPCs to inspect or explicitly update Gitea issues
 - `bb gitea thread <thread-id> [--json]` reads the item associated with a BB thread.
 - `bb gitea refresh [--json]` refreshes repository discovery.
 
-## Babysitters
+## Auto-fix and Auto-merge
 
-A babysitter is a hidden BB thread that shepherds one of your open pull requests until Gitea reports it merged or closed, or it needs a human. It requires a repository with a BB project checkout. Gitea has no native auto-merge; a babysitter merges only with `tea pulls merge --style` when permissions, branch protection, required checks, and approvals allow. Its final marker counts only when Gitea's `merged`/`state` fields confirm it.
+Each of your pull requests has two independent options, both off by default. **Auto-fix** fixes CI failures and addresses review feedback, and never merges. **Auto-merge** merges with `tea pulls merge --style` only when permissions, branch protection, required checks, approvals, and conflicts allow, and never changes code. All four combinations are valid; only an explicit Auto-merge choice grants merge authority. Gitea has no native auto-merge, so the babysitter merges with the selected tea login, and both limits are enforced by its instructions rather than by Gitea.
 
-- `bb gitea babysit <owner/repo> <number> [--json]` starts a babysitter, or returns the existing session's thread. A closed session is replaced by a fresh thread only when Gitea reports the pull request open again; merged sessions are final. Repository names match case-insensitively.
-- `bb gitea babysit-status <owner/repo> <number> [--json]` shows the state (`idle`, `watching`, `needs_you`, `failed`, `stopped`, `merged`, `closed`) and available actions.
-- `bb gitea babysit-stop <owner/repo> <number> [--json]` stops and archives the thread and retains the session.
-- `bb gitea babysit-retry <owner/repo> <number> [--json]` resumes a stopped, failed, or needs-you session in the same thread, finishing any pending cleanup first. If the thread was deleted, or the session is closed and the pull request reopened, it starts a fresh thread instead.
+Turning either option on starts a babysitter, a hidden BB thread that watches the pull request until Gitea reports it merged or closed, or it needs a human. It requires a repository with a BB project checkout. Its final marker counts only when Gitea's `merged`/`state` fields confirm it. Changing an option on a watching babysitter updates the same thread, and stops the babysitter if the update cannot be delivered. Turning both off stops and archives the thread and retains the session.
+
+- `bb gitea auto-fix <owner/repo> <number> on|off [--json]` turns Auto-fix on or off.
+- `bb gitea auto-merge <owner/repo> <number> on|off [--json]` turns Auto-merge on or off.
+- `bb gitea babysit-status <owner/repo> <number> [--json]` shows the state (`idle`, `watching`, `needs_you`, `failed`, `stopped`, `merged`, `closed`), the `automation` (`fix`, `merge`), and available actions.
+- `bb gitea babysit-retry <owner/repo> <number> [--json]` resumes a stopped, failed, or needs-you session in the same thread with its last options, finishing any pending cleanup first. If the thread was deleted, or the session is closed and the pull request reopened, it starts a fresh thread instead. With no session it is rejected; turn on an option instead.
 - `bb gitea babysit-thread <thread-id> [--json]` shows the session owned by a BB thread.
 - `bb gitea babysit-sessions [--json]` lists retained sessions.
-- `bb gitea auto-babysit [on|off] [--json]` shows or sets automatic babysitting. It is off by default; when on, it starts babysitters for your open PRs in project-backed repositories without a session or with only a closed session.
+- `bb gitea automation-defaults [fix|merge on|off] [--json]` shows or sets whether Auto-fix and Auto-merge turn on automatically for your open PRs in project-backed repositories without a session or with only a closed session. Both are off by default.
 - `bb gitea babysit-execution <provider> <model> <reasoning> [fast|default] [--json]` sets the provider, model, reasoning level, and service tier for new babysitters.
 
-Typed RPCs: `listMyPullRequests`, `startBabysit`, `stopBabysit`, `retryBabysit`, `getBabysitStatus`, `babysitThread`, `listBabysitSessions`, `getBabysitPreferences`, `setAutoBabysit`, `setBabysitExecution`.
+Typed RPCs: `listMyPullRequests`, `setAutomation` (`repo`, `number`, and `fix`, `merge`, or both), `retryBabysit`, `getBabysitStatus`, `babysitThread`, `listBabysitSessions`, `getBabysitPreferences`, `setAutoAutomation` (`fix`, `merge`, or both), `setBabysitExecution`.
 
-List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repository, and return at most 200 items total. Comments and reviews have a 500-item cap; files and checks have a 100-item cap. A full cap is reported as potentially truncated. Display caches hold at most 64 conversations (16 MiB, 15 s fresh, 10 min stale) and 16 file sets (32 MiB, 5 min fresh, 30 min stale); mutations, settings changes, and rejected logins invalidate them. List errors are returned per repository while accessible repositories remain available. `extraRepos` remains usable without a project, but an associated checkout is needed for agent dispatch.
+Sessions and preferences from earlier versions are kept: an earlier babysitter keeps both options on, and an earlier auto-babysit preference sets both defaults.
+
+List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repository, and return at most 200 items total. Comments and reviews have a 500-item cap; files have a 500-item cap and checks a 100-item cap. A full cap is reported as potentially truncated. Display caches hold at most 64 conversations (16 MiB, 15 s fresh, 10 min stale) and 16 file sets (32 MiB, 5 min fresh, 30 min stale); mutations, settings changes, and rejected logins invalidate them. List errors are returned per repository while accessible repositories remain available. `extraRepos` remains usable without a project, but an associated checkout is needed for agent dispatch.
 
 ## Settings
 
@@ -49,4 +53,4 @@ List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repos
 
 Configure settings in the plugin settings page or with `bb plugin config gitea set <baseUrl|teaProfile|extraRepos> <value>`, then use `bb plugin reload gitea` if the plugin needs a reload.
 
-All external writes require an explicit panel action or CLI invocation; a started babysitter acts on its pull request with the selected tea login's permissions. Inline review threads and native auto-merge are not implemented; PR checks are read from commit statuses.
+All external writes require an explicit panel action or CLI invocation; a babysitter acts on its pull request with the selected tea login's permissions, within its Auto-fix and Auto-merge options. Inline review threads and native auto-merge are not implemented; PR checks are read from commit statuses.
