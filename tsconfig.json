@@ -24,6 +24,7 @@
     "server.ts",
     "babysitter.ts",
     "pull-diff.ts",
+    "display-cache.ts",
     "*.test.ts",
     "app.tsx",
     "vitest.config.ts"

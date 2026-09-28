@@ -8,7 +8,7 @@ Gitea brings issues and pull requests from a Gitea instance into BB through the 
 bb plugin install https://github.com/Nick-Motion/bb-plugin-gitea
 ```
 
-This README describes version 1.1.0. Once the `v1.1.0` tag is published, pin it with `bb plugin install git:https://github.com/Nick-Motion/bb-plugin-gitea.git@v1.1.0`. The plugin id is `gitea`, and it registers the `bb gitea` command; do not install it alongside another plugin that registers the same command.
+This README describes version 1.2.0. Once the `v1.2.0` tag is published, pin it with `bb plugin install git:https://github.com/Nick-Motion/bb-plugin-gitea.git@v1.2.0`. To move an existing installation to a new release, run `bb plugin update gitea --yes`; settings and babysitter state are kept. The plugin id is `gitea`, and it registers the `bb gitea` command; do not install it alongside another plugin that registers the same command.
 
 ## Configure
 
@@ -29,7 +29,31 @@ The plugin runs `tea api` without a shell, always passes the resolved profile wi
 
 The panel copies My GitHub's tab header, compact state-and-title rows, list/detail navigation, themed diff renderer, and card spacing. It provides **My PRs**, **Issues**, **Pull requests**, and **Babysitters**, repository/state/text filters, refresh, issue creation, detail conversations, comments, close/reopen, label and assignee editing, PR files/checks/reviews, agent dispatch, and links to BB threads. My PRs lists pull requests in tracked repositories whose author is the signed-in Gitea login. Gitea limitations mean inline review threads and native auto-merge are unavailable; checks come from commit statuses.
 
-PR files show each patch that Gitea includes. When Gitea omits a patch, the plugin fetches the raw `pulls/<number>.diff` through the same `tea api --include` transport and matches its sections to files by new path, and by previous path for renames. The files and diff are bound to the head and base revision read before and after them. If the revision moves, the plugin rereads once; if it moves again, every diff is marked stale. A file shows its patch, a binary or no-content notice, a too-large notice above 256 KiB, or an unavailable reason (missing section, stale revision, raw diff over 16 MiB, or failed raw diff read), with a link to the files page on Gitea.
+PR files show each patch that Gitea includes. When Gitea omits a patch, the plugin fetches the raw `pulls/<number>.diff` through the same `tea api --include` transport and matches its sections to files by new path, and by previous path for renames. The files and diff are bound to the head and base revision read before and after them; the Files tab passes the revision from the conversation. If the revision moves, the plugin rereads once; if it moves again, every diff is marked stale. A file shows its patch, a binary or no-content notice, a too-large notice above 256 KiB, or an unavailable reason (missing section, stale revision, raw diff over 16 MiB, or failed raw diff read), with a link to the files page on Gitea.
+
+## Display cache
+
+The panel and `bb gitea conversation` / `bb gitea files` read through a bounded in-memory cache on the plugin server; nothing is written to disk. Each entry is keyed by the normalized instance URL and path prefix, the tea profile and its user, the item kind, the repository (case-insensitive), and the number. Keys hold no bodies or secrets, and realtime notices carry only `owner/repo#number`.
+
+| Read | Fresh for | Served stale for at most | Entries | Total size | Largest entry |
+| --- | --- | --- | --- | --- | --- |
+| Conversation (item, comments, reviews, checks, revision) | 15 s | 10 min | 64 | 16 MiB | 2 MiB |
+| Pull request files and diffs, per head/base revision | 5 min | 30 min | 16 | 32 MiB | 8 MiB |
+
+A fresh entry returns without calling Gitea. An older entry returns immediately with `freshness.state` `refreshing` while one shared background read updates it. When that read finishes, the plugin publishes `display-changed` and the panel rereads. If the refresh fails, the entry is shown as `stale-error` with the error. The read is retried after 30 seconds and is dropped when its retention ends. Concurrent identical reads share one Gitea read. When one caller cancels, a read still shared by other callers keeps running; background refreshes never belong to a caller. The least recently used entries are evicted first. Larger values are returned but not stored, and so are files that went stale while they were read.
+
+The following clear the cache:
+
+- **Refresh** in the panel and `--refresh` reread the item from Gitea.
+- Comments, state changes, label and assignee edits, and reviews invalidate their item.
+- A settings change clears everything.
+- A rejected or missing tea login clears everything; a 403 or 404 drops that entry.
+- A read that was in flight when its entry was invalidated cannot repopulate the cache.
+- Reloading the plugin disposes the cache and cancels its reads.
+
+The conversation loads the issue, comments, pull request, reviews, and commit statuses in parallel, within tea's eight concurrent requests. It does not fetch files or the raw diff; the Files tab requests them for the revision the conversation shows. If the pull request moved, the files response reports the new revision and the conversation is reloaded instead of pairing old diffs with it.
+
+Babysitter lifecycle, merge and terminal decisions, mutations, and `bb gitea show` never use the display cache; they read Gitea directly.
 
 ## Babysitters
 
@@ -51,6 +75,8 @@ bb gitea repos [--json]
 bb gitea issues [owner/repo] [--state open|closed|all] [--query text] [--json]
 bb gitea prs [owner/repo] [--state open|closed|all] [--query text] [--json]
 bb gitea show <issue|pr> <owner/repo> <number> [--json]
+bb gitea conversation <issue|pr> <owner/repo> <number> [--refresh] [--json]
+bb gitea files <owner/repo> <number> [--refresh] [--json]
 bb gitea create-issue <owner/repo> <title> [--body text]
 bb gitea comment <owner/repo> <number> <body>
 bb gitea set-state <owner/repo> <number> <open|closed>

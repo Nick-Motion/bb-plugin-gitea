@@ -822,6 +822,255 @@ it("rereads files once when the head moves and marks diffs stale if it keeps mov
   expect(read).toBe(3);
 });
 
+async function conversation(host: Host, input: Record<string, unknown> = {}) {
+  return giteaRpcContract.conversation.output.parse(
+    await host.harness.behavior.callRpc("conversation", {
+      repo: "acme/widgets",
+      number: 9,
+      kind: "pr",
+      ...input,
+    }),
+  );
+}
+
+async function files(host: Host, input: Record<string, unknown> = {}) {
+  return giteaRpcContract.pullFiles.output.parse(
+    await host.harness.behavior.callRpc("pullFiles", {
+      repo: "acme/widgets",
+      number: 9,
+      ...input,
+    }),
+  );
+}
+
+function displaySignals(host: Host) {
+  return host.harness.inspection.realtimeSignals.filter(
+    (signal) => signal.channel === "display-changed",
+  );
+}
+
+const readsFiles = (call: TeaCall) =>
+  call.endpoint.includes("/pulls/9/files") ||
+  call.endpoint.endsWith("/pulls/9.diff");
+
+it("reads the pull request conversation without files, loads files on request, and serves repeats from cache", async () => {
+  const { host, calls } = await start(
+    diffApi(
+      rawFiles,
+      () => ({ raw: rawDiff }),
+      () => ({
+        ...pullJson(),
+        changed_files: rawFiles.length,
+      }),
+    ),
+  );
+  const first = await conversation(host);
+  expect(first.freshness.state).toBe("fresh");
+  expect(first.conversation).toMatchObject({
+    kind: "pr",
+    title: "Diff",
+    headRefName: "feature",
+    revision: { head: headSha, base: baseSha },
+    changedFiles: rawFiles.length,
+  });
+  expect(calls.some(readsFiles)).toBe(false);
+  const coldCalls = calls.length;
+  expect((await conversation(host)).freshness.state).toBe("fresh");
+  expect(calls).toHaveLength(coldCalls);
+
+  const listed = await files(host, {
+    revision: { head: headSha, base: baseSha },
+  });
+  expect(listed.stale).toBe(false);
+  expect(listed.files.map((file) => file.diff.kind)).toContain("text");
+  expect(
+    calls
+      .slice(coldCalls)
+      .map((call) => call.endpoint.split("?")[0]!.replace(/.*\/pulls\//, "")),
+  ).toEqual(["9/files", "9.diff", "9"]);
+  const fileCalls = calls.length;
+  await files(host, { revision: { head: headSha, base: baseSha } });
+  expect(calls).toHaveLength(fileCalls);
+});
+
+it("names team reviewers and ghost authors instead of rejecting the response", async () => {
+  const { host } = await start(({ endpoint }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/issues/9")) return { json: issue(9, "Team") };
+    if (path.endsWith("/pulls/9")) return { json: pullJson() };
+    if (path.endsWith("/pulls/9/reviews"))
+      return {
+        json:
+          page(endpoint) === 1
+            ? [
+                { user: null, team: { name: "core" }, state: "REQUEST_REVIEW" },
+                { user: null, team: null, state: "COMMENT" },
+              ]
+            : [],
+      };
+    return { json: [] };
+  });
+  const { conversation: loaded } = await conversation(host);
+  expect(loaded.kind === "pr" && loaded.reviews.map((r) => r.author)).toEqual([
+    "core",
+    "",
+  ]);
+});
+
+it("invalidates a cached item after a mutation and announces the change without content", async () => {
+  let title = "Before";
+  const { host, calls } = await start(({ endpoint, method }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/issues/9") && method === "GET")
+      return { json: issue(9, title) };
+    if (path.endsWith("/pulls/9")) return { json: pullJson() };
+    return { json: method === "GET" ? [] : {} };
+  });
+  await conversation(host);
+  title = "After";
+  expect((await conversation(host)).conversation.title).toBe("Before");
+  await host.harness.behavior.callRpc("comment", {
+    repo: "acme/widgets",
+    number: 9,
+    body: "done",
+  });
+  expect(displaySignals(host).at(-1)?.payload).toEqual({
+    item: "acme/widgets#9",
+  });
+  const before = calls.length;
+  expect((await conversation(host)).conversation.title).toBe("After");
+  expect(calls.length).toBeGreaterThan(before);
+});
+
+it("serves stale content while a background refresh runs and reports its outcome", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  cleanups.push(() => {
+    vi.useRealTimers();
+  });
+  let title = "First";
+  let failing = false;
+  const { host } = await start(({ endpoint }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/issues/4"))
+      return failing ? { status: 500 } : { json: issue(4, title) };
+    return { json: [] };
+  });
+  const read = () => conversation(host, { number: 4, kind: "issue" });
+  await read();
+  title = "Second";
+  vi.setSystemTime(Date.now() + 20_000);
+  const stale = await read();
+  expect(stale).toMatchObject({
+    freshness: { state: "refreshing" },
+    conversation: { title: "First" },
+  });
+  await vi.waitFor(() => expect(displaySignals(host)).toHaveLength(1));
+  expect(displaySignals(host)[0]!.payload).toEqual({ item: "acme/widgets#4" });
+  expect(await read()).toMatchObject({
+    freshness: { state: "fresh" },
+    conversation: { title: "Second" },
+  });
+
+  failing = true;
+  vi.setSystemTime(Date.now() + 20_000);
+  expect((await read()).freshness.state).toBe("refreshing");
+  await vi.waitFor(() => expect(displaySignals(host)).toHaveLength(2));
+  expect(await read()).toMatchObject({
+    freshness: { state: "stale-error", error: "Gitea API returned HTTP 500." },
+    conversation: { title: "Second" },
+  });
+});
+
+it("keys cached content by account and clears it when settings change or Gitea rejects the login", async () => {
+  let rejected = false;
+  const { host, calls } = await start(
+    ({ endpoint }) => {
+      const path = endpoint.split("?")[0]!;
+      if (rejected) return { status: 401 };
+      if (path.endsWith("/issues/4")) return { json: issue(4) };
+      if (path.endsWith("/issues/5")) return { json: issue(5) };
+      return { json: [] };
+    },
+    {
+      profiles: [
+        ...defaultProfiles,
+        { name: "ops", url: "https://gitea.example/prefix", user: "ops" },
+      ],
+      settings: { teaProfile: "work" },
+    },
+  );
+  const read = (number: number) =>
+    conversation(host, { number, kind: "issue" });
+  await read(4);
+  await read(5);
+  const warm = calls.length;
+  await read(4);
+  expect(calls).toHaveLength(warm);
+
+  await host.harness.behavior.setSettings({ teaProfile: "ops" });
+  expect(displaySignals(host).at(-1)?.payload).toEqual({ item: null });
+  await read(4);
+  expect(calls.slice(warm).every((call) => call.login === "ops")).toBe(true);
+  expect(calls.length).toBeGreaterThan(warm);
+
+  await read(5);
+  rejected = true;
+  await expect(read(4)).resolves.toBeDefined();
+  await expect(
+    conversation(host, { number: 4, kind: "issue", refresh: true }),
+  ).rejects.toThrow('Gitea rejected tea login profile "ops"');
+  const afterRejection = calls.length;
+  const announced = displaySignals(host).length;
+  await expect(read(5)).rejects.toThrow("rejected");
+  expect(calls.length).toBeGreaterThan(afterRejection);
+  await expect(read(5)).rejects.toThrow("rejected");
+  expect(displaySignals(host)).toHaveLength(announced);
+});
+
+it("reports a revision change instead of binding old diffs to the conversation", async () => {
+  const moved = "c".repeat(40);
+  let head = headSha;
+  const { host, calls } = await start(
+    diffApi(
+      [{ filename: "src/app.ts", status: "modified", patch: rawHunk }],
+      () => ({ raw: rawDiff }),
+      () => pullJson(head),
+    ),
+  );
+  const shown = (await conversation(host)).conversation;
+  expect(shown.kind === "pr" && shown.revision.head).toBe(headSha);
+  head = moved;
+  const listed = await files(host, {
+    revision: { head: headSha, base: baseSha },
+  });
+  expect(listed.revision.head).toBe(moved);
+  expect(listed.stale).toBe(false);
+  expect(displaySignals(host).at(-1)?.payload).toEqual({
+    item: "acme/widgets#9",
+  });
+  const before = calls.length;
+  const reread = (await conversation(host)).conversation;
+  expect(reread.kind === "pr" && reread.revision.head).toBe(moved);
+  expect(calls.length).toBeGreaterThan(before);
+  const cached = calls.length;
+  await files(host, { revision: { head: moved, base: baseSha } });
+  expect(calls).toHaveLength(cached);
+});
+
+it("keeps full detail uncached for the CLI show command", async () => {
+  const { host, calls } = await start(
+    diffApi([{ filename: "a.ts", status: "modified", patch: rawHunk }], () => ({
+      status: 500,
+    })),
+  );
+  await conversation(host);
+  const before = calls.length;
+  await pullDetail(host);
+  const once = calls.length - before;
+  await pullDetail(host);
+  expect(calls.length - before).toBe(once * 2);
+});
+
 type ThreadState = {
   spawned: number;
   archiveFailures: number;
@@ -864,7 +1113,8 @@ async function startBabysitters() {
   const patchThread = (
     threadId: string,
     patch: Partial<ReturnType<typeof makeThreadResponse>>,
-  ) => state.threads.set(threadId, { ...state.threads.get(threadId), ...patch });
+  ) =>
+    state.threads.set(threadId, { ...state.threads.get(threadId), ...patch });
   const threads: FakeSdkOverrides["threads"] = {
     spawn: async () => ({ id: `babysit-${++state.spawned}` }),
     send: async () => {
@@ -919,6 +1169,13 @@ async function startBabysitters() {
                   .map(([, pull]) => pull)
               : [],
         };
+      const shown = path.match(
+        /^\/api\/v1\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)$/,
+      );
+      if (shown) {
+        const pull = pulls.get(`${shown[1]!.toLowerCase()}#${shown[2]}`);
+        return pull ? { json: pull } : { status: 404 };
+      }
       const one = path.match(
         /^\/api\/v1\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/,
       );
@@ -1113,6 +1370,21 @@ it("confirms terminal state with Gitea, cleans up, and refuses to restart a merg
     rpc(host, "babysitThread", { threadId: "babysit-1" }),
   ).resolves.toMatchObject({ status: "merged", number: 42 });
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+});
+
+it("decides babysitter lifecycle from live Gitea state rather than cached display content", async () => {
+  const { host, settle } = await startBabysitters();
+  await expect(
+    conversation(host, { number: 42, kind: "pr" }),
+  ).resolves.toMatchObject({ conversation: { state: "open" } });
+  settle("acme/widgets#42", true);
+  await expect(
+    conversation(host, { number: 42, kind: "pr" }),
+  ).resolves.toMatchObject({ conversation: { state: "open" } });
+  await expect(rpc(host, "startBabysit", pr42)).rejects.toThrow(
+    "the pull request is merged",
+  );
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
 });
 
 it("fails an unconfirmed marker and resumes the retained thread on retry", async () => {

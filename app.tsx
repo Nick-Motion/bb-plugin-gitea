@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   definePluginApp,
   experimental_ProviderModelPicker as ProviderModelPicker,
@@ -36,8 +36,19 @@ import { FileDiff as PierreFileDiff } from "@pierre/diffs/react";
 type Item = PluginRpcResult<
   (typeof giteaRpcContract)["listItems"]
 >["items"][number];
-type Detail = PluginRpcResult<(typeof giteaRpcContract)["detail"]>;
-type FileDiff = Detail["files"][number]["diff"];
+type ConversationView = PluginRpcResult<
+  (typeof giteaRpcContract)["conversation"]
+>;
+type FilesView = PluginRpcResult<(typeof giteaRpcContract)["pullFiles"]>;
+type FileEntry = FilesView["files"][number];
+type FileDiff = FileEntry["diff"];
+type Freshness = ConversationView["freshness"];
+type ItemRef = { kind: "issue" | "pr"; repo: string; number: number };
+type Loadable<T> =
+  | { state: "loading" }
+  | { state: "ready"; value: T }
+  | { state: "error"; message: string };
+type Keyed<T> = { key: string; view: Loadable<T> };
 type MyPulls = PluginRpcResult<(typeof giteaRpcContract)["listMyPullRequests"]>;
 type Preferences = MyPulls["preferences"];
 type BabysitView = MyPulls["items"][number]["babysit"];
@@ -165,11 +176,11 @@ function PatchView({ path, patch }: { path: string; patch: string }) {
   );
 }
 
-function filesUrl(detail: Detail) {
-  return detail.url ? `${detail.url.replace(/\/+$/, "")}/files` : "";
+function filesUrl(item: { url: string }) {
+  return item.url ? `${item.url.replace(/\/+$/, "")}/files` : "";
 }
 
-function DiffBanner({ files }: { files: Detail["files"] }) {
+function DiffBanner({ files }: { files: FileEntry[] }) {
   const reasons = new Set(
     files.flatMap((file) =>
       file.diff.kind === "unavailable" ? [file.diff.reason] : [],
@@ -193,6 +204,235 @@ function DiffBanner({ files }: { files: Detail["files"] }) {
 
 function itemKey(item: Pick<Item, "repo" | "number">) {
   return `${item.repo}#${item.number}`;
+}
+
+function itemTag(item: Pick<Item, "repo" | "number">) {
+  return `${item.repo.toLowerCase()}#${item.number}`;
+}
+
+function changedItem(payload: unknown): string | null | undefined {
+  if (typeof payload !== "object" || payload === null || !("item" in payload))
+    return undefined;
+  const { item } = payload;
+  return item === null || typeof item === "string" ? item : undefined;
+}
+
+function errorText(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+const loading = { state: "loading" } as const;
+
+function useItemDisplay(target: ItemRef | null, wantFiles: boolean) {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const key = target ? `${target.kind}:${itemTag(target)}` : null;
+  const [conversation, setConversation] =
+    useState<Keyed<ConversationView> | null>(null);
+  const [files, setFiles] = useState<Keyed<FilesView> | null>(null);
+  const conversationRun = useRef(0);
+  const filesRun = useRef(0);
+  const loadConversation = useCallback(
+    async (refresh: boolean) => {
+      if (!target || !key) return;
+      const run = ++conversationRun.current;
+      let view: Loadable<ConversationView>;
+      try {
+        view = {
+          state: "ready",
+          value: await rpc.call("conversation", { ...target, refresh }),
+        };
+      } catch (error) {
+        view = {
+          state: "error",
+          message: errorText(error, "Could not load item"),
+        };
+      }
+      if (run === conversationRun.current) setConversation({ key, view });
+    },
+    [key, rpc, target],
+  );
+  useEffect(() => {
+    void loadConversation(false);
+    return () => {
+      conversationRun.current += 1;
+    };
+  }, [loadConversation]);
+  const shown = conversation?.key === key ? conversation.view : loading;
+  const revision =
+    shown.state === "ready" && shown.value.conversation.kind === "pr"
+      ? shown.value.conversation.revision
+      : null;
+  const filesKey =
+    key && revision ? `${key}@${revision.head}:${revision.base}` : null;
+  const loadFiles = useCallback(
+    async (refresh: boolean) => {
+      if (!target || !filesKey || !revision) return;
+      const run = ++filesRun.current;
+      let view: Loadable<FilesView>;
+      try {
+        view = {
+          state: "ready",
+          value: await rpc.call("pullFiles", {
+            repo: target.repo,
+            number: target.number,
+            revision,
+            refresh,
+          }),
+        };
+      } catch (error) {
+        view = {
+          state: "error",
+          message: errorText(error, "Could not load changed files"),
+        };
+      }
+      if (run === filesRun.current) setFiles({ key: filesKey, view });
+    },
+    [filesKey, rpc, target],
+  );
+  useEffect(() => {
+    if (!wantFiles) return;
+    void loadFiles(false);
+    return () => {
+      filesRun.current += 1;
+    };
+  }, [loadFiles, wantFiles]);
+  const onChange = useCallback(
+    (payload: unknown) => {
+      const item = changedItem(payload);
+      if (item === undefined || !target) return;
+      if (item !== null && item !== itemTag(target)) return;
+      void loadConversation(false);
+      if (wantFiles) void loadFiles(false);
+    },
+    [loadConversation, loadFiles, target, wantFiles],
+  );
+  useRealtime("display-changed", onChange);
+  const shownFiles = files?.key === filesKey ? files.view : loading;
+  const filesMoved =
+    shownFiles.state === "ready" &&
+    revision !== null &&
+    (shownFiles.value.revision.head !== revision.head ||
+      shownFiles.value.revision.base !== revision.base);
+  return {
+    conversation: shown,
+    files: shownFiles,
+    filesMoved,
+    reload: () => loadConversation(false),
+    refresh: async () => {
+      await loadConversation(true);
+      if (wantFiles) await loadFiles(true);
+    },
+  };
+}
+
+function FreshnessNote({
+  freshness,
+  onRefresh,
+}: {
+  freshness: Freshness;
+  onRefresh: () => void;
+}) {
+  const time = new Date(freshness.fetchedAt).toLocaleTimeString();
+  return (
+    <span
+      data-testid="bb-freshness"
+      data-state={freshness.state}
+      className="flex shrink-0 items-center gap-1"
+      title={freshness.state === "stale-error" ? freshness.error : undefined}
+    >
+      {freshness.state === "fresh"
+        ? `Updated ${time}`
+        : freshness.state === "refreshing"
+          ? `Updating · shown from ${time}`
+          : `Refresh failed · shown from ${time}`}
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-7 px-2"
+        onClick={onRefresh}
+      >
+        Refresh
+      </Button>
+    </span>
+  );
+}
+
+function FilesList({
+  files,
+  url,
+  moved,
+  compact,
+}: {
+  files: Loadable<FilesView>;
+  url: string;
+  moved: boolean;
+  compact: boolean;
+}) {
+  if (files.state === "loading")
+    return (
+      <div className="space-y-2" data-testid="bb-files-loading">
+        <Skeleton className="h-8 w-full" />
+        <Skeleton className="h-32 w-full" />
+      </div>
+    );
+  if (files.state === "error")
+    return <p className="text-xs text-muted-foreground">{files.message}</p>;
+  if (moved)
+    return (
+      <p role="status" className="text-xs text-muted-foreground">
+        This pull request changed since its conversation loaded. Loading the
+        latest revision…
+      </p>
+    );
+  const { value } = files;
+  return (
+    <>
+      {value.filesTruncated && (
+        <p className="text-xs text-muted-foreground">
+          The file list reached the 100-file cap and may be incomplete.
+        </p>
+      )}
+      {value.freshness.state === "stale-error" && (
+        <p role="status" className="text-xs text-muted-foreground">
+          Showing files from{" "}
+          {new Date(value.freshness.fetchedAt).toLocaleTimeString()}. Gitea
+          refresh failed: {value.freshness.error}
+        </p>
+      )}
+      <DiffBanner files={value.files} />
+      {value.files.map((file) =>
+        compact ? (
+          <details key={file.path} className="border-b py-2">
+            <summary className="cursor-pointer">{file.path}</summary>
+            <div className="mt-2 overflow-hidden rounded-md border border-border bg-card">
+              <GiteaDiff path={file.path} diff={file.diff} filesUrl={url} />
+            </div>
+          </details>
+        ) : (
+          <article
+            key={file.path}
+            className="overflow-hidden rounded-lg border border-border bg-card"
+          >
+            <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-2 text-xs">
+              <span className="min-w-0 flex-1 truncate font-mono">
+                {file.previousPath
+                  ? `${file.previousPath} → ${file.path}`
+                  : file.path}
+              </span>
+              <span className="text-green-600 dark:text-green-400">
+                +{file.additions}
+              </span>
+              <span className="text-red-600 dark:text-red-400">
+                −{file.deletions}
+              </span>
+              <Badge variant="secondary">{file.status}</Badge>
+            </div>
+            <GiteaDiff path={file.path} diff={file.diff} filesUrl={url} />
+          </article>
+        ),
+      )}
+    </>
+  );
 }
 
 function parseSubPath(
@@ -501,8 +741,6 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     errors: Array<{ repo: string; message: string }>;
   }>({ truncated: false, errors: [] });
   const [listError, setListError] = useState<string | null>(null);
-  const [detail, setDetail] = useState<Detail | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
   const [status, setStatus] = useState<{
     ready: boolean;
     error: string | null;
@@ -517,6 +755,17 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const [reviewBody, setReviewBody] = useState("");
   const [detailSection, setDetailSection] =
     useState<DetailSection>("conversation");
+  const route = useMemo(() => parseSubPath(subPath), [subPath]);
+  const display = useItemDisplay(route, detailSection === "files");
+  const shown = display.conversation;
+  const detail = useMemo(
+    () =>
+      shown.state === "ready"
+        ? { ...shown.value.conversation, threadId: shown.value.threadId }
+        : null,
+    [shown],
+  );
+  const detailError = shown.state === "error" ? shown.message : null;
   const [labelsDraft, setLabelsDraft] = useState("");
   const [assigneesDraft, setAssigneesDraft] = useState("");
   useEffect(() => {
@@ -584,45 +833,16 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     },
     [navigate],
   );
-  const refreshDetail = useCallback(
-    async (item: Pick<Item, "repo" | "number" | "kind">) => {
-      const result = await rpc.call("detail", item);
-      setDetail(result);
-    },
-    [rpc],
-  );
+  const { reload: refreshDetail } = display;
   useEffect(() => {
-    const target = parseSubPath(subPath);
-    if (!target) {
-      setDetail(null);
+    if (!route) {
       setNewIssue(subPath === "new");
       if (subPath === "new") setView("issues");
       return;
     }
-    setView(target.kind === "pr" ? "pulls" : "issues");
+    setView(route.kind === "pr" ? "pulls" : "issues");
     setDetailSection("conversation");
-    setDetail(null);
-    setDetailError(null);
-    let current = true;
-    void rpc
-      .call("detail", target)
-      .then((result) => {
-        if (current) setDetail(result);
-      })
-      .catch((error: unknown) => {
-        if (current) {
-          setDetailError(
-            error instanceof Error ? error.message : "Could not load item",
-          );
-          toast.error(
-            error instanceof Error ? error.message : "Could not load item",
-          );
-        }
-      });
-    return () => {
-      current = false;
-    };
-  }, [rpc, subPath]);
+  }, [route, subPath]);
   const refresh = useCallback(async () => {
     await loadStatus();
     await loadItems();
@@ -636,7 +856,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
         body: draft,
       });
       setDraft("");
-      await refreshDetail(detail);
+      await refreshDetail();
       toast.success("Comment added");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Comment failed");
@@ -651,7 +871,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           number: detail.number,
           state: next,
         });
-        await refreshDetail(detail);
+        await refreshDetail();
         await loadItems();
         toast.success(next === "closed" ? "Closed" : "Reopened");
       } catch (error) {
@@ -671,7 +891,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           body: reviewBody,
         });
         setReviewBody("");
-        await refreshDetail(detail);
+        await refreshDetail();
         toast.success("Review submitted");
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "Review failed");
@@ -687,7 +907,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
         number: detail.number,
         kind: detail.kind,
       });
-      await refreshDetail(detail);
+      await refreshDetail();
       navigate.toThread(result.threadId);
       toast.success("BB agent thread created");
     } catch (error) {
@@ -713,7 +933,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           .map((value) => value.trim())
           .filter(Boolean),
       });
-      await refreshDetail(detail);
+      await refreshDetail();
       toast.success("Labels and assignees updated");
     } catch (error) {
       toast.error(
@@ -830,6 +1050,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   {detail.repo} · #{detail.number}
                 </span>
                 <span className="flex-1" />
+                {shown.state === "ready" && (
+                  <FreshnessNote
+                    freshness={shown.value.freshness}
+                    onRefresh={() => void display.refresh()}
+                  />
+                )}
                 {detail.url && (
                   <UrlLink
                     href={detail.url}
@@ -839,6 +1065,19 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   </UrlLink>
                 )}
               </div>
+              {shown.state === "ready" &&
+                shown.value.freshness.state === "stale-error" && (
+                  <p
+                    role="status"
+                    className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+                  >
+                    Showing content from{" "}
+                    {new Date(
+                      shown.value.freshness.fetchedAt,
+                    ).toLocaleTimeString()}
+                    . Gitea refresh failed: {shown.value.freshness.error}
+                  </p>
+                )}
               <div className="flex flex-wrap items-start gap-3">
                 <h2 className="min-w-0 flex-1 text-xl font-semibold text-foreground">
                   {detail.title}{" "}
@@ -911,7 +1150,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                         <TabsTrigger value="files">
                           Files{" "}
                           <Badge variant="secondary" className="ml-1.5">
-                            {detail.files.length}
+                            {detail.changedFiles ??
+                              (display.files.state === "ready"
+                                ? display.files.value.files.length
+                                : "")}
                           </Badge>
                         </TabsTrigger>
                       </TabsList>
@@ -920,41 +1162,16 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   {detail.kind === "pr" && detailSection === "files" ? (
                     <section className="space-y-3">
                       <h3 className="text-xs font-semibold text-muted-foreground">
-                        Files changed · {detail.files.length}
+                        Files changed
+                        {display.files.state === "ready" &&
+                          ` · ${display.files.value.files.length}`}
                       </h3>
-                      {detail.filesTruncated && (
-                        <p className="text-xs text-muted-foreground">
-                          The file list reached the 100-file cap and may be
-                          incomplete.
-                        </p>
-                      )}
-                      <DiffBanner files={detail.files} />
-                      {detail.files.map((file) => (
-                        <article
-                          key={file.path}
-                          className="overflow-hidden rounded-lg border border-border bg-card"
-                        >
-                          <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-2 text-xs">
-                            <span className="min-w-0 flex-1 truncate font-mono">
-                              {file.previousPath
-                                ? `${file.previousPath} → ${file.path}`
-                                : file.path}
-                            </span>
-                            <span className="text-green-600 dark:text-green-400">
-                              +{file.additions}
-                            </span>
-                            <span className="text-red-600 dark:text-red-400">
-                              −{file.deletions}
-                            </span>
-                            <Badge variant="secondary">{file.status}</Badge>
-                          </div>
-                          <GiteaDiff
-                            path={file.path}
-                            diff={file.diff}
-                            filesUrl={filesUrl(detail)}
-                          />
-                        </article>
-                      ))}
+                      <FilesList
+                        files={display.files}
+                        url={filesUrl(detail)}
+                        moved={display.filesMoved}
+                        compact={false}
+                      />
                     </section>
                   ) : (
                     <section className="space-y-3 rounded-lg border border-border bg-card p-4">
@@ -1163,7 +1380,6 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
             onValueChange={(value) => {
               navigate.toPluginPanel("gitea");
               setNewIssue(false);
-              setDetail(null);
               setView(value as View);
             }}
           >
@@ -1351,46 +1567,57 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
 
 function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
   const rpc = useRpc<typeof giteaRpcContract>();
-  const [detail, setDetail] = useState<Detail | null>(null);
+  const [item, setItem] = useState<ItemRef | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let current = true;
+    setItem(null);
+    setError(null);
     void rpc
       .call("threadItem", { threadId })
-      .then(async (item) => {
-        if (!item)
-          throw new Error(
+      .then((linked) => {
+        if (!current) return;
+        if (linked) setItem(linked);
+        else
+          setError(
             "This BB thread is not linked to a Gitea issue or pull request.",
           );
-        const result = await rpc.call("detail", item);
-        if (current) setDetail(result);
       })
       .catch((reason: unknown) => {
         if (current)
-          setError(
-            reason instanceof Error
-              ? reason.message
-              : "Could not load the linked Gitea item.",
-          );
+          setError(errorText(reason, "Could not load the linked Gitea item."));
       });
     return () => {
       current = false;
     };
   }, [rpc, threadId]);
-  if (error)
-    return <div className="p-4 text-sm text-muted-foreground">{error}</div>;
-  if (!detail)
+  const display = useItemDisplay(item, item?.kind === "pr");
+  const shown = display.conversation;
+  if (error || shown.state === "error")
+    return (
+      <div className="p-4 text-sm text-muted-foreground">
+        {error ?? (shown.state === "error" ? shown.message : "")}
+      </div>
+    );
+  if (shown.state === "loading")
     return (
       <div className="p-4 text-sm text-muted-foreground">
         Loading Gitea item…
       </div>
     );
+  const detail = shown.value.conversation;
   return (
     <div className="flex h-full min-h-0 flex-col overflow-auto text-sm">
       <header className="border-b p-4">
         <div className="font-semibold">{detail.title}</div>
-        <div className="mt-1 text-xs text-muted-foreground">
-          {detail.repo}#{detail.number} · {detail.kind} · {detail.state}
+        <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+          <span className="flex-1">
+            {detail.repo}#{detail.number} · {detail.kind} · {detail.state}
+          </span>
+          <FreshnessNote
+            freshness={shown.value.freshness}
+            onRefresh={() => void display.refresh()}
+          />
         </div>
       </header>
       <article className="border-b p-4">
@@ -1401,32 +1628,7 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
           {detail.body || "No description"}
         </div>
       </article>
-      {detail.kind === "pr" && (
-        <section className="border-b p-4">
-          <h3 className="mb-2 font-medium">
-            Files changed · {detail.files.length}
-          </h3>
-          {detail.filesTruncated && (
-            <div className="mb-2 text-xs text-muted-foreground">
-              The file list reached the 100-file cap and may be incomplete.
-            </div>
-          )}
-          <DiffBanner files={detail.files} />
-          {detail.files.map((file) => (
-            <details key={file.path} className="border-b py-2">
-              <summary className="cursor-pointer">{file.path}</summary>
-              <div className="mt-2 overflow-hidden rounded-md border border-border bg-card">
-                <GiteaDiff
-                  path={file.path}
-                  diff={file.diff}
-                  filesUrl={filesUrl(detail)}
-                />
-              </div>
-            </details>
-          ))}
-        </section>
-      )}
-      <section className="p-4">
+      <section className="border-b p-4">
         <h3 className="mb-2 font-medium">Conversation</h3>
         {detail.commentsTruncated && (
           <div className="mb-2 text-xs text-muted-foreground">
@@ -1446,6 +1648,20 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
           </article>
         ))}
       </section>
+      {detail.kind === "pr" && (
+        <section className="space-y-2 p-4">
+          <h3 className="mb-2 font-medium">
+            Files changed
+            {detail.changedFiles !== null && ` · ${detail.changedFiles}`}
+          </h3>
+          <FilesList
+            files={display.files}
+            url={filesUrl(detail)}
+            moved={display.filesMoved}
+            compact
+          />
+        </section>
+      )}
     </div>
   );
 }

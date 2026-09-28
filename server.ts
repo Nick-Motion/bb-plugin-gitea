@@ -8,6 +8,12 @@ import { execFile, type ExecFileException } from "node:child_process";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import {
+  DisplayCache,
+  type Display,
+  type FailureScope,
+  type FreshnessPolicy,
+} from "./display-cache.js";
+import {
   assignFileDiffs,
   fileDiffSchema,
   parseRevision,
@@ -72,41 +78,76 @@ const commentSchema = z.object({
   body: z.string(),
   createdAt: z.string(),
 });
+const fileSchema = z.object({
+  path: z.string(),
+  status: z.string(),
+  previousPath: z.string().nullable(),
+  additions: z.number(),
+  deletions: z.number(),
+  diff: fileDiffSchema,
+});
+const checkSchema = z.object({
+  name: z.string(),
+  status: z.enum(["success", "failure", "pending", "neutral"]),
+  url: z.string(),
+});
+const reviewSchema = z.object({
+  author: z.string(),
+  state: z.string(),
+  body: z.string(),
+  createdAt: z.string(),
+});
+const revisionSchema = z.object({ head: z.string(), base: z.string() });
 const detailSchema = itemSchema.extend({
   comments: z.array(commentSchema),
   commentsTruncated: z.boolean(),
-  files: z.array(
-    z.object({
-      path: z.string(),
-      status: z.string(),
-      previousPath: z.string().nullable(),
-      additions: z.number(),
-      deletions: z.number(),
-      diff: fileDiffSchema,
-    }),
-  ),
+  files: z.array(fileSchema),
   checksTruncated: z.boolean(),
-  checks: z.array(
-    z.object({
-      name: z.string(),
-      status: z.enum(["success", "failure", "pending", "neutral"]),
-      url: z.string(),
-    }),
-  ),
-  reviews: z.array(
-    z.object({
-      author: z.string(),
-      state: z.string(),
-      body: z.string(),
-      createdAt: z.string(),
-    }),
-  ),
+  checks: z.array(checkSchema),
+  reviews: z.array(reviewSchema),
   filesTruncated: z.boolean(),
   reviewsTruncated: z.boolean(),
   headRefName: z.string(),
   baseRefName: z.string(),
   threadId: z.string().nullable(),
 });
+const conversationBase = itemSchema.omit({ kind: true }).extend({
+  comments: z.array(commentSchema),
+  commentsTruncated: z.boolean(),
+});
+const conversationSchema = z.discriminatedUnion("kind", [
+  conversationBase.extend({ kind: z.literal("issue") }),
+  conversationBase.extend({
+    kind: z.literal("pr"),
+    headRefName: z.string(),
+    baseRefName: z.string(),
+    revision: revisionSchema,
+    changedFiles: z.number().int().nonnegative().nullable(),
+    checks: z.array(checkSchema),
+    checksTruncated: z.boolean(),
+    reviews: z.array(reviewSchema),
+    reviewsTruncated: z.boolean(),
+  }),
+]);
+const pullFilesSchema = z.object({
+  revision: revisionSchema,
+  files: z.array(fileSchema),
+  filesTruncated: z.boolean(),
+  stale: z.boolean(),
+});
+const freshnessSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("fresh"), fetchedAt: z.string() }),
+  z.object({ state: z.literal("refreshing"), fetchedAt: z.string() }),
+  z.object({
+    state: z.literal("stale-error"),
+    fetchedAt: z.string(),
+    error: z.string(),
+  }),
+]);
+type Conversation = z.infer<typeof conversationSchema>;
+type PullFiles = z.infer<typeof pullFilesSchema>;
+type FileView = z.infer<typeof fileSchema>;
+type Check = z.infer<typeof checkSchema>;
 const okSchema = z.object({ ok: z.literal(true) });
 const pullRefSchema = z.object({
   repo: repositorySchema,
@@ -142,6 +183,28 @@ export const giteaRpcContract = defineRpcContract({
       kind: z.enum(["issue", "pr"]),
     }),
     output: detailSchema,
+  },
+  conversation: {
+    input: z.object({
+      repo: repositorySchema,
+      number: z.number().int().positive(),
+      kind: z.enum(["issue", "pr"]),
+      refresh: z.boolean().default(false),
+    }),
+    output: z.object({
+      freshness: freshnessSchema,
+      conversation: conversationSchema,
+      threadId: z.string().nullable(),
+    }),
+  },
+  pullFiles: {
+    input: z.object({
+      repo: repositorySchema,
+      number: z.number().int().positive(),
+      revision: revisionSchema.nullable().default(null),
+      refresh: z.boolean().default(false),
+    }),
+    output: pullFilesSchema.extend({ freshness: freshnessSchema }),
   },
   createIssue: {
     input: z.object({
@@ -246,6 +309,7 @@ export const giteaRpcContract = defineRpcContract({
 });
 
 type Repo = { repo: string; projectId: string | null };
+type TeaLogin = { name: string; user: string };
 type RpcContext = { experimental_signal?: AbortSignal };
 type ApiRequest = {
   method?: "GET" | "POST" | "PATCH" | "PUT";
@@ -259,6 +323,17 @@ const maxConcurrentTea = 8;
 const pageSize = 50;
 const maxPages = 10;
 const maxListRepositories = 50;
+const conversationPolicy: FreshnessPolicy = {
+  freshMs: 15_000,
+  retainMs: 10 * 60_000,
+  retryMs: 30_000,
+};
+const filesPolicy: FreshnessPolicy = {
+  freshMs: 5 * 60_000,
+  retainMs: 30 * 60_000,
+  retryMs: 30_000,
+};
+const mebibyte = 1024 * 1024;
 
 function cleanBaseUrl(raw: string): URL {
   const url = new URL(raw);
@@ -300,6 +375,32 @@ class TeaProcessError extends Error {
   }
 }
 
+function displayTag(repo: string, number: number) {
+  return `${repo.toLowerCase()}#${number}`;
+}
+
+function freshnessView(freshness: Display<unknown>["freshness"]) {
+  const fetchedAt = new Date(freshness.fetchedAt).toISOString();
+  return freshness.state === "stale-error"
+    ? { state: freshness.state, fetchedAt, error: freshness.error }
+    : { state: freshness.state, fetchedAt };
+}
+
+function checkStatus(state: string): Check["status"] {
+  if (state === "success") return "success";
+  if (state === "failure" || state === "error") return "failure";
+  if (state === "pending") return "pending";
+  return "neutral";
+}
+
+class GiteaAccessError extends Error {
+  readonly scope: "account" | "item";
+  constructor(message: string, scope: "account" | "item") {
+    super(message);
+    this.scope = scope;
+  }
+}
+
 function safeLink(base: URL, value: unknown): string {
   if (typeof value !== "string") return "";
   try {
@@ -327,6 +428,19 @@ function strings(value: unknown): string[] {
         )
         .filter(Boolean)
     : [];
+}
+function actor(value: Record<string, unknown>): string {
+  for (const nested of [value.user, value.team])
+    if (
+      typeof nested === "object" &&
+      nested !== null &&
+      !Array.isArray(nested)
+    ) {
+      const identity = record(nested);
+      const name = text(identity.login) || text(identity.name);
+      if (name) return name;
+    }
+  return "";
 }
 function mapItem(
   repo: string,
@@ -420,10 +534,51 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   let config = await settings.get();
-  let loginLookup: Promise<string> | null = null;
+  let loginLookup: Promise<TeaLogin> | null = null;
+  const classifyDisplayFailure = (error: unknown): FailureScope =>
+    error instanceof GiteaAccessError ? "drop-entry" : "retain";
+  const publishDisplay = (item: string | null) =>
+    bb.realtime.publish("display-changed", { item });
+  const conversations = new DisplayCache<Conversation>({
+    bounds: {
+      maxEntries: 64,
+      maxBytes: 16 * mebibyte,
+      maxEntryBytes: 2 * mebibyte,
+    },
+    now: Date.now,
+    classify: classifyDisplayFailure,
+    onBackgroundSettled: publishDisplay,
+  });
+  const pullFiles = new DisplayCache<PullFiles>({
+    bounds: {
+      maxEntries: 16,
+      maxBytes: 32 * mebibyte,
+      maxEntryBytes: 8 * mebibyte,
+    },
+    now: Date.now,
+    classify: classifyDisplayFailure,
+    onBackgroundSettled: publishDisplay,
+  });
+  function forgetDisplay() {
+    const removed = [conversations.clear(), pullFiles.clear()];
+    if (removed.includes(true)) publishDisplay(null);
+  }
+  function forgetDisplayItem(repo: string, number: number) {
+    const tag = displayTag(repo, number);
+    conversations.invalidate(tag);
+    pullFiles.invalidate(tag);
+    publishDisplay(tag);
+  }
+  bb.onDispose(() => {
+    conversations.dispose();
+    pullFiles.dispose();
+  });
   settings.onChange((next) => {
     config = next;
     loginLookup = null;
+    conversations.clear();
+    pullFiles.clear();
+    publishDisplay(null);
   });
   let teaPath: string | null = null;
   let activeTea = 0;
@@ -518,7 +673,7 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error(`Gitea CLI tea was not found. ${teaHint}`);
   }
 
-  async function findLogin(): Promise<string> {
+  async function findLogin(): Promise<TeaLogin> {
     const base = cleanBaseUrl(config.baseUrl);
     const file = await resolveTea();
     let rows: unknown;
@@ -557,7 +712,7 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error(
           `tea login profile "${profile}" belongs to a different Gitea instance than ${base.href}.`,
         );
-      return selected.name;
+      return { name: selected.name, user: selected.user };
     }
     if (!matching.length)
       throw new Error(`No tea login profile matches ${base.href}. ${teaHint}`);
@@ -565,10 +720,13 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(
         `Several tea login profiles for ${base.href} belong to different users. Set the tea login profile in Gitea plugin settings.`,
       );
-    return matching.map((login) => login.name).sort()[0]!;
+    const [first] = matching.sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+    return { name: first!.name, user: first!.user };
   }
 
-  function teaLogin(): Promise<string> {
+  function teaLogin(): Promise<TeaLogin> {
     if (!loginLookup) {
       const lookup = findLogin();
       loginLookup = lookup;
@@ -586,7 +744,12 @@ export default async function plugin(bb: BbPluginApi) {
     cleanBaseUrl(config.baseUrl);
     const { signal } = request;
     signal?.throwIfAborted();
-    const login = await teaLogin();
+    const login = (
+      await teaLogin().catch((error: unknown) => {
+        forgetDisplay();
+        throw error;
+      })
+    ).name;
     const file = await resolveTea(signal);
     const args = [
       "api",
@@ -611,8 +774,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (error.overflow) return { kind: "too-large" };
       if (error.missingLogin) {
         loginLookup = null;
-        throw new Error(
+        forgetDisplay();
+        throw new GiteaAccessError(
           `tea login profile "${login}" is no longer available. ${teaHint}`,
+          "account",
         );
       }
       throw new Error(
@@ -626,10 +791,15 @@ export default async function plugin(bb: BbPluginApi) {
     );
     if (!Number.isInteger(status))
       throw new Error("tea did not report the Gitea response status.");
-    if (status === 401)
-      throw new Error(
+    if (status === 401) {
+      forgetDisplay();
+      throw new GiteaAccessError(
         `Gitea rejected tea login profile "${login}". Sign in again with \`tea login add\`.`,
+        "account",
       );
+    }
+    if (status === 403 || status === 404)
+      throw new GiteaAccessError(`Gitea API returned HTTP ${status}.`, "item");
     if (status < 200 || status >= 300)
       throw new Error(`Gitea API returned HTTP ${status}.`);
     return { kind: "body", body: output.stdout };
@@ -709,6 +879,176 @@ export default async function plugin(bb: BbPluginApi) {
       ? null
       : await pullDiff(repo, number, signal);
     return { files, raw, truncated: page.truncated };
+  }
+
+  async function displayKey(scope: string, repo: string, number: number) {
+    const login = await teaLogin().catch((error: unknown) => {
+      forgetDisplay();
+      throw error;
+    });
+    return JSON.stringify([
+      cleanBaseUrl(config.baseUrl).href,
+      login.name,
+      login.user,
+      scope,
+      repo.toLowerCase(),
+      number,
+    ]);
+  }
+
+  async function readComments(
+    repo: string,
+    number: number,
+    signal: AbortSignal | undefined,
+  ) {
+    const page = await paginated(
+      repoPath(repo, `issues/${number}/comments`),
+      signal,
+    );
+    return {
+      truncated: page.truncated,
+      comments: page.values.map((raw) => {
+        const value = record(raw);
+        return commentSchema.parse({
+          author: actor(value),
+          body: text(value.body),
+          createdAt: text(value.created_at),
+        });
+      }),
+    };
+  }
+
+  async function readReviews(
+    repo: string,
+    number: number,
+    signal: AbortSignal | undefined,
+  ) {
+    const page = await paginated(
+      repoPath(repo, `pulls/${number}/reviews`),
+      signal,
+    );
+    return {
+      truncated: page.truncated,
+      reviews: page.values.map((entry) => {
+        const review = record(entry);
+        return {
+          author: actor(review),
+          state: text(review.state),
+          body: text(review.body),
+          createdAt: text(review.submitted_at),
+        };
+      }),
+    };
+  }
+
+  async function readChecks(
+    repo: string,
+    head: string,
+    signal: AbortSignal | undefined,
+  ): Promise<{ checks: Check[]; truncated: boolean }> {
+    const base = cleanBaseUrl(config.baseUrl);
+    const statuses = await paginated(
+      repoPath(repo, `statuses/${encodeURIComponent(head)}`),
+      signal,
+      2,
+    ).catch((error: unknown) => {
+      if (signal?.aborted || error instanceof GiteaAccessError) throw error;
+      return { values: [], truncated: false };
+    });
+    return {
+      truncated: statuses.truncated,
+      checks: statuses.values.slice(0, 100).map((entry) => {
+        const status = record(entry);
+        return {
+          name: text(status.context),
+          status: checkStatus(text(status.status)),
+          url: safeLink(base, status.target_url),
+        };
+      }),
+    };
+  }
+
+  async function readConversation(
+    repo: string,
+    number: number,
+    kind: "issue" | "pr",
+    signal: AbortSignal,
+  ): Promise<Conversation> {
+    const base = cleanBaseUrl(config.baseUrl);
+    const [issue, thread, pull] = await Promise.all([
+      api(repoPath(repo, `issues/${number}`), { signal }),
+      readComments(repo, number, signal),
+      kind === "pr"
+        ? Promise.all([
+            readPull(repo, number, signal).then(async (loaded) => ({
+              ...loaded,
+              checks: await readChecks(repo, loaded.revision.head, signal),
+            })),
+            readReviews(repo, number, signal),
+          ])
+        : null,
+    ]);
+    const { kind: _kind, ...item } = mapItem(repo, issue, kind, base);
+    const common = {
+      ...item,
+      comments: thread.comments,
+      commentsTruncated: thread.truncated,
+    };
+    if (pull === null) return conversationSchema.parse({ ...common, kind });
+    const [loaded, reviewPage] = pull;
+    return conversationSchema.parse({
+      ...common,
+      kind,
+      headRefName: text(record(loaded.pull.head).ref),
+      baseRefName: text(record(loaded.pull.base).ref),
+      revision: loaded.revision,
+      changedFiles:
+        typeof loaded.pull.changed_files === "number"
+          ? loaded.pull.changed_files
+          : null,
+      checks: loaded.checks.checks,
+      checksTruncated: loaded.checks.truncated,
+      reviews: reviewPage.reviews,
+      reviewsTruncated: reviewPage.truncated,
+    });
+  }
+
+  async function readBoundFiles(
+    repo: string,
+    number: number,
+    known: PullRevision | null,
+    signal: AbortSignal | undefined,
+  ): Promise<{ pull: Record<string, unknown>; value: PullFiles }> {
+    const before = known ?? (await readPull(repo, number, signal)).revision;
+    let loaded = await readPullFiles(repo, number, signal);
+    let after = await readPull(repo, number, signal);
+    let stale = false;
+    if (!sameRevision(before, after.revision)) {
+      const retryBase = after.revision;
+      loaded = await readPullFiles(repo, number, signal);
+      after = await readPull(repo, number, signal);
+      stale = !sameRevision(retryBase, after.revision);
+    }
+    const diffs: FileDiff[] = stale
+      ? loaded.files.map(() => ({ kind: "unavailable", reason: "stale" }))
+      : assignFileDiffs(loaded.files, loaded.raw);
+    const files: FileView[] = loaded.files.map((file, index) => ({
+      path: file.path,
+      previousPath: file.previousPath,
+      status: file.status,
+      additions: file.additions,
+      deletions: file.deletions,
+      diff: diffs[index]!,
+    }));
+    return {
+      pull: after.pull,
+      value: {
+        revision: after.revision,
+        files,
+        filesTruncated: loaded.truncated,
+        stale,
+      },
+    };
   }
 
   async function repos(): Promise<Repo[]> {
@@ -1125,7 +1465,7 @@ export default async function plugin(bb: BbPluginApi) {
         number,
         title,
         baseUrl: cleanBaseUrl(config.baseUrl).href,
-        login,
+        login: login.name,
       }),
       providerId: execution.providerId,
       model: execution.model,
@@ -1221,7 +1561,7 @@ export default async function plugin(bb: BbPluginApi) {
               number,
               title: text(pull.title) || `pull request #${number}`,
               baseUrl: cleanBaseUrl(config.baseUrl).href,
-              login: await teaLogin(),
+              login: (await teaLogin()).name,
             })}\n\nContinue from the preserved transcript and current Gitea state.`,
             mentions: [],
           },
@@ -1405,128 +1745,111 @@ export default async function plugin(bb: BbPluginApi) {
       { experimental_signal: signal }: RpcContext = {},
     ) => {
       const base = cleanBaseUrl(config.baseUrl);
-      const issueValue = await api(repoPath(repo, `issues/${number}`), {
-        signal,
-      });
-      const item = mapItem(repo, issueValue, kind, base);
-      const commentPage = await paginated(
-        repoPath(repo, `issues/${number}/comments`),
-        signal,
-      );
-      const comments = commentPage.values.map((raw) => {
-        const value = record(raw);
-        const user = record(value.user);
-        return commentSchema.parse({
-          author: text(user.login),
-          body: text(value.body),
-          createdAt: text(value.created_at),
-        });
-      });
-      let files: Array<{
-        path: string;
-        previousPath: string | null;
-        status: string;
-        additions: number;
-        deletions: number;
-        diff: FileDiff;
-      }> = [];
-      let filesTruncated = false,
-        reviewsTruncated = false;
-      let headRefName = "",
-        baseRefName = "",
-        checksTruncated = false,
-        checks: Array<{
-          name: string;
-          status: "success" | "failure" | "pending" | "neutral";
-          url: string;
-        }> = [],
-        reviews: Array<{
-          author: string;
-          state: string;
-          body: string;
-          createdAt: string;
-        }> = [];
-      if (kind === "pr") {
-        const [before, reviewPage] = await Promise.all([
-          readPull(repo, number, signal),
-          paginated(repoPath(repo, `pulls/${number}/reviews`), signal),
-        ]);
-        let loaded = await readPullFiles(repo, number, signal);
-        let after = await readPull(repo, number, signal);
-        let stale = false;
-        if (!sameRevision(before.revision, after.revision)) {
-          const retryBase = after;
-          loaded = await readPullFiles(repo, number, signal);
-          after = await readPull(repo, number, signal);
-          stale = !sameRevision(retryBase.revision, after.revision);
-        }
-        const pull = after.pull,
-          head = record(pull.head),
-          baseInfo = record(pull.base);
-        headRefName = text(head.ref);
-        baseRefName = text(baseInfo.ref);
-        filesTruncated = loaded.truncated;
-        reviewsTruncated = reviewPage.truncated;
-        const diffs: FileDiff[] = stale
-          ? loaded.files.map(() => ({ kind: "unavailable", reason: "stale" }))
-          : assignFileDiffs(loaded.files, loaded.raw);
-        files = loaded.files.map((file, index) => ({
-          path: file.path,
-          previousPath: file.previousPath,
-          status: file.status,
-          additions: file.additions,
-          deletions: file.deletions,
-          diff: diffs[index]!,
-        }));
-        reviews = reviewPage.values.map((entry) => {
-          const r = record(entry);
-          return {
-            author: text(record(r.user).login),
-            state: text(r.state),
-            body: text(r.body),
-            createdAt: text(r.submitted_at),
-          };
-        });
-        const statuses = await paginated(
-          repoPath(repo, `statuses/${encodeURIComponent(after.revision.head)}`),
-          signal,
-          2,
-        ).catch(() => ({ values: [], truncated: false }));
-        checksTruncated = statuses.truncated;
-        checks = statuses.values.slice(0, 100).map((entry) => {
-          const s = record(entry);
-          const state = text(s.status);
-          return {
-            name: text(s.context),
-            status:
-              state === "success"
-                ? ("success" as const)
-                : state === "failure" || state === "error"
-                  ? ("failure" as const)
-                  : state === "pending"
-                    ? ("pending" as const)
-                    : ("neutral" as const),
-            url: safeLink(base, s.target_url),
-          };
-        });
-      }
-      const threadId = await bb.storage.kv.get<string>(
-        `thread:${repo}:${number}`,
-      );
-      return detailSchema.parse({
+      const [issue, thread, pr, threadId] = await Promise.all([
+        api(repoPath(repo, `issues/${number}`), { signal }),
+        readComments(repo, number, signal),
+        kind === "pr"
+          ? Promise.all([
+              readReviews(repo, number, signal),
+              readBoundFiles(repo, number, null, signal).then(
+                async (bound) => ({
+                  ...bound,
+                  checks: await readChecks(
+                    repo,
+                    bound.value.revision.head,
+                    signal,
+                  ),
+                }),
+              ),
+            ])
+          : null,
+        bb.storage.kv.get<string>(`thread:${repo}:${number}`),
+      ]);
+      const item = mapItem(repo, issue, kind, base);
+      const common = {
         ...item,
-        comments,
-        commentsTruncated: commentPage.truncated,
-        files,
-        filesTruncated,
-        checks,
-        checksTruncated,
-        reviews,
-        reviewsTruncated,
-        headRefName,
-        baseRefName,
+        comments: thread.comments,
+        commentsTruncated: thread.truncated,
         threadId: threadId ?? null,
+      };
+      if (pr === null)
+        return detailSchema.parse({
+          ...common,
+          files: [],
+          filesTruncated: false,
+          checks: [],
+          checksTruncated: false,
+          reviews: [],
+          reviewsTruncated: false,
+          headRefName: "",
+          baseRefName: "",
+        });
+      const [reviewPage, bound] = pr;
+      return detailSchema.parse({
+        ...common,
+        files: bound.value.files,
+        filesTruncated: bound.value.filesTruncated,
+        checks: bound.checks.checks,
+        checksTruncated: bound.checks.truncated,
+        reviews: reviewPage.reviews,
+        reviewsTruncated: reviewPage.truncated,
+        headRefName: text(record(bound.pull.head).ref),
+        baseRefName: text(record(bound.pull.base).ref),
       });
+    },
+    conversation: async (
+      { repo, number, kind, refresh },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      const tag = displayTag(repo, number);
+      if (refresh) {
+        conversations.invalidate(tag);
+        pullFiles.invalidate(tag);
+      }
+      const key = await displayKey(kind, repo, number);
+      const [display, threadId] = await Promise.all([
+        conversations.read(
+          key,
+          tag,
+          (loadSignal) => readConversation(repo, number, kind, loadSignal),
+          { policy: conversationPolicy, signal },
+        ),
+        bb.storage.kv.get<string>(`thread:${repo}:${number}`),
+      ]);
+      return {
+        freshness: freshnessView(display.freshness),
+        conversation: display.value,
+        threadId: threadId ?? null,
+      };
+    },
+    pullFiles: async (
+      { repo, number, revision, refresh },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      const tag = displayTag(repo, number);
+      if (refresh) pullFiles.invalidate(tag);
+      const key = await displayKey("files", repo, number);
+      const display = await pullFiles.read(
+        key,
+        tag,
+        async (loadSignal) =>
+          (await readBoundFiles(repo, number, revision, loadSignal)).value,
+        {
+          policy: filesPolicy,
+          signal,
+          usable: (value) =>
+            revision === null || sameRevision(value.revision, revision),
+          storable: (value) => !value.stale,
+        },
+      );
+      if (
+        revision !== null &&
+        !sameRevision(display.value.revision, revision)
+      ) {
+        conversations.invalidate(tag);
+        publishDisplay(tag);
+      }
+      return { ...display.value, freshness: freshnessView(display.freshness) };
     },
     createIssue: async (
       { repo, title, body },
@@ -1546,51 +1869,67 @@ export default async function plugin(bb: BbPluginApi) {
       { repo, number, body },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      await api(repoPath(repo, `issues/${number}/comments`), {
-        method: "POST",
-        body: { body },
-        signal,
-      });
+      try {
+        await api(repoPath(repo, `issues/${number}/comments`), {
+          method: "POST",
+          body: { body },
+          signal,
+        });
+      } finally {
+        forgetDisplayItem(repo, number);
+      }
       return { ok: true as const };
     },
     setState: async (
       { repo, number, state },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      await api(repoPath(repo, `issues/${number}`), {
-        method: "PATCH",
-        body: { state },
-        signal,
-      });
+      try {
+        await api(repoPath(repo, `issues/${number}`), {
+          method: "PATCH",
+          body: { state },
+          signal,
+        });
+      } finally {
+        forgetDisplayItem(repo, number);
+      }
       return { ok: true as const };
     },
     updateMetadata: async (
       { repo, number, labels, assignees },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      await Promise.all([
-        api(repoPath(repo, `issues/${number}/labels`), {
-          method: "PUT",
-          body: { labels },
-          signal,
-        }),
-        api(repoPath(repo, `issues/${number}`), {
-          method: "PATCH",
-          body: { assignees },
-          signal,
-        }),
-      ]);
+      try {
+        await Promise.all([
+          api(repoPath(repo, `issues/${number}/labels`), {
+            method: "PUT",
+            body: { labels },
+            signal,
+          }),
+          api(repoPath(repo, `issues/${number}`), {
+            method: "PATCH",
+            body: { assignees },
+            signal,
+          }),
+        ]);
+      } finally {
+        forgetDisplayItem(repo, number);
+      }
       return { ok: true as const };
     },
     review: async (
       { repo, number, event, body },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      await api(repoPath(repo, `pulls/${number}/reviews`), {
-        method: "POST",
-        body: { event, body },
-        signal,
-      });
+      try {
+        await api(repoPath(repo, `pulls/${number}/reviews`), {
+          method: "POST",
+          body: { event, body },
+          signal,
+        });
+      } finally {
+        forgetDisplayItem(repo, number);
+      }
       return { ok: true as const };
     },
     sendAgent: async (
@@ -1623,7 +1962,7 @@ export default async function plugin(bb: BbPluginApi) {
       ]);
       const comments = commentPage.values.slice(-10).map((value) => {
         const comment = record(value);
-        return `${text(record(comment.user).login)}: ${text(comment.body).slice(0, 2000)}`;
+        return `${actor(comment)}: ${text(comment.body).slice(0, 2000)}`;
       });
       const files = filePage.values.slice(0, 10).map((value) => {
         const file = record(value);
@@ -1806,6 +2145,17 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb gitea show <issue|pr> <owner/repo> <number> [--json]",
       },
       {
+        name: "conversation",
+        summary: "Read the cached issue or pull request conversation",
+        usage:
+          "bb gitea conversation <issue|pr> <owner/repo> <number> [--refresh] [--json]",
+      },
+      {
+        name: "files",
+        summary: "Read cached pull request changed files and diffs",
+        usage: "bb gitea files <owner/repo> <number> [--refresh] [--json]",
+      },
+      {
         name: "create-issue",
         summary: "Create an issue",
         usage: "bb gitea create-issue <owner/repo> <title> [--body text]",
@@ -1909,7 +2259,10 @@ export default async function plugin(bb: BbPluginApi) {
         .filter((value) => value >= 0)
         .sort((a, b) => b - a))
         args.splice(index, 2);
-      const positional = args.filter((value) => value !== "--json");
+      const refresh = args.includes("--refresh");
+      const positional = args.filter(
+        (value) => value !== "--json" && value !== "--refresh",
+      );
       const [command, ...values] = positional;
       const succeed = (value: unknown, human: string) => ({
         exitCode: 0,
@@ -1953,6 +2306,32 @@ export default async function plugin(bb: BbPluginApi) {
           return succeed(
             value,
             `${value.repo}#${value.number} ${value.title}\n${value.state} · ${value.author}\n\n${value.body}`,
+          );
+        }
+        if (command === "conversation") {
+          const input = giteaRpcContract.conversation.input.parse({
+            kind: values[0],
+            repo: values[1],
+            number: Number(values[2]),
+            refresh,
+          });
+          const value = await handlers.conversation(input);
+          const { conversation, freshness } = value;
+          return succeed(
+            value,
+            `${conversation.repo}#${conversation.number} ${conversation.title}\n${conversation.state} · ${conversation.author} · ${freshness.state} ${freshness.fetchedAt}${freshness.state === "stale-error" ? `\n${freshness.error}` : ""}\n\n${conversation.body}`,
+          );
+        }
+        if (command === "files") {
+          const input = giteaRpcContract.pullFiles.input.parse({
+            repo: values[0],
+            number: Number(values[1]),
+            refresh,
+          });
+          const value = await handlers.pullFiles(input);
+          return succeed(
+            value,
+            `${value.files.map((file) => `${file.status} ${file.path} +${file.additions} -${file.deletions} ${file.diff.kind}`).join("\n")}${value.filesTruncated ? "\nThe file list is capped." : ""}${value.stale ? "\nThe pull request changed while files were read." : ""}`,
           );
         }
         if (command === "create-issue") {

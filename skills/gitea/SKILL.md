@@ -12,6 +12,9 @@ Use `bb gitea` and typed Gitea RPCs to inspect or explicitly update Gitea issues
 - `bb gitea prs [owner/repo] [--state open|closed|all] [--query text] [--json]` lists pull requests.
 - `bb gitea my-prs [owner/repo] [--state open|closed|all] [--query text] [--json]` lists pull requests authored by the signed-in Gitea login, with each babysitter state and the babysitter preferences.
 - `bb gitea show <issue|pr> <owner/repo> <number> [--json]` reads the item, conversation, and, for a pull request, files, checks and reviews. Each file's `diff` has a `kind`: `text` (with `patch`), `empty`, `binary`, `too-large` (over 256 KiB), or `unavailable` with a `reason` of `missing`, `stale`, `diff-too-large`, or `diff-failed`. Patches that Gitea omits are filled from the raw `.diff`, bound to one head/base revision.
+- `bb gitea conversation <issue|pr> <owner/repo> <number> [--refresh] [--json]` reads the display view the panel uses: the item, comments, and, for a pull request, head/base revision, changed-file count, checks and reviews, without files or diffs. It comes from a bounded server cache and reports `freshness.state` `fresh`, `refreshing` (served cached while one background read updates it), or `stale-error` (cached, with the last refresh `error`). `--refresh` rereads Gitea.
+- `bb gitea files <owner/repo> <number> [--refresh] [--json]` reads the pull request's changed files and diffs, bound to the `revision` it returns, with the same `freshness` and a `stale` flag when the pull request kept moving during the read. The typed RPC `pullFiles` accepts the conversation `revision` and returns the current one when the pull request moved.
+- Use `show`, not `conversation`, when a decision needs Gitea's current state; `show` and babysitter, merge and mutation paths never read the display cache.
 - `bb gitea create-issue <owner/repo> <title> [--body text]` creates an issue.
 - `bb gitea comment <owner/repo> <number> <body>` posts a conversation comment.
 - `bb gitea set-state <owner/repo> <number> <open|closed>` changes issue or pull request state.
@@ -36,7 +39,7 @@ A babysitter is a hidden BB thread that shepherds one of your open pull requests
 
 Typed RPCs: `listMyPullRequests`, `startBabysit`, `stopBabysit`, `retryBabysit`, `getBabysitStatus`, `babysitThread`, `listBabysitSessions`, `getBabysitPreferences`, `setAutoBabysit`, `setBabysitExecution`.
 
-List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repository, and return at most 200 items total. Comments and reviews have a 500-item cap; files and checks have a 100-item cap. A full cap is reported as potentially truncated. List errors are returned per repository while accessible repositories remain available. `extraRepos` remains usable without a project, but an associated checkout is needed for agent dispatch.
+List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repository, and return at most 200 items total. Comments and reviews have a 500-item cap; files and checks have a 100-item cap. A full cap is reported as potentially truncated. Display caches hold at most 64 conversations (16 MiB, 15 s fresh, 10 min stale) and 16 file sets (32 MiB, 5 min fresh, 30 min stale); mutations, settings changes, and rejected logins invalidate them. List errors are returned per repository while accessible repositories remain available. `extraRepos` remains usable without a project, but an associated checkout is needed for agent dispatch.
 
 ## Settings
 
