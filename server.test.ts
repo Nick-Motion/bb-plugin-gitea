@@ -1,0 +1,606 @@
+import { afterEach, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { createServer, type Server } from "node:http";
+import { mkdtempSync, rmSync } from "node:fs";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import plugin, { giteaRpcContract } from "./server";
+
+type TeaCall = {
+  args: string[];
+  login: string;
+  method: string;
+  endpoint: string;
+  body: unknown;
+};
+type TeaReply =
+  | { status?: number; json?: unknown; raw?: string }
+  | { exitCode: number; stderr: string }
+  | { hang: true }
+  | { signal: "SIGTERM" };
+type TeaProfile = { name: string; url: string; user: string };
+
+const fixtureDir = join(import.meta.dirname, "test-fixtures");
+const defaultProfiles: TeaProfile[] = [
+  { name: "work", url: "https://gitea.example/prefix", user: "dev" },
+];
+const defaultSettings = {
+  baseUrl: "https://gitea.example/prefix/",
+  teaProfile: "",
+  extraRepos: "acme/widgets",
+};
+
+const cleanups: Array<() => Promise<void> | void> = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  vi.unstubAllEnvs();
+});
+
+function isolateTeaEnvironment(path: string) {
+  const home = mkdtempSync(join(tmpdir(), "gitea-home-"));
+  cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+  vi.stubEnv("HOME", home);
+  vi.stubEnv("XDG_CONFIG_HOME", home);
+  vi.stubEnv("PATH", path);
+}
+
+async function startTea(
+  api: (call: TeaCall) => TeaReply | Promise<TeaReply>,
+  profiles: TeaProfile[],
+) {
+  const calls: TeaCall[] = [];
+  const server: Server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", async () => {
+      const { args, stdin } = JSON.parse(Buffer.concat(chunks).toString()) as {
+        args: string[];
+        stdin: string;
+      };
+      const reply = async (): Promise<unknown> => {
+        if (args.join(" ") === "logins list --output json")
+          return {
+            stdout: JSON.stringify(
+              profiles.map((profile) => ({
+                ...profile,
+                ssh_host: "",
+                default: false,
+              })),
+            ),
+          };
+        const option = (name: string) => args[args.indexOf(name) + 1] ?? "";
+        const call = {
+          args,
+          login: option("--login"),
+          method: option("--method"),
+          endpoint: args.at(-1) ?? "",
+          body:
+            option("--data") === "@-" ? (JSON.parse(stdin) as unknown) : null,
+        };
+        calls.push(call);
+        const result = await api(call);
+        if (!("status" in result || "json" in result || "raw" in result))
+          return result;
+        const status = result.status ?? 200;
+        return {
+          stderr: `HTTP/1.1 ${status} Fixture\r\nContent-Type: application/json\r\n\r\n`,
+          stdout: result.raw ?? JSON.stringify(result.json ?? {}),
+        };
+      };
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify(await reply()));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(
+    () => new Promise<void>((resolve) => server.close(() => resolve())),
+  );
+  vi.stubEnv(
+    "TEA_FIXTURE_URL",
+    `http://127.0.0.1:${(server.address() as AddressInfo).port}/`,
+  );
+  return calls;
+}
+
+async function start(
+  api: (call: TeaCall) => TeaReply | Promise<TeaReply>,
+  options: {
+    profiles?: TeaProfile[];
+    settings?: Partial<typeof defaultSettings>;
+    projects?: Array<{
+      id: string;
+      sources: Array<{ type: string; path: string }>;
+    }>;
+  } = {},
+) {
+  isolateTeaEnvironment(`${fixtureDir}:${process.env.PATH ?? ""}`);
+  const calls = await startTea(api, options.profiles ?? defaultProfiles);
+  const host = createFakePluginHost({
+    pluginId: "gitea",
+    settings: { ...defaultSettings, ...options.settings },
+    sdk: { projects: { list: async () => options.projects ?? [] } },
+  });
+  cleanups.push(() => host.harness.lifecycle.dispose());
+  await plugin(host.bb);
+  return { host, calls };
+}
+
+type Host = ReturnType<typeof createFakePluginHost>;
+
+async function status(host: Host) {
+  return giteaRpcContract.status.output.parse(
+    await host.harness.behavior.callRpc("status", null),
+  );
+}
+
+async function listItems(host: Host, input: Record<string, unknown>) {
+  return giteaRpcContract.listItems.output.parse(
+    await host.harness.behavior.callRpc("listItems", {
+      kind: "issue",
+      state: "open",
+      query: "",
+      ...input,
+    }),
+  );
+}
+
+function issue(number: number, title = `Issue ${number}`) {
+  return {
+    number,
+    title,
+    state: "open",
+    user: { login: "dev" },
+    labels: [],
+    assignees: [],
+    html_url: `https://gitea.example/prefix/acme/widgets/issues/${number}`,
+    body: "",
+    updated_at: "2026-09-01T00:00:00Z",
+  };
+}
+
+function page(endpoint: string): number {
+  return Number(
+    new URL(endpoint, "https://fixture.invalid").searchParams.get("page"),
+  );
+}
+
+function gitSource(remote: string) {
+  const path = mkdtempSync(join(tmpdir(), "gitea-remote-"));
+  execFileSync("git", ["init", "--quiet", path]);
+  execFileSync("git", ["-C", path, "remote", "add", "origin", remote]);
+  return path;
+}
+
+it("discovers only matching Gitea HTTPS and SSH remotes under the configured path prefix", async () => {
+  const paths = [
+    gitSource("https://github.com/acme/ignored.git"),
+    gitSource("https://gitea.example:3000/prefix/acme/widgets.git"),
+    gitSource("ssh://git@gitea.example:2222/prefix/ops/api.git"),
+    gitSource("git@gitea.example:prefix/docs/manual.git"),
+  ];
+  cleanups.push(() => {
+    for (const path of paths) rmSync(path, { recursive: true, force: true });
+  });
+  const { host } = await start(() => ({ json: { login: "dev" } }), {
+    profiles: [
+      { name: "work", url: "https://gitea.example:3000/prefix", user: "dev" },
+    ],
+    settings: {
+      baseUrl: "https://gitea.example:3000/prefix/",
+      extraRepos: "team/docs",
+    },
+    projects: paths.map((path, index) => ({
+      id: `project-${index}`,
+      sources: [{ type: "local_path", path }],
+    })),
+  });
+  const result = await status(host);
+  expect(result).toMatchObject({ ready: true, error: null, login: "dev" });
+  expect(result.repos).toEqual([
+    { repo: "acme/widgets", projectId: "project-1" },
+    { repo: "ops/api", projectId: "project-2" },
+    { repo: "docs/manual", projectId: "project-3" },
+    { repo: "team/docs", projectId: null },
+  ]);
+});
+
+it("reads a second issue page and reports repository failures without losing accessible results", async () => {
+  const { host, calls } = await start(
+    ({ endpoint }) => {
+      if (endpoint.includes("broken/repo")) return { status: 403 };
+      if (page(endpoint) === 1)
+        return {
+          json: Array.from({ length: 50 }, (_, index) => issue(index + 1)),
+        };
+      if (page(endpoint) === 2) return { json: [issue(51, "Older issue")] };
+      return { json: [] };
+    },
+    { settings: { extraRepos: "acme/widgets broken/repo" } },
+  );
+  const result = await listItems(host, {});
+  expect(result.items).toHaveLength(51);
+  expect(result.items.at(-1)?.title).toBe("Older issue");
+  expect(result.errors).toEqual([
+    { repo: "broken/repo", message: "Gitea API returned HTTP 403." },
+  ]);
+  expect(calls.map((call) => call.endpoint)).toEqual(
+    expect.arrayContaining([
+      "/api/v1/repos/acme/widgets/issues?state=open&type=issues&limit=50&page=1",
+      "/api/v1/repos/acme/widgets/issues?state=open&type=issues&limit=50&page=2",
+    ]),
+  );
+});
+
+it("paginates pull request comments, files, and reviews and stops on a short page", async () => {
+  const { host, calls } = await start(({ endpoint }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/issues/9")) return { json: issue(9, "Large change") };
+    if (path.endsWith("/pulls/9"))
+      return {
+        json: { head: { ref: "feature", sha: "abc" }, base: { ref: "main" } },
+      };
+    if (path.endsWith("/statuses/abc")) return { json: [] };
+    const count = page(endpoint) === 1 ? 50 : 1;
+    const rows = (row: (index: number) => unknown) => ({
+      json: Array.from({ length: count }, (_, index) => row(index)),
+    });
+    if (path.endsWith("/comments"))
+      return rows((index) => ({
+        user: { login: "reviewer" },
+        body: `Comment ${index}`,
+        created_at: "2026-09-01T00:00:00Z",
+      }));
+    if (path.endsWith("/files"))
+      return rows((index) => ({
+        filename: `src/${page(endpoint)}-${index}.ts`,
+        status: "modified",
+        additions: 1,
+        deletions: 0,
+        patch: "@@ -1 +1 @@\n-old\n+new",
+      }));
+    if (path.endsWith("/reviews"))
+      return rows((index) => ({
+        user: { login: "reviewer" },
+        state: "APPROVED",
+        body: `Review ${index}`,
+        submitted_at: "2026-09-01T00:00:00Z",
+      }));
+    return { json: [] };
+  });
+  const result = giteaRpcContract.detail.output.parse(
+    await host.harness.behavior.callRpc("detail", {
+      repo: "acme/widgets",
+      number: 9,
+      kind: "pr",
+    }),
+  );
+  expect(result.comments).toHaveLength(51);
+  expect(result.files).toHaveLength(51);
+  expect(result.reviews).toHaveLength(51);
+  expect(result).toMatchObject({
+    headRefName: "feature",
+    baseRefName: "main",
+    commentsTruncated: false,
+    filesTruncated: false,
+    reviewsTruncated: false,
+  });
+  expect(calls.map((call) => call.endpoint)).toContain(
+    "/api/v1/repos/acme/widgets/pulls/9/files?limit=50&page=2",
+  );
+  expect(calls.some((call) => call.endpoint.includes("page=3"))).toBe(false);
+});
+
+it("marks a full bounded issue result window as potentially truncated", async () => {
+  const { host } = await start(() => ({
+    json: Array.from({ length: 50 }, (_, index) => issue(index + 1)),
+  }));
+  const result = await listItems(host, { repo: "acme/widgets" });
+  expect(result.items).toHaveLength(200);
+  expect(result.truncated).toBe(true);
+});
+
+it("routes each request through the tea profile for the configured origin and path prefix", async () => {
+  const { host, calls } = await start(() => ({ json: [issue(4)] }), {
+    profiles: [
+      { name: "root", url: "https://gitea.example", user: "dev" },
+      { name: "elsewhere", url: "https://other.example/prefix", user: "dev" },
+      { name: "work", url: "https://GITEA.example:443/prefix/", user: "dev" },
+    ],
+  });
+  const result = await listItems(host, { repo: "acme/widgets" });
+  expect(result.items).toMatchObject([
+    { repo: "acme/widgets", number: 4, author: "dev" },
+  ]);
+  expect(calls).toEqual([
+    expect.objectContaining({
+      login: "work",
+      method: "GET",
+      endpoint:
+        "/api/v1/repos/acme/widgets/issues?state=open&type=issues&limit=50&page=1",
+      body: null,
+    }),
+  ]);
+});
+
+it("coalesces aliases for one account and requires a profile choice when accounts differ", async () => {
+  const { host, calls } = await start(() => ({ json: { login: "dev" } }), {
+    profiles: [
+      { name: "zeta", url: "https://gitea.example/prefix", user: "dev" },
+      { name: "alpha", url: "https://gitea.example/prefix", user: "Dev" },
+    ],
+  });
+  await expect(
+    host.harness.behavior.callRpc("status", null),
+  ).resolves.toMatchObject({ ready: true, login: "dev" });
+  expect(calls.map((call) => call.login)).toEqual(["alpha"]);
+
+  const ambiguous = await start(() => ({ json: { login: "dev" } }), {
+    profiles: [
+      { name: "work", url: "https://gitea.example/prefix", user: "dev" },
+      { name: "bot", url: "https://gitea.example/prefix", user: "ci-bot" },
+    ],
+  });
+  await expect(
+    ambiguous.host.harness.behavior.callRpc("status", null),
+  ).resolves.toMatchObject({
+    ready: false,
+    login: null,
+    error: expect.stringContaining("belong to different users"),
+  });
+  expect(ambiguous.calls).toEqual([]);
+  await ambiguous.host.harness.behavior.setSettings({ teaProfile: "bot" });
+  await expect(
+    ambiguous.host.harness.behavior.callRpc("status", null),
+  ).resolves.toMatchObject({ ready: true });
+  expect(ambiguous.calls.map((call) => call.login)).toEqual(["bot"]);
+});
+
+it("never routes through an explicitly selected profile for another instance", async () => {
+  const { host, calls } = await start(() => ({ json: { login: "dev" } }), {
+    profiles: [
+      ...defaultProfiles,
+      { name: "personal", url: "https://gitea.example", user: "dev" },
+    ],
+    settings: { teaProfile: "personal" },
+  });
+  await expect(
+    host.harness.behavior.callRpc("status", null),
+  ).resolves.toMatchObject({
+    ready: false,
+    error: expect.stringContaining("different Gitea instance"),
+  });
+  await host.harness.behavior.setSettings({ teaProfile: "missing" });
+  await expect(
+    host.harness.behavior.callRpc("status", null),
+  ).resolves.toMatchObject({
+    ready: false,
+    error: expect.stringContaining('"missing" was not found'),
+  });
+  expect(calls).toEqual([]);
+});
+
+it("accepts plain HTTP only for loopback instances", async () => {
+  const { host, calls } = await start(() => ({ json: [] }), {
+    settings: { baseUrl: "http://remote.example" },
+  });
+  const result = await listItems(host, { repo: "acme/widgets" });
+  expect(result.errors).toEqual([
+    {
+      repo: "acme/widgets",
+      message: expect.stringContaining("must use HTTPS"),
+    },
+  ]);
+  expect(calls).toEqual([]);
+});
+
+it("sends mutation JSON on stdin to the matching REST endpoints and accepts empty responses", async () => {
+  const { host, calls } = await start(({ method, endpoint }) => {
+    if (method === "POST" && endpoint.endsWith("/issues"))
+      return { status: 201, json: issue(5, "New issue") };
+    if (endpoint.endsWith("/comments")) return { status: 204, raw: "" };
+    return { json: {} };
+  });
+  await expect(
+    host.harness.behavior.callRpc("createIssue", {
+      repo: "acme/widgets",
+      title: "New issue",
+      body: "Details",
+    }),
+  ).resolves.toMatchObject({ number: 5, title: "New issue" });
+  await expect(
+    host.harness.behavior.callRpc("comment", {
+      repo: "acme/widgets",
+      number: 4,
+      body: "Looks good; don't leak me",
+    }),
+  ).resolves.toEqual({ ok: true });
+  await host.harness.behavior.callRpc("setState", {
+    repo: "acme/widgets",
+    number: 4,
+    state: "closed",
+  });
+  await host.harness.behavior.callRpc("updateMetadata", {
+    repo: "acme/widgets",
+    number: 4,
+    labels: ["bug"],
+    assignees: ["dev"],
+  });
+  await host.harness.behavior.callRpc("review", {
+    repo: "acme/widgets",
+    number: 4,
+    event: "APPROVED",
+    body: "Ship it",
+  });
+  const prefix = "/api/v1/repos/acme/widgets";
+  expect(
+    calls.map(({ method, endpoint, body }) => ({ method, endpoint, body })),
+  ).toEqual(
+    expect.arrayContaining([
+      {
+        method: "POST",
+        endpoint: `${prefix}/issues`,
+        body: { title: "New issue", body: "Details" },
+      },
+      {
+        method: "POST",
+        endpoint: `${prefix}/issues/4/comments`,
+        body: { body: "Looks good; don't leak me" },
+      },
+      {
+        method: "PATCH",
+        endpoint: `${prefix}/issues/4`,
+        body: { state: "closed" },
+      },
+      {
+        method: "PUT",
+        endpoint: `${prefix}/issues/4/labels`,
+        body: { labels: ["bug"] },
+      },
+      {
+        method: "PATCH",
+        endpoint: `${prefix}/issues/4`,
+        body: { assignees: ["dev"] },
+      },
+      {
+        method: "POST",
+        endpoint: `${prefix}/pulls/4/reviews`,
+        body: { event: "APPROVED", body: "Ship it" },
+      },
+    ]),
+  );
+  expect(calls).toHaveLength(6);
+  for (const call of calls) {
+    expect(call.args).toEqual([
+      "api",
+      "--login",
+      "work",
+      "--method",
+      call.method,
+      "--include",
+      "--data",
+      "@-",
+      call.endpoint,
+    ]);
+  }
+});
+
+it.each([
+  {
+    name: "nonzero exit",
+    reply: { exitCode: 1, stderr: "Error: request failed: token=hunter2" },
+    message:
+      "The tea request to Gitea failed. Check network access and server availability, then try again.",
+  },
+  {
+    name: "process terminated by a signal",
+    reply: { signal: "SIGTERM" as const },
+    message: "The tea request to Gitea timed out. Try again later.",
+  },
+  {
+    name: "removed login profile",
+    reply: { exitCode: 1, stderr: "login name 'work' does not exist" },
+    message: expect.stringContaining('"work" is no longer available'),
+  },
+  {
+    name: "rejected credentials",
+    reply: { status: 401, json: { message: "token hunter2 is invalid" } },
+    message: expect.stringContaining('Gitea rejected tea login profile "work"'),
+  },
+  {
+    name: "invalid JSON",
+    reply: { raw: "<html>hunter2</html>" },
+    message: "tea returned invalid JSON from Gitea.",
+  },
+])(
+  "reports $name as a safe repository error without tea output",
+  async ({ reply, message }) => {
+    const { host } = await start(() => reply);
+    const result = await listItems(host, { repo: "acme/widgets" });
+    expect(result.errors).toEqual([{ repo: "acme/widgets", message }]);
+    expect(JSON.stringify(result)).not.toContain("hunter2");
+  },
+);
+
+it("reports a missing tea executable as a readiness problem", async () => {
+  const emptyDir = mkdtempSync(join(tmpdir(), "gitea-path-"));
+  cleanups.push(() => rmSync(emptyDir, { recursive: true, force: true }));
+  isolateTeaEnvironment(emptyDir);
+  const host = createFakePluginHost({
+    pluginId: "gitea",
+    settings: defaultSettings,
+    sdk: { projects: { list: async () => [] } },
+  });
+  cleanups.push(() => host.harness.lifecycle.dispose());
+  await plugin(host.bb);
+  await expect(
+    host.harness.behavior.callRpc("status", null),
+  ).resolves.toMatchObject({
+    ready: false,
+    login: null,
+    error: expect.stringContaining("Gitea CLI tea was not found"),
+  });
+});
+
+it("exposes the validated read and write handlers through bb gitea commands", async () => {
+  const { host, calls } = await start(({ endpoint }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/issues/4"))
+      return { json: { ...issue(4, "Existing"), body: "Description" } };
+    if (path.endsWith("/comments") || path.endsWith("/reviews"))
+      return { json: [] };
+    return { json: {} };
+  });
+  const detail = await host.harness.behavior.runCli([
+    "show",
+    "issue",
+    "acme/widgets",
+    "4",
+    "--json",
+  ]);
+  expect(detail.exitCode).toBe(0);
+  expect(detail.stdout).toContain("Description");
+  for (const argv of [
+    ["comment", "acme/widgets", "4", "CLI", "comment"],
+    ["set-state", "acme/widgets", "4", "closed"],
+    ["metadata", "acme/widgets", "4", "bug,urgent", "dev"],
+    ["review", "acme/widgets", "4", "APPROVED", "Looks", "good"],
+  ])
+    expect((await host.harness.behavior.runCli(argv)).exitCode).toBe(0);
+  const prefix = "/api/v1/repos/acme/widgets";
+  expect(
+    calls.map(({ method, endpoint, body }) => ({ method, endpoint, body })),
+  ).toEqual(
+    expect.arrayContaining([
+      {
+        method: "POST",
+        endpoint: `${prefix}/issues/4/comments`,
+        body: { body: "CLI comment" },
+      },
+      {
+        method: "PATCH",
+        endpoint: `${prefix}/issues/4`,
+        body: { state: "closed" },
+      },
+      {
+        method: "PUT",
+        endpoint: `${prefix}/issues/4/labels`,
+        body: { labels: ["bug", "urgent"] },
+      },
+      {
+        method: "POST",
+        endpoint: `${prefix}/pulls/4/reviews`,
+        body: { event: "APPROVED", body: "Looks good" },
+      },
+    ]),
+  );
+  const invalid = await host.harness.behavior.runCli([
+    "review",
+    "acme/widgets",
+    "4",
+    "MERGE",
+  ]);
+  expect(invalid.exitCode).toBe(1);
+  expect(invalid.stderr).toContain("Invalid option");
+});

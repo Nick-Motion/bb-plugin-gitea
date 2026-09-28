@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args[0] === "--version") {
+    process.stdout.write("Version: 0.15.1\n");
+    return 0;
+  }
+  const response = await fetch(process.env.TEA_FIXTURE_URL, {
+    method: "POST",
+    body: JSON.stringify({ args, stdin: await readStdin() }),
+  });
+  const reply = await response.json();
+  if (reply.hang) setInterval(() => {}, 1000);
+  if (reply.signal) process.kill(process.pid, reply.signal);
+  if (reply.hang || reply.signal) return new Promise(() => {});
+  process.stderr.write(reply.stderr ?? "");
+  process.stdout.write(reply.stdout ?? "");
+  return reply.exitCode ?? 0;
+}
+
+main().then(
+  (code) => {
+    process.exitCode = code;
+  },
+  () => {
+    process.exitCode = 70;
+  },
+);
