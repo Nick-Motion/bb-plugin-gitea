@@ -8,7 +8,7 @@ Gitea brings issues and pull requests from a Gitea instance into BB through the 
 bb plugin install https://github.com/Nick-Motion/bb-plugin-gitea
 ```
 
-This README describes version 1.2.0. Once the `v1.2.0` tag is published, pin it with `bb plugin install git:https://github.com/Nick-Motion/bb-plugin-gitea.git@v1.2.0`. To move an existing installation to a new release, run `bb plugin update gitea --yes`; settings and babysitter state are kept. The plugin id is `gitea`, and it registers the `bb gitea` command; do not install it alongside another plugin that registers the same command.
+This README describes version 1.2.1. Once the `v1.2.1` tag is published, pin it with `bb plugin install git:https://github.com/Nick-Motion/bb-plugin-gitea.git@v1.2.1`. To move an existing installation to a new release, run `bb plugin update gitea --yes`; settings and babysitter state are kept. The plugin id is `gitea`, and it registers the `bb gitea` command; do not install it alongside another plugin that registers the same command.
 
 ## Configure
 
@@ -33,19 +33,21 @@ PR files show each patch that Gitea includes. When Gitea omits a patch, the plug
 
 ## Display cache
 
-The panel and `bb gitea conversation` / `bb gitea files` read through a bounded in-memory cache on the plugin server; nothing is written to disk. Each entry is keyed by the normalized instance URL and path prefix, the tea profile and its user, the item kind, the repository (case-insensitive), and the number. Keys hold no bodies or secrets, and realtime notices carry only `owner/repo#number`.
+The panel and `bb gitea conversation` / `bb gitea files` read through a bounded in-memory cache on the plugin server; nothing is written to disk. Each entry is keyed by the normalized instance URL and path prefix, the tea profile and its user, the item kind, the repository (case-insensitive), and the number. Keys hold no bodies or secrets, and realtime notices carry only `owner/repo#number` or `lists`.
 
 | Read | Fresh for | Served stale for at most | Entries | Total size | Largest entry |
 | --- | --- | --- | --- | --- | --- |
 | Conversation (item, comments, reviews, checks, revision) | 15 s | 10 min | 64 | 16 MiB | 2 MiB |
 | Pull request files and diffs, per head/base revision | 5 min | 30 min | 16 | 32 MiB | 8 MiB |
+| Issue and pull request lists, per kind, repository or all, and state | 15 s | 10 min | 32 | 32 MiB | 8 MiB |
+| My PRs, per repository or all, and state | 15 s | 10 min | 32 | 32 MiB | 8 MiB |
 
 A fresh entry returns without calling Gitea. An older entry returns immediately with `freshness.state` `refreshing` while one shared background read updates it. When that read finishes, the plugin publishes `display-changed` and the panel rereads. If the refresh fails, the entry is shown as `stale-error` with the error. The read is retried after 30 seconds and is dropped when its retention ends. Concurrent identical reads share one Gitea read. When one caller cancels, a read still shared by other callers keeps running; background refreshes never belong to a caller. The least recently used entries are evicted first. Larger values are returned but not stored, and so are files that went stale while they were read.
 
 The following clear the cache:
 
 - **Refresh** in the panel and `--refresh` reread the item from Gitea.
-- Comments, state changes, label and assignee edits, and reviews invalidate their item.
+- Comments, state changes, label and assignee edits, and reviews invalidate their item. State changes, label and assignee edits, and new issues also invalidate every list; comments and reviews do not.
 - A settings change clears everything.
 - A rejected or missing tea login clears everything; a 403 or 404 drops that entry.
 - A read that was in flight when its entry was invalidated cannot repopulate the cache.
@@ -53,7 +55,11 @@ The following clear the cache:
 
 The conversation loads the issue, comments, pull request, reviews, and commit statuses in parallel, within tea's eight concurrent requests. It does not fetch files or the raw diff; the Files tab requests them for the revision the conversation shows. If the pull request moved, the files response reports the new revision and the conversation is reloaded instead of pairing old diffs with it.
 
-Babysitter lifecycle, merge and terminal decisions, mutations, and `bb gitea show` never use the display cache; they read Gitea directly.
+Lists cache every item in the tracked repositories and apply the text query afterward, so changing the search does not read Gitea again. When every repository fails, the list read fails; a cached list then shows as `stale-error`. `bb gitea issues`, `prs`, and `my-prs` always reread Gitea and refresh the cached list.
+
+The panel also remembers its tab, filters, readiness, preferences, and the last 16 lists in page memory. Remembered readiness and rows belong to one verified account: the instance, tea profile, and user the server reported for them. An app-wide watcher keeps that account verified while the panel is closed. It stays mounted for the life of the BB page and watches the plugin settings, the server's cache-clear notices, and the realtime connection. Returning to the panel from a thread repaints the remembered rows and filters at once only while the account is still verified and the settings match, then asks the server for the list, which is free while the server entry is fresh and otherwise refreshes in the background. A settings change or a server cache-clear notice forgets every remembered list and readiness before anything can repaint them. The server sends that notice on a settings change and when Gitea rejects the tea login or the profile disappears while its cache holds entries. A readiness check that reports Gitea as not ready also forgets everything; the panel runs one after a failed list read, and any reply to a request started before the forget is ignored. A lost realtime connection, a missing watcher, or unreadable settings keeps the remembered rows hidden until a readiness check confirms the same account, without waiting for the list. Neither the panel nor the server watches tea's own login files. If a token is revoked outside BB, the remembered rows for that account can show until the background readiness or list request is rejected, which then forgets them all. A filter the panel has not shown yet displays a loading state, never another filter's rows, and a reply to an older filter is ignored. Page memory ends when the BB page reloads; the next visit then reads from the server cache. The Babysitters tab is not remembered.
+
+Babysitter lifecycle, automatic babysitting, merge and terminal decisions, mutations, and `bb gitea show` never use the display cache; they read Gitea directly.
 
 ## Babysitters
 
