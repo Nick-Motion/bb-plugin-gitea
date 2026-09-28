@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   definePluginApp,
+  experimental_ProviderModelPicker as ProviderModelPicker,
   useBbNavigate,
+  useRealtime,
   useRpc,
   UrlLink,
+  type ExperimentalProviderModelPickerValue,
   type PluginNavPanelProps,
   type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
@@ -34,7 +37,14 @@ type Item = PluginRpcResult<
   (typeof giteaRpcContract)["listItems"]
 >["items"][number];
 type Detail = PluginRpcResult<(typeof giteaRpcContract)["detail"]>;
-type View = "my-prs" | "issues" | "pulls";
+type FileDiff = Detail["files"][number]["diff"];
+type MyPulls = PluginRpcResult<(typeof giteaRpcContract)["listMyPullRequests"]>;
+type Preferences = MyPulls["preferences"];
+type BabysitView = MyPulls["items"][number]["babysit"];
+type BabysitSessions = PluginRpcResult<
+  (typeof giteaRpcContract)["listBabysitSessions"]
+>["sessions"];
+type View = "my-prs" | "babysitters" | "issues" | "pulls";
 type DetailSection = "conversation" | "files";
 
 function useIsDarkTheme() {
@@ -54,10 +64,75 @@ function useIsDarkTheme() {
   return dark;
 }
 
-function GiteaDiff({ path, patch }: { path: string; patch: string | null }) {
+function formatBytes(bytes: number) {
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+    : `${Math.ceil(bytes / 1024)} KiB`;
+}
+
+const unavailableText = {
+  missing: "Gitea's raw diff has no section that matches this file.",
+  stale:
+    "The pull request changed while its files were loading. Reload to see a consistent diff.",
+  "diff-too-large":
+    "The pull request's raw diff exceeds the 16 MiB limit, so per-file diffs are not shown here.",
+  "diff-failed": "Gitea did not return the raw diff for this pull request.",
+} as const;
+
+function DiffNotice({
+  children,
+  filesUrl,
+}: {
+  children: string;
+  filesUrl: string;
+}) {
+  return (
+    <div
+      data-testid="bb-diff-notice"
+      className="flex flex-wrap items-center gap-2 px-3 py-2 text-xs text-muted-foreground"
+    >
+      <span>{children}</span>
+      {filesUrl && (
+        <UrlLink href={filesUrl} className="underline hover:text-foreground">
+          View on Gitea ↗
+        </UrlLink>
+      )}
+    </div>
+  );
+}
+
+function GiteaDiff({
+  path,
+  diff,
+  filesUrl,
+}: {
+  path: string;
+  diff: FileDiff;
+  filesUrl: string;
+}) {
+  if (diff.kind === "text") return <PatchView path={path} patch={diff.patch} />;
+  if (diff.kind === "empty")
+    return (
+      <DiffNotice filesUrl="">
+        No content changes (rename or mode change only).
+      </DiffNotice>
+    );
+  if (diff.kind === "binary")
+    return <DiffNotice filesUrl={filesUrl}>Binary file changed.</DiffNotice>;
+  if (diff.kind === "too-large")
+    return (
+      <DiffNotice filesUrl={filesUrl}>
+        {`This file's diff is ${formatBytes(diff.bytes)}, above the ${formatBytes(diff.limit)} inline limit.`}
+      </DiffNotice>
+    );
+  return (
+    <DiffNotice filesUrl={filesUrl}>{unavailableText[diff.reason]}</DiffNotice>
+  );
+}
+
+function PatchView({ path, patch }: { path: string; patch: string }) {
   const dark = useIsDarkTheme();
   const fileDiff = useMemo<FileDiffMetadata | null>(() => {
-    if (!patch?.trim()) return null;
     const normalized = patch.replace(/\r\n/g, "\n").trimEnd();
     const text = normalized.startsWith("diff --git")
       ? `${normalized}\n`
@@ -80,12 +155,38 @@ function GiteaDiff({ path, patch }: { path: string; patch: string | null }) {
   if (!fileDiff)
     return (
       <pre className="overflow-x-auto px-3 py-2 font-mono text-xs leading-5 text-foreground/80">
-        {patch ?? "Patch omitted by Gitea for this file."}
+        {patch}
       </pre>
     );
   return (
     <div data-testid="bb-diff" data-path={path}>
       <PierreFileDiff fileDiff={fileDiff} options={options} />
+    </div>
+  );
+}
+
+function filesUrl(detail: Detail) {
+  return detail.url ? `${detail.url.replace(/\/+$/, "")}/files` : "";
+}
+
+function DiffBanner({ files }: { files: Detail["files"] }) {
+  const reasons = new Set(
+    files.flatMap((file) =>
+      file.diff.kind === "unavailable" ? [file.diff.reason] : [],
+    ),
+  );
+  const notices = (["stale", "diff-too-large", "diff-failed"] as const).filter(
+    (reason) => reasons.has(reason),
+  );
+  if (!notices.length) return null;
+  return (
+    <div
+      role="status"
+      className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+    >
+      {notices.map((reason) => (
+        <div key={reason}>{unavailableText[reason]}</div>
+      ))}
     </div>
   );
 }
@@ -109,6 +210,281 @@ function parseSubPath(
   };
 }
 
+const babysitLabels = {
+  idle: "not babysat",
+  watching: "babysitting",
+  needs_you: "needs you",
+  failed: "failed",
+  merged: "merged",
+  closed: "closed",
+  stopped: "stopped",
+} as const;
+
+function babysitDetail(view: BabysitView) {
+  if (view.status === "failed") return view.error;
+  if (view.status === "needs_you") return view.note;
+  return "";
+}
+
+function BabysitControls({
+  repo,
+  number,
+  view,
+  onChanged,
+}: {
+  repo: string;
+  number: number;
+  view: BabysitView;
+  onChanged: () => void;
+}) {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const navigate = useBbNavigate();
+  const [busy, setBusy] = useState(false);
+  const run = async (action: BabysitView["actions"][number]) => {
+    setBusy(true);
+    try {
+      if (action === "stop") await rpc.call("stopBabysit", { repo, number });
+      else
+        await rpc.call(action === "start" ? "startBabysit" : "retryBabysit", {
+          repo,
+          number,
+        });
+      toast.success(
+        action === "stop"
+          ? "Babysitter stopped"
+          : action === "start"
+            ? "Babysitter started"
+            : "Babysitter resumed",
+      );
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Babysitter action failed",
+      );
+    } finally {
+      setBusy(false);
+      onChanged();
+    }
+  };
+  const detail = babysitDetail(view);
+  return (
+    <span
+      data-testid="babysit-controls"
+      className="flex shrink-0 flex-wrap items-center gap-1"
+    >
+      {view.status !== "idle" && (
+        <Badge
+          variant={view.status === "failed" ? "destructive" : "secondary"}
+          title={detail || undefined}
+        >
+          {babysitLabels[view.status]}
+        </Badge>
+      )}
+      {"threadId" in view && (
+        <Button
+          size="sm"
+          variant="link"
+          className="h-7 px-1"
+          onClick={() => navigate.toThread(view.threadId)}
+        >
+          Thread
+        </Button>
+      )}
+      {view.actions.map((action) => (
+        <Button
+          key={action}
+          size="sm"
+          variant={action === "stop" ? "outline" : "default"}
+          className="h-7"
+          disabled={busy}
+          onClick={() => void run(action)}
+        >
+          {action === "start"
+            ? "Babysit"
+            : action === "stop"
+              ? "Stop"
+              : "Retry"}
+        </Button>
+      ))}
+    </span>
+  );
+}
+
+function BabysitPreferencesControl() {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const [loaded, setLoaded] = useState<
+    | { state: "loading" }
+    | { state: "ready"; preferences: Preferences }
+    | { state: "error"; message: string }
+  >({ state: "loading" });
+  const [saving, setSaving] = useState(false);
+  const load = useCallback(() => {
+    void rpc
+      .call("getBabysitPreferences", null)
+      .then((preferences) => setLoaded({ state: "ready", preferences }))
+      .catch((error: unknown) =>
+        setLoaded({
+          state: "error",
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+  }, [rpc]);
+  useEffect(load, [load]);
+  useRealtime("babysit-changed", load);
+  if (loaded.state === "loading") return null;
+  if (loaded.state === "error")
+    return (
+      <div
+        role="alert"
+        className="flex flex-wrap items-center gap-2 text-xs text-destructive"
+      >
+        Could not load babysitter settings: {loaded.message}
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7"
+          onClick={() => {
+            setLoaded({ state: "loading" });
+            load();
+          }}
+        >
+          Retry
+        </Button>
+      </div>
+    );
+  const { preferences } = loaded;
+  const setPreferences = (next: Preferences) =>
+    setLoaded({ state: "ready", preferences: next });
+  const save = async (
+    update: () => Promise<Preferences>,
+    optimistic: Preferences,
+  ) => {
+    const previous = preferences;
+    setPreferences(optimistic);
+    setSaving(true);
+    try {
+      setPreferences(await update());
+    } catch (error) {
+      setPreferences(previous);
+      toast.error(
+        error instanceof Error ? error.message : "Could not save settings",
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+  const execution: ExperimentalProviderModelPickerValue = preferences.execution;
+  return (
+    <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          aria-label="Automatically babysit my pull requests"
+          checked={preferences.autoBabysit}
+          disabled={saving}
+          onChange={(event) => {
+            const enabled = event.target.checked;
+            void save(() => rpc.call("setAutoBabysit", { enabled }), {
+              ...preferences,
+              autoBabysit: enabled,
+            });
+          }}
+        />
+        Auto-babysit my PRs in BB projects
+      </label>
+      <ProviderModelPicker
+        value={execution}
+        disabled={saving}
+        align="end"
+        onChange={(value) => {
+          const next = {
+            ...value,
+            serviceTier: value.serviceTier ?? "default",
+          };
+          void save(() => rpc.call("setBabysitExecution", next), {
+            ...preferences,
+            execution: next,
+          });
+        }}
+      />
+    </div>
+  );
+}
+
+function BabysitterSessions() {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const navigate = useBbNavigate();
+  const [sessions, setSessions] = useState<BabysitSessions | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(() => {
+    void rpc
+      .call("listBabysitSessions", null)
+      .then((result) => {
+        setSessions(result.sessions);
+        setError(null);
+      })
+      .catch((reason: unknown) =>
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : "Could not load babysitter sessions",
+        ),
+      );
+  }, [rpc]);
+  useEffect(load, [load]);
+  useRealtime("babysit-changed", load);
+  if (error)
+    return (
+      <div role="alert" className="p-8 text-center text-muted-foreground">
+        {error}
+      </div>
+    );
+  if (!sessions) return <Skeleton className="h-24 w-full" />;
+  if (!sessions.length)
+    return (
+      <div className="rounded-lg border border-border bg-card p-8 text-center text-muted-foreground">
+        No babysitter sessions yet. Start one from My PRs.
+      </div>
+    );
+  return (
+    <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
+      {sessions.map((session) => (
+        <div
+          key={`${session.repo}#${session.number}`}
+          data-testid="babysit-session"
+          className="flex flex-col gap-2 px-3 py-3 sm:flex-row sm:items-center"
+        >
+          <button
+            className="flex min-w-0 flex-1 cursor-pointer flex-col items-start text-left"
+            onClick={() =>
+              navigate.toPluginPanel("gitea", {
+                subPath: `pulls/${session.repo}/${session.number}`,
+              })
+            }
+          >
+            <span className="font-medium text-foreground">
+              {session.repo}#{session.number}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {session.updatedAt}
+            </span>
+            {babysitDetail(session) && (
+              <span className="line-clamp-2 text-xs text-muted-foreground">
+                {babysitDetail(session)}
+              </span>
+            )}
+          </button>
+          <BabysitControls
+            repo={session.repo}
+            number={session.number}
+            view={session}
+            onChanged={load}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
@@ -117,6 +493,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const [repo, setRepo] = useState("all");
   const [query, setQuery] = useState("");
   const [items, setItems] = useState<Item[]>([]);
+  const [babysits, setBabysits] = useState<Map<string, BabysitView>>(
+    () => new Map(),
+  );
   const [listNotice, setListNotice] = useState<{
     truncated: boolean;
     errors: Array<{ repo: string; message: string }>;
@@ -155,15 +534,28 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     }
   }, [rpc]);
   const loadItems = useCallback(async () => {
+    if (view === "babysitters") return;
     setLoading(true);
     try {
-      const result = await rpc.call("listItems", {
-        kind: view === "issues" ? "issue" : "pr",
-        state,
-        query,
-        ...(repo === "all" ? {} : { repo }),
-      });
+      const filters = { state, query, ...(repo === "all" ? {} : { repo }) };
+      const mine =
+        view === "my-prs"
+          ? await rpc.call("listMyPullRequests", filters)
+          : null;
+      const result =
+        mine ??
+        (await rpc.call("listItems", {
+          kind: view === "issues" ? "issue" : "pr",
+          ...filters,
+        }));
       setItems(result.items);
+      setBabysits(
+        new Map(
+          (mine?.items ?? []).map(
+            (item) => [itemKey(item), item.babysit] as const,
+          ),
+        ),
+      );
       setListNotice({ truncated: result.truncated, errors: result.errors });
       setListError(null);
     } catch (error) {
@@ -180,6 +572,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   useEffect(() => {
     void loadItems();
   }, [loadItems]);
+  const reloadBabysits = useCallback(() => {
+    if (view === "my-prs") void loadItems();
+  }, [loadItems, view]);
+  useRealtime("babysit-changed", reloadBabysits);
   const openItem = useCallback(
     async (item: Item) => {
       navigate.toPluginPanel("gitea", {
@@ -347,13 +743,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     }
   }, [loadItems, newBody, newTitle, openItem, repo, rpc]);
 
-  const visibleItems = useMemo(
-    () =>
-      view === "my-prs"
-        ? items.filter((item) => item.author === status?.login)
-        : items,
-    [items, status?.login, view],
-  );
+  const visibleItems = items;
   const count = visibleItems.filter((item) => item.state === "open").length;
   if (newIssue) {
     return (
@@ -538,6 +928,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                           incomplete.
                         </p>
                       )}
+                      <DiffBanner files={detail.files} />
                       {detail.files.map((file) => (
                         <article
                           key={file.path}
@@ -545,7 +936,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                         >
                           <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-2 text-xs">
                             <span className="min-w-0 flex-1 truncate font-mono">
-                              {file.path}
+                              {file.previousPath
+                                ? `${file.previousPath} → ${file.path}`
+                                : file.path}
                             </span>
                             <span className="text-green-600 dark:text-green-400">
                               +{file.additions}
@@ -555,7 +948,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                             </span>
                             <Badge variant="secondary">{file.status}</Badge>
                           </div>
-                          <GiteaDiff path={file.path} patch={file.patch} />
+                          <GiteaDiff
+                            path={file.path}
+                            diff={file.diff}
+                            filesUrl={filesUrl(detail)}
+                          />
                         </article>
                       ))}
                     </section>
@@ -777,6 +1174,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   {view === "my-prs" ? count : ""}
                 </Badge>
               </TabsTrigger>
+              <TabsTrigger value="babysitters">Babysitters</TabsTrigger>
               <TabsTrigger value="issues">Issues</TabsTrigger>
               <TabsTrigger value="pulls">Pull requests</TabsTrigger>
             </TabsList>
@@ -819,109 +1217,132 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               ))}
             </div>
           )}
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <Select value={repo} onValueChange={setRepo}>
-                <SelectTrigger className="w-52">
-                  <SelectValue placeholder="All repositories" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All repositories</SelectItem>
-                  {repoOptions.map((entry) => (
-                    <SelectItem key={entry.repo} value={entry.repo}>
-                      {entry.repo}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Select
-                value={state}
-                onValueChange={(value) => setState(value as typeof state)}
-              >
-                <SelectTrigger className="w-32">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="open">Open</SelectItem>
-                  <SelectItem value="closed">Closed</SelectItem>
-                  <SelectItem value="all">All states</SelectItem>
-                </SelectContent>
-              </Select>
-              <Input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search title, body, repository"
-                className="max-w-sm"
-              />
-            </div>
-            <div className="overflow-hidden rounded-lg border border-border bg-card">
-              <div className="divide-y divide-border">
-                {loading ? (
-                  Array.from({ length: 6 }, (_, index) => (
-                    <div key={index} className="space-y-2 px-3 py-3">
-                      <Skeleton className="h-4 w-3/4" />
-                      <Skeleton className="h-3 w-1/2" />
-                    </div>
-                  ))
-                ) : listError ? (
-                  <div
-                    role="alert"
-                    className="p-8 text-center text-muted-foreground"
-                  >
-                    {listError}
-                  </div>
-                ) : visibleItems.length ? (
-                  visibleItems.map((item) => (
-                    <button
-                      key={itemKey(item)}
-                      className="flex w-full cursor-pointer flex-col gap-2 px-3 py-3 text-left hover:bg-accent/50 sm:flex-row sm:items-center"
-                      onClick={() => void openItem(item)}
+          {(view === "my-prs" || view === "babysitters") && (
+            <BabysitPreferencesControl />
+          )}
+          {view === "babysitters" ? (
+            <BabysitterSessions />
+          ) : (
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Select value={repo} onValueChange={setRepo}>
+                  <SelectTrigger className="w-52">
+                    <SelectValue placeholder="All repositories" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All repositories</SelectItem>
+                    {repoOptions.map((entry) => (
+                      <SelectItem key={entry.repo} value={entry.repo}>
+                        {entry.repo}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={state}
+                  onValueChange={(value) => setState(value as typeof state)}
+                >
+                  <SelectTrigger className="w-32">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="open">Open</SelectItem>
+                    <SelectItem value="closed">Closed</SelectItem>
+                    <SelectItem value="all">All states</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Input
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search title, body, repository"
+                  className="max-w-sm"
+                />
+              </div>
+              <div className="overflow-hidden rounded-lg border border-border bg-card">
+                <div className="divide-y divide-border">
+                  {loading ? (
+                    Array.from({ length: 6 }, (_, index) => (
+                      <div key={index} className="space-y-2 px-3 py-3">
+                        <Skeleton className="h-4 w-3/4" />
+                        <Skeleton className="h-3 w-1/2" />
+                      </div>
+                    ))
+                  ) : listError ? (
+                    <div
+                      role="alert"
+                      className="p-8 text-center text-muted-foreground"
                     >
-                      <span className="flex min-w-0 flex-1 items-center gap-2">
-                        <Badge
-                          variant="outline"
-                          className="gap-1.5 font-normal"
+                      {listError}
+                    </div>
+                  ) : visibleItems.length ? (
+                    visibleItems.map((item) => (
+                      <div
+                        key={itemKey(item)}
+                        className="flex flex-col gap-2 hover:bg-accent/50 sm:flex-row sm:items-center sm:pr-3"
+                      >
+                        <button
+                          className="flex w-full min-w-0 flex-1 cursor-pointer flex-col gap-2 px-3 py-3 text-left sm:flex-row sm:items-center"
+                          onClick={() => void openItem(item)}
                         >
-                          <span
-                            className={`size-2 shrink-0 rounded-full ${item.state === "open" ? "bg-green-500" : "bg-purple-500"}`}
-                          />
-                          {item.state.toLowerCase()}
-                        </Badge>
-                        <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                          #{item.number}
-                        </span>
-                        <span className="min-w-0 truncate text-sm font-medium text-foreground">
-                          {item.title}
-                        </span>
-                        <span className="hidden shrink-0 text-xs text-muted-foreground md:inline">
-                          {item.repo}
-                        </span>
-                      </span>
-                      <span className="flex flex-wrap items-center gap-1">
-                        {item.labels.slice(0, 3).map((label) => (
-                          <Badge
-                            key={label}
-                            variant="secondary"
-                            className="font-normal text-muted-foreground"
-                          >
-                            {label}
-                          </Badge>
-                        ))}
-                      </span>
-                    </button>
-                  ))
-                ) : (
-                  <div className="p-8 text-center text-muted-foreground">
-                    {view === "my-prs" && !status?.login
-                      ? "Install tea and sign in with a matching Gitea login profile to see your pull requests."
-                      : repoOptions.length
-                        ? "No matching items."
-                        : "Add repositories in settings or attach a Gitea checkout to a BB project."}
-                  </div>
-                )}
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <Badge
+                              variant="outline"
+                              className="gap-1.5 font-normal"
+                            >
+                              <span
+                                className={`size-2 shrink-0 rounded-full ${item.state === "open" ? "bg-green-500" : "bg-purple-500"}`}
+                              />
+                              {item.state.toLowerCase()}
+                            </Badge>
+                            <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                              #{item.number}
+                            </span>
+                            <span className="min-w-0 truncate text-sm font-medium text-foreground">
+                              {item.title}
+                            </span>
+                            <span className="hidden shrink-0 text-xs text-muted-foreground md:inline">
+                              {item.repo}
+                            </span>
+                          </span>
+                          <span className="flex flex-wrap items-center gap-1">
+                            {item.labels.slice(0, 3).map((label) => (
+                              <Badge
+                                key={label}
+                                variant="secondary"
+                                className="font-normal text-muted-foreground"
+                              >
+                                {label}
+                              </Badge>
+                            ))}
+                          </span>
+                        </button>
+                        {babysits.has(itemKey(item)) && (
+                          <span className="px-3 pb-3 sm:p-0">
+                            <BabysitControls
+                              repo={item.repo}
+                              number={item.number}
+                              view={babysits.get(itemKey(item))!}
+                              onChanged={reloadBabysits}
+                            />
+                          </span>
+                        )}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="p-8 text-center text-muted-foreground">
+                      {view === "my-prs" && !status?.login
+                        ? "Install tea and sign in with a matching Gitea login profile to see your pull requests."
+                        : view === "my-prs"
+                          ? "No pull requests authored by you in tracked repositories."
+                          : repoOptions.length
+                            ? "No matching items."
+                            : "Add repositories in settings or attach a Gitea checkout to a BB project."}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
     </div>
@@ -990,11 +1411,16 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
               The file list reached the 100-file cap and may be incomplete.
             </div>
           )}
+          <DiffBanner files={detail.files} />
           {detail.files.map((file) => (
             <details key={file.path} className="border-b py-2">
               <summary className="cursor-pointer">{file.path}</summary>
               <div className="mt-2 overflow-hidden rounded-md border border-border bg-card">
-                <GiteaDiff path={file.path} patch={file.patch} />
+                <GiteaDiff
+                  path={file.path}
+                  diff={file.diff}
+                  filesUrl={filesUrl(detail)}
+                />
               </div>
             </details>
           ))}

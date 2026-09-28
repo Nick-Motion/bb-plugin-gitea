@@ -22,6 +22,8 @@
   },
   "include": [
     "server.ts",
+    "babysitter.ts",
+    "pull-diff.ts",
     "*.test.ts",
     "app.tsx",
     "vitest.config.ts"

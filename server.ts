@@ -7,6 +7,45 @@ import { z } from "zod";
 import { execFile, type ExecFileException } from "node:child_process";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
+import {
+  assignFileDiffs,
+  fileDiffSchema,
+  parseRevision,
+  sameRevision,
+  type FileDiff,
+  type PullRevision,
+  type RawPullDiff,
+} from "./pull-diff.js";
+import {
+  autoStartTargets,
+  babysitExecutionSchema,
+  babysitPreferencesSchema,
+  babysitSessionSchema,
+  babysitSessionViewSchema,
+  babysitView,
+  babysitViewSchema,
+  buildBabysitterPrompt,
+  confirmedTerminal,
+  decideRetry,
+  decideStart,
+  decideStop,
+  defaultBabysitPreferences,
+  giteaBabysitterTitlePrefix,
+  onArchived,
+  onCleanupFailed,
+  onFailed,
+  onIdle,
+  parseLifecycle,
+  pullKey,
+  sameSession,
+  sessionActions,
+  startError,
+  stopped,
+  watching,
+  type BabysitPreferences,
+  type BabysitSession,
+  type LifecycleFact,
+} from "./babysitter.js";
 const execFileAsync = promisify(execFile);
 
 const repositorySchema = z.string().regex(/^[\w.-]+\/[\w.-]+$/);
@@ -40,9 +79,10 @@ const detailSchema = itemSchema.extend({
     z.object({
       path: z.string(),
       status: z.string(),
+      previousPath: z.string().nullable(),
       additions: z.number(),
       deletions: z.number(),
-      patch: z.string().nullable(),
+      diff: fileDiffSchema,
     }),
   ),
   checksTruncated: z.boolean(),
@@ -68,6 +108,11 @@ const detailSchema = itemSchema.extend({
   threadId: z.string().nullable(),
 });
 const okSchema = z.object({ ok: z.literal(true) });
+const pullRefSchema = z.object({
+  repo: repositorySchema,
+  number: z.number().int().positive(),
+});
+const threadIdSchema = z.object({ threadId: z.string().min(1) });
 
 export const giteaRpcContract = defineRpcContract({
   status: {
@@ -165,6 +210,39 @@ export const giteaRpcContract = defineRpcContract({
       items: z.number().int().nonnegative(),
     }),
   },
+  listMyPullRequests: {
+    input: z.object({
+      repo: repositorySchema.optional(),
+      state: z.enum(["open", "closed", "all"]).default("open"),
+      query: z.string().max(200).default(""),
+    }),
+    output: listOutputSchema.extend({
+      login: z.string(),
+      items: z.array(itemSchema.extend({ babysit: babysitViewSchema })),
+      preferences: babysitPreferencesSchema,
+    }),
+  },
+  startBabysit: { input: pullRefSchema, output: threadIdSchema },
+  retryBabysit: { input: pullRefSchema, output: threadIdSchema },
+  stopBabysit: { input: pullRefSchema, output: okSchema },
+  getBabysitStatus: { input: pullRefSchema, output: babysitViewSchema },
+  babysitThread: {
+    input: threadIdSchema,
+    output: babysitSessionViewSchema.nullable(),
+  },
+  listBabysitSessions: {
+    input: z.null(),
+    output: z.object({ sessions: z.array(babysitSessionViewSchema) }),
+  },
+  getBabysitPreferences: { input: z.null(), output: babysitPreferencesSchema },
+  setAutoBabysit: {
+    input: z.object({ enabled: z.boolean() }),
+    output: babysitPreferencesSchema,
+  },
+  setBabysitExecution: {
+    input: babysitExecutionSchema,
+    output: babysitPreferencesSchema,
+  },
 });
 
 type Repo = { repo: string; projectId: string | null };
@@ -213,9 +291,11 @@ function sameInstance(raw: string, base: URL): boolean {
 class TeaProcessError extends Error {
   readonly missingLogin: boolean;
   readonly interrupted: boolean;
+  readonly overflow: boolean;
   constructor(error: ExecFileException, stderr: string) {
     super("tea exited unsuccessfully.");
     this.missingLogin = /login name '.*' does not exist/.test(stderr);
+    this.overflow = error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
     this.interrupted = error.killed === true || error.signal != null;
   }
 }
@@ -499,8 +579,11 @@ export default async function plugin(bb: BbPluginApi) {
     return loginLookup;
   }
 
-  async function api(path: string, request: ApiRequest = {}): Promise<unknown> {
-    const base = cleanBaseUrl(config.baseUrl);
+  async function teaApi(
+    path: string,
+    request: ApiRequest,
+  ): Promise<{ kind: "body"; body: string } | { kind: "too-large" }> {
+    cleanBaseUrl(config.baseUrl);
     const { signal } = request;
     signal?.throwIfAborted();
     const login = await teaLogin();
@@ -525,6 +608,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
     } catch (error) {
       if (signal?.aborted || !(error instanceof TeaProcessError)) throw error;
+      if (error.overflow) return { kind: "too-large" };
       if (error.missingLogin) {
         loginLookup = null;
         throw new Error(
@@ -548,13 +632,85 @@ export default async function plugin(bb: BbPluginApi) {
       );
     if (status < 200 || status >= 300)
       throw new Error(`Gitea API returned HTTP ${status}.`);
-    if (!output.stdout.trim()) return null;
+    return { kind: "body", body: output.stdout };
+  }
+
+  async function api(path: string, request: ApiRequest = {}): Promise<unknown> {
+    const response = await teaApi(path, request);
+    if (response.kind === "too-large")
+      throw new Error("The Gitea response exceeded the 16 MiB limit.");
+    if (!response.body.trim()) return null;
     try {
-      return JSON.parse(output.stdout) as unknown;
+      return JSON.parse(response.body) as unknown;
     } catch {
       throw new Error("tea returned invalid JSON from Gitea.");
     }
   }
+
+  async function pullDiff(
+    repo: string,
+    number: number,
+    signal: AbortSignal | undefined,
+  ): Promise<RawPullDiff> {
+    try {
+      const response = await teaApi(repoPath(repo, `pulls/${number}.diff`), {
+        signal,
+      });
+      return response.kind === "body"
+        ? { kind: "text", text: response.body }
+        : response;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      bb.log.warn(
+        `Could not read the raw diff for ${repo}#${number}: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+      return { kind: "failed" };
+    }
+  }
+
+  async function readPull(
+    repo: string,
+    number: number,
+    signal: AbortSignal | undefined,
+  ): Promise<{ pull: Record<string, unknown>; revision: PullRevision }> {
+    const pull = record(
+      await api(repoPath(repo, `pulls/${number}`), { signal }),
+    );
+    const revision = parseRevision(pull);
+    if (!revision)
+      throw new Error(
+        "Gitea returned a pull request without head and base revisions.",
+      );
+    return { pull, revision };
+  }
+
+  async function readPullFiles(
+    repo: string,
+    number: number,
+    signal: AbortSignal | undefined,
+  ) {
+    const page = await paginated(
+      repoPath(repo, `pulls/${number}/files`),
+      signal,
+      2,
+    );
+    const files = page.values.map((entry) => {
+      const f = record(entry);
+      return {
+        path: text(f.filename),
+        previousPath: text(f.previous_filename) || null,
+        status: text(f.status),
+        additions: Number(f.additions) || 0,
+        deletions: Number(f.deletions) || 0,
+        patch: text(f.patch) || null,
+      };
+    });
+    const raw = files.every((file) => file.patch)
+      ? null
+      : await pullDiff(repo, number, signal);
+    return { files, raw, truncated: page.truncated };
+  }
+
   async function repos(): Promise<Repo[]> {
     const found = new Map<string, Repo>();
     const base = cleanBaseUrl(config.baseUrl);
@@ -674,6 +830,546 @@ export default async function plugin(bb: BbPluginApi) {
       errors,
     });
   }
+  const babysitPrefix = "babysit:";
+  const babysitIntervalMs = 5 * 60_000;
+  const babysitKey = (repo: string, number: number) =>
+    `${babysitPrefix}${pullKey(repo, number)}`;
+  const babysitThreadKey = (threadId: string) => `babysit-thread:${threadId}`;
+  const babysitRefSchema = z.object({
+    repo: repositorySchema,
+    number: z.number().int().positive(),
+  });
+  const babysitRuns = new Map<string, Promise<{ threadId: string }>>();
+  const now = () => new Date().toISOString();
+  const message = (error: unknown) =>
+    error instanceof Error ? error.message : String(error);
+
+  async function getSession(
+    repo: string,
+    number: number,
+  ): Promise<BabysitSession | null> {
+    const parsed = babysitSessionSchema.safeParse(
+      await bb.storage.kv.get<unknown>(babysitKey(repo, number)),
+    );
+    return parsed.success ? parsed.data : null;
+  }
+
+  async function getSessionByThread(
+    threadId: string,
+  ): Promise<BabysitSession | null> {
+    const ref = babysitRefSchema.safeParse(
+      await bb.storage.kv.get<unknown>(babysitThreadKey(threadId)),
+    );
+    if (!ref.success) return null;
+    const session = await getSession(ref.data.repo, ref.data.number);
+    return session?.threadId === threadId ? session : null;
+  }
+
+  async function listSessions(): Promise<BabysitSession[]> {
+    const sessions: BabysitSession[] = [];
+    for (const key of await bb.storage.kv.list(babysitPrefix)) {
+      const parsed = babysitSessionSchema.safeParse(
+        await bb.storage.kv.get<unknown>(key),
+      );
+      if (parsed.success) sessions.push(parsed.data);
+    }
+    return sessions.sort((left, right) =>
+      right.updatedAt.localeCompare(left.updatedAt),
+    );
+  }
+
+  async function setSession(session: BabysitSession): Promise<void> {
+    await bb.storage.kv.set(babysitKey(session.repo, session.number), session);
+    await bb.storage.kv.set(babysitThreadKey(session.threadId), {
+      repo: session.repo,
+      number: session.number,
+    });
+    bb.realtime.publish("babysit-changed", {
+      repo: session.repo,
+      number: session.number,
+    });
+  }
+
+  async function forgetDeletedThread(threadId: string): Promise<void> {
+    const current = await getSessionByThread(threadId);
+    if (current !== null) {
+      await bb.storage.kv.delete(babysitKey(current.repo, current.number));
+      bb.realtime.publish("babysit-changed", {
+        repo: current.repo,
+        number: current.number,
+      });
+    }
+    await bb.storage.kv.delete(babysitThreadKey(threadId));
+  }
+
+  async function readThreadPresence(
+    threadId: string,
+  ): Promise<
+    | { state: "deleted" }
+    | { state: "present"; archived: boolean; status: string }
+  > {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      return thread.deletedAt
+        ? { state: "deleted" }
+        : {
+            state: "present",
+            archived: Boolean(thread.archivedAt),
+            status: thread.status,
+          };
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        (error as { code?: unknown }).code === "thread_not_found"
+      )
+        return { state: "deleted" };
+      throw error;
+    }
+  }
+
+  async function writeIfCurrent(
+    expected: BabysitSession,
+    next: BabysitSession,
+  ): Promise<boolean> {
+    if (
+      !sameSession(expected, await getSession(expected.repo, expected.number))
+    )
+      return false;
+    await setSession(next);
+    return true;
+  }
+
+  async function getPreferences(): Promise<BabysitPreferences> {
+    const parsed = babysitPreferencesSchema.safeParse(
+      await bb.storage.kv.get<unknown>("babysit-preferences"),
+    );
+    return parsed.success ? parsed.data : defaultBabysitPreferences;
+  }
+
+  let preferencesUpdate: Promise<unknown> = Promise.resolve();
+  function updatePreferences(
+    update: (current: BabysitPreferences) => BabysitPreferences,
+  ): Promise<BabysitPreferences> {
+    const result = preferencesUpdate.then(async () => {
+      const next = update(await getPreferences());
+      await bb.storage.kv.set("babysit-preferences", next);
+      bb.realtime.publish("babysit-changed", { settings: true });
+      return next;
+    });
+    preferencesUpdate = result.catch(() => undefined);
+    return result;
+  }
+
+  async function readLifecycle(
+    repo: string,
+    number: number,
+    signal?: AbortSignal,
+  ): Promise<LifecycleFact> {
+    try {
+      const lifecycle = parseLifecycle(
+        await api(repoPath(repo, `pulls/${number}`), { signal }),
+      );
+      return (
+        lifecycle ?? {
+          state: "unknown",
+          error: "Gitea returned an unrecognized pull request state.",
+        }
+      );
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return { state: "unknown", error: message(error) };
+    }
+  }
+
+  function trackedProjects(
+    tracked: { repo: string; projectId: string | null }[],
+  ): Map<string, string> {
+    return new Map(
+      tracked.flatMap((entry) =>
+        entry.projectId === null
+          ? []
+          : [[entry.repo.toLowerCase(), entry.projectId] as const],
+      ),
+    );
+  }
+
+  async function projectFor(repo: string): Promise<string | null> {
+    return (
+      (await repos()).find(
+        (entry) => entry.repo.toLowerCase() === repo.toLowerCase(),
+      )?.projectId ?? null
+    );
+  }
+
+  async function archiveAndStop(
+    threadId: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const failures: string[] = [];
+    try {
+      await bb.sdk.threads.stop({ threadId });
+    } catch (error) {
+      failures.push(`stop: ${message(error)}`);
+    }
+    try {
+      await bb.sdk.threads.archive({ threadId });
+    } catch (error) {
+      failures.push(`archive: ${message(error)}`);
+    }
+    if (!failures.length) return { ok: true };
+    const error = failures.join("; ");
+    bb.log.error(`Could not clean up Gitea babysitter ${threadId}: ${error}`);
+    return { ok: false, error };
+  }
+
+  async function notifySupervisor(
+    threadId: string,
+    event: "idle" | "failed",
+    detail: string | null,
+  ) {
+    try {
+      await bb.sdk.plugins.callRpc({
+        pluginId: "supervisor",
+        method: "notifyBabysitter",
+        input: { threadId, event, detail },
+        outputSchema: z.object({ accepted: z.boolean() }).strict(),
+      });
+    } catch (error) {
+      bb.log.debug(
+        `Supervisor unavailable for Gitea babysitter ${threadId}: ${message(error)}`,
+      );
+    }
+  }
+
+  async function settle(
+    current: BabysitSession,
+    next: BabysitSession,
+    event: "idle" | "failed",
+    detail: string | null,
+  ) {
+    if (!(await writeIfCurrent(current, next))) return;
+    await notifySupervisor(next.threadId, event, detail);
+    if (!sameSession(next, await getSession(next.repo, next.number))) return;
+    const cleanup = await archiveAndStop(next.threadId);
+    if (!cleanup.ok)
+      await writeIfCurrent(next, onCleanupFailed(next, cleanup.error, now()));
+  }
+
+  async function handleIdle(threadId: string, lastText: string | null) {
+    const current = await getSessionByThread(threadId);
+    if (current?.status !== "watching") return;
+    const lifecycle = await readLifecycle(current.repo, current.number);
+    const next = onIdle(current, lastText, lifecycle, now());
+    if (next) await settle(current, next, "idle", lastText);
+  }
+
+  async function handleFailed(threadId: string, error: string | null) {
+    const current = await getSessionByThread(threadId);
+    const next = current && onFailed(current, error, now());
+    if (current && next) await settle(current, next, "failed", error);
+  }
+
+  async function handleArchived(threadId: string) {
+    const current = await getSessionByThread(threadId);
+    const next = current && onArchived(current, now());
+    if (current && next) await writeIfCurrent(current, next);
+  }
+
+  function runKeyed(
+    repo: string,
+    number: number,
+    run: () => Promise<{ threadId: string }>,
+  ): Promise<{ threadId: string }> {
+    const key = pullKey(repo, number);
+    const running = babysitRuns.get(key);
+    if (running) return running;
+    const promise = run().finally(() => {
+      if (babysitRuns.get(key) === promise) babysitRuns.delete(key);
+    });
+    babysitRuns.set(key, promise);
+    return promise;
+  }
+
+  async function spawnBabysitter(
+    repo: string,
+    number: number,
+  ): Promise<{ threadId: string }> {
+    const key = `${repo}#${number}`;
+    const [pull, projectId] = await Promise.all([
+      api(repoPath(repo, `pulls/${number}`)).then(record),
+      projectFor(repo),
+    ]);
+    const lifecycle = parseLifecycle(pull);
+    if (!lifecycle)
+      throw new Error("Gitea returned an unrecognized pull request state.");
+    const decision = decideStart({
+      session: await getSession(repo, number),
+      projectId,
+      lifecycle,
+    });
+    if (decision.kind === "reject")
+      throw new Error(startError(key, decision.reason));
+    if (decision.kind === "existing") return { threadId: decision.threadId };
+    const title = text(pull.title) || `pull request #${number}`;
+    const [{ execution }, login] = await Promise.all([
+      getPreferences(),
+      teaLogin(),
+    ]);
+    const thread = await bb.sdk.threads.spawn({
+      projectId: decision.projectId,
+      environment: { type: "project-default" },
+      visibility: "hidden",
+      title: `${giteaBabysitterTitlePrefix} ${key}: ${title}`.slice(0, 120),
+      prompt: buildBabysitterPrompt({
+        repo,
+        number,
+        title,
+        baseUrl: cleanBaseUrl(config.baseUrl).href,
+        login,
+      }),
+      providerId: execution.providerId,
+      model: execution.model,
+      reasoningLevel: execution.reasoningLevel,
+      serviceTier: execution.serviceTier,
+      permissionMode: "auto",
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        reasoningLevel: "explicit",
+        serviceTier: "explicit",
+        permissionMode: "explicit",
+      },
+    });
+    const raced = await getSession(repo, number);
+    if (
+      raced !== null &&
+      !(decision.replaces !== null && sameSession(decision.replaces, raced))
+    ) {
+      const cleanup = await archiveAndStop(thread.id);
+      if (!cleanup.ok)
+        throw new Error(
+          `Could not discard duplicate babysitter ${thread.id}: ${cleanup.error}`,
+        );
+      return { threadId: raced.threadId };
+    }
+    await setSession({
+      repo,
+      number,
+      threadId: thread.id,
+      updatedAt: now(),
+      status: "watching",
+    });
+    if (decision.replaces !== null)
+      await bb.storage.kv.delete(babysitThreadKey(decision.replaces.threadId));
+    await bb.storage.kv.set(`thread-link:${thread.id}`, {
+      repo,
+      number,
+      kind: "pr",
+    });
+    bb.log.info(`Started Gitea babysitter ${thread.id} for ${key}`);
+    return { threadId: thread.id };
+  }
+
+  function startBabysitter(repo: string, number: number) {
+    return runKeyed(repo, number, () => spawnBabysitter(repo, number));
+  }
+
+  function retryBabysitter(repo: string, number: number) {
+    return runKeyed(repo, number, async () => {
+      const decision = decideRetry(await getSession(repo, number));
+      if (decision.kind === "start") return await spawnBabysitter(repo, number);
+      if (decision.kind === "reject")
+        throw new Error(startError(`${repo}#${number}`, decision.reason));
+      if (decision.kind === "existing") return { threadId: decision.threadId };
+      const { session } = decision;
+      const result = { threadId: session.threadId };
+      const presence = await readThreadPresence(session.threadId);
+      if (presence.state === "deleted") {
+        await forgetDeletedThread(session.threadId);
+        return await spawnBabysitter(repo, number);
+      }
+      if (decision.cleanupFirst) {
+        const cleanup = await archiveAndStop(session.threadId);
+        if (!cleanup.ok) {
+          await writeIfCurrent(
+            session,
+            onCleanupFailed(session, cleanup.error, now()),
+          );
+          throw new Error(`Cleanup failed: ${cleanup.error}`);
+        }
+      }
+      const pull = record(await api(repoPath(repo, `pulls/${number}`)));
+      const lifecycle = parseLifecycle(pull);
+      if (!lifecycle)
+        throw new Error("Gitea returned an unrecognized pull request state.");
+      const done = confirmedTerminal(session, lifecycle, now());
+      if (done) {
+        await writeIfCurrent(session, done);
+        return result;
+      }
+      if (presence.archived || decision.cleanupFirst)
+        await bb.sdk.threads.unarchive({ threadId: session.threadId });
+      if (!sameSession(session, await getSession(repo, number))) return result;
+      await bb.sdk.threads.send({
+        threadId: session.threadId,
+        mode: "start",
+        input: [
+          {
+            type: "text",
+            text: `${buildBabysitterPrompt({
+              repo,
+              number,
+              title: text(pull.title) || `pull request #${number}`,
+              baseUrl: cleanBaseUrl(config.baseUrl).href,
+              login: await teaLogin(),
+            })}\n\nContinue from the preserved transcript and current Gitea state.`,
+            mentions: [],
+          },
+        ],
+      });
+      if (await writeIfCurrent(session, watching(session, now())))
+        return result;
+      const latest = await getSession(repo, number);
+      if (
+        latest?.threadId === session.threadId &&
+        latest.status === "stopped"
+      ) {
+        const cleanup = await archiveAndStop(session.threadId);
+        if (!cleanup.ok)
+          await writeIfCurrent(
+            latest,
+            onCleanupFailed(latest, cleanup.error, now()),
+          );
+      }
+      return result;
+    });
+  }
+
+  async function stopBabysitter(repo: string, number: number) {
+    for (;;) {
+      const target = decideStop(await getSession(repo, number));
+      if (!target) return { ok: true as const };
+      const next = stopped(target, now());
+      if (!(await writeIfCurrent(target, next))) continue;
+      const cleanup = await archiveAndStop(target.threadId);
+      if (cleanup.ok) return { ok: true as const };
+      await writeIfCurrent(next, onCleanupFailed(next, cleanup.error, now()));
+      throw new Error(`Cleanup failed: ${cleanup.error}`);
+    }
+  }
+
+  async function babysitStatus(repo: string, number: number) {
+    const session = await getSession(repo, number);
+    if (session !== null && session.status !== "closed")
+      return babysitView(session, null);
+    const [lifecycle, projectId] = await Promise.all([
+      readLifecycle(repo, number),
+      projectFor(repo),
+    ]);
+    return babysitView(session, { lifecycle, projectId });
+  }
+
+  async function currentLogin(signal?: AbortSignal): Promise<string> {
+    const login = text(record(await api("user", { signal })).login);
+    if (!login) throw new Error("Gitea did not report the signed-in user.");
+    return login;
+  }
+
+  async function reconcileAutoBabysit(signal?: AbortSignal) {
+    if (!(await getPreferences()).autoBabysit) return;
+    const [login, tracked, pulls, sessions] = await Promise.all([
+      currentLogin(signal),
+      repos(),
+      listItems("pr", undefined, "open", "", signal),
+      listSessions(),
+    ]);
+    const targets = autoStartTargets({
+      login,
+      pulls: pulls.items,
+      projects: trackedProjects(tracked),
+      sessions: new Map(
+        sessions.map((session) => [
+          pullKey(session.repo, session.number),
+          session,
+        ]),
+      ),
+    });
+    for (const target of targets) {
+      signal?.throwIfAborted();
+      try {
+        await startBabysitter(target.repo, target.number);
+      } catch (error) {
+        bb.log.warn(
+          `Automatic Gitea babysitter failed for ${target.repo}#${target.number}: ${message(error)}`,
+        );
+      }
+    }
+  }
+
+  async function reconcileSessions(signal: AbortSignal) {
+    for (const session of await listSessions()) {
+      if (signal.aborted) return;
+      try {
+        const thread = await readThreadPresence(session.threadId);
+        if (thread.state === "deleted")
+          await forgetDeletedThread(session.threadId);
+        else if (session.status !== "watching") continue;
+        else if (thread.archived) await handleArchived(session.threadId);
+        else if (thread.status === "idle")
+          await handleIdle(
+            session.threadId,
+            (await bb.sdk.threads.output({ threadId: session.threadId }))
+              .output,
+          );
+        else if (thread.status === "error")
+          await handleFailed(
+            session.threadId,
+            "The babysitter thread ended in error while the Gitea plugin was not observing it.",
+          );
+      } catch (error) {
+        bb.log.warn(
+          `Could not reconcile Gitea babysitter ${session.threadId}: ${message(error)}`,
+        );
+      }
+    }
+  }
+
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) =>
+    handleIdle(thread.id, lastAssistantText),
+  );
+  bb.events.on("thread.failed", ({ thread, error }) =>
+    handleFailed(thread.id, error),
+  );
+  bb.events.on("thread.archived", ({ thread }) => handleArchived(thread.id));
+  bb.events.on("thread.deleted", ({ thread }) =>
+    forgetDeletedThread(thread.id),
+  );
+  bb.background.service("babysitters", {
+    async start(signal) {
+      while (!signal.aborted) {
+        try {
+          await reconcileSessions(signal);
+          await reconcileAutoBabysit(signal);
+        } catch (error) {
+          if (signal.aborted) break;
+          bb.log.warn(
+            `Gitea babysitter reconciliation failed: ${message(error)}`,
+          );
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(done, babysitIntervalMs);
+          function done() {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", done);
+            resolve();
+          }
+          signal.addEventListener("abort", done, { once: true });
+          if (signal.aborted) done();
+        });
+      }
+    },
+  });
+
   const handlers = {
     status: async (
       _input,
@@ -728,10 +1424,11 @@ export default async function plugin(bb: BbPluginApi) {
       });
       let files: Array<{
         path: string;
+        previousPath: string | null;
         status: string;
         additions: number;
         deletions: number;
-        patch: string | null;
+        diff: FileDiff;
       }> = [];
       let filesTruncated = false,
         reviewsTruncated = false;
@@ -750,28 +1447,37 @@ export default async function plugin(bb: BbPluginApi) {
           createdAt: string;
         }> = [];
       if (kind === "pr") {
-        const [pr, filePage, reviewPage] = await Promise.all([
-          api(repoPath(repo, `pulls/${number}`), { signal }),
-          paginated(repoPath(repo, `pulls/${number}/files`), signal, 2),
+        const [before, reviewPage] = await Promise.all([
+          readPull(repo, number, signal),
           paginated(repoPath(repo, `pulls/${number}/reviews`), signal),
         ]);
-        const pull = record(pr),
+        let loaded = await readPullFiles(repo, number, signal);
+        let after = await readPull(repo, number, signal);
+        let stale = false;
+        if (!sameRevision(before.revision, after.revision)) {
+          const retryBase = after;
+          loaded = await readPullFiles(repo, number, signal);
+          after = await readPull(repo, number, signal);
+          stale = !sameRevision(retryBase.revision, after.revision);
+        }
+        const pull = after.pull,
           head = record(pull.head),
           baseInfo = record(pull.base);
         headRefName = text(head.ref);
         baseRefName = text(baseInfo.ref);
-        filesTruncated = filePage.truncated;
+        filesTruncated = loaded.truncated;
         reviewsTruncated = reviewPage.truncated;
-        files = filePage.values.map((entry) => {
-          const f = record(entry);
-          return {
-            path: text(f.filename),
-            status: text(f.status),
-            additions: Number(f.additions) || 0,
-            deletions: Number(f.deletions) || 0,
-            patch: text(f.patch) || null,
-          };
-        });
+        const diffs: FileDiff[] = stale
+          ? loaded.files.map(() => ({ kind: "unavailable", reason: "stale" }))
+          : assignFileDiffs(loaded.files, loaded.raw);
+        files = loaded.files.map((file, index) => ({
+          path: file.path,
+          previousPath: file.previousPath,
+          status: file.status,
+          additions: file.additions,
+          deletions: file.deletions,
+          diff: diffs[index]!,
+        }));
         reviews = reviewPage.values.map((entry) => {
           const r = record(entry);
           return {
@@ -782,7 +1488,7 @@ export default async function plugin(bb: BbPluginApi) {
           };
         });
         const statuses = await paginated(
-          repoPath(repo, `statuses/${encodeURIComponent(text(head.sha))}`),
+          repoPath(repo, `statuses/${encodeURIComponent(after.revision.head)}`),
           signal,
           2,
         ).catch(() => ({ values: [], truncated: false }));
@@ -952,6 +1658,63 @@ export default async function plugin(bb: BbPluginApi) {
     threadItem: async ({ threadId }) =>
       (await bb.storage.kv.get(`thread-link:${threadId}`)) ?? null,
     refresh: async () => ({ repos: (await repos()).length, items: 0 }),
+    listMyPullRequests: async (
+      { repo, state, query },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      const [login, tracked, list, preferences] = await Promise.all([
+        currentLogin(signal),
+        repos(),
+        listItems("pr", repo, state, query, signal),
+        getPreferences(),
+      ]);
+      const projects = trackedProjects(tracked);
+      const items = await Promise.all(
+        list.items
+          .filter((item) => item.author === login)
+          .map(async (item) => ({
+            ...item,
+            babysit: babysitView(
+              await getSession(item.repo, item.number),
+              item.state === "open"
+                ? {
+                    lifecycle: { state: "open" },
+                    projectId: projects.get(item.repo.toLowerCase()) ?? null,
+                  }
+                : null,
+            ),
+          })),
+      );
+      return { ...list, login, items, preferences };
+    },
+    startBabysit: ({ repo, number }) => startBabysitter(repo, number),
+    retryBabysit: ({ repo, number }) => retryBabysitter(repo, number),
+    stopBabysit: ({ repo, number }) => stopBabysitter(repo, number),
+    getBabysitStatus: ({ repo, number }) => babysitStatus(repo, number),
+    babysitThread: async ({ threadId }) => {
+      const session = await getSessionByThread(threadId);
+      return session && { ...session, actions: sessionActions(session) };
+    },
+    listBabysitSessions: async () => ({
+      sessions: (await listSessions()).map((session) => ({
+        ...session,
+        actions: sessionActions(session),
+      })),
+    }),
+    getBabysitPreferences: () => getPreferences(),
+    setAutoBabysit: async ({ enabled }) => {
+      const preferences = await updatePreferences((current) => ({
+        ...current,
+        autoBabysit: enabled,
+      }));
+      if (enabled)
+        await reconcileAutoBabysit().catch((error: unknown) =>
+          bb.log.warn(`Automatic Gitea babysitting failed: ${message(error)}`),
+        );
+      return preferences;
+    },
+    setBabysitExecution: (execution) =>
+      updatePreferences((current) => ({ ...current, execution })),
   } satisfies PluginRpcHandlers<typeof giteaRpcContract>;
   bb.rpc.register(giteaRpcContract, handlers);
   async function mentionItems(kind: "issue" | "pr", query: string) {
@@ -1083,6 +1846,54 @@ export default async function plugin(bb: BbPluginApi) {
         name: "refresh",
         summary: "Refresh repository availability",
         usage: "bb gitea refresh [--json]",
+      },
+      {
+        name: "my-prs",
+        summary: "List your pull requests with babysitter status",
+        usage:
+          "bb gitea my-prs [owner/repo] [--state open|closed|all] [--query text] [--json]",
+      },
+      {
+        name: "babysit",
+        summary: "Start a hidden babysitter thread for your pull request",
+        usage: "bb gitea babysit <owner/repo> <number> [--json]",
+      },
+      {
+        name: "babysit-status",
+        summary: "Show a pull request's babysitter state",
+        usage: "bb gitea babysit-status <owner/repo> <number> [--json]",
+      },
+      {
+        name: "babysit-stop",
+        summary: "Stop and archive a pull request's babysitter",
+        usage: "bb gitea babysit-stop <owner/repo> <number> [--json]",
+      },
+      {
+        name: "babysit-retry",
+        summary: "Resume a stopped, failed, or waiting babysitter",
+        usage: "bb gitea babysit-retry <owner/repo> <number> [--json]",
+      },
+      {
+        name: "babysit-thread",
+        summary: "Show the babysitter session owned by a BB thread",
+        usage: "bb gitea babysit-thread <thread-id> [--json]",
+      },
+      {
+        name: "babysit-sessions",
+        summary: "List retained babysitter sessions",
+        usage: "bb gitea babysit-sessions [--json]",
+      },
+      {
+        name: "auto-babysit",
+        summary: "Show or set automatic babysitting of your pull requests",
+        usage: "bb gitea auto-babysit [on|off] [--json]",
+      },
+      {
+        name: "babysit-execution",
+        summary:
+          "Set the provider, model, reasoning, and tier for new babysitters",
+        usage:
+          "bb gitea babysit-execution <provider> <model> <reasoning> [fast|default] [--json]",
       },
     ],
     async run(argv) {
@@ -1226,6 +2037,102 @@ export default async function plugin(bb: BbPluginApi) {
               ? `${value.repo}#${value.number} ${value.kind}`
               : "No Gitea item linked.",
           );
+        }
+        const describe = (
+          view: z.infer<typeof babysitViewSchema>,
+          ref: string,
+        ) =>
+          `${ref} ${view.status}${"threadId" in view ? ` thread ${view.threadId}` : ""}${view.status === "failed" ? `\n${view.error}` : ""}${view.actions.length ? `\nActions: ${view.actions.join(", ")}` : ""}`;
+        const pullRef = () =>
+          pullRefSchema.parse({ repo: values[0], number: Number(values[1]) });
+        const describePreferences = (value: BabysitPreferences) =>
+          `Automatic babysitting: ${value.autoBabysit ? "on" : "off"}\nExecution: ${value.execution.providerId} ${value.execution.model} ${value.execution.reasoningLevel} ${value.execution.serviceTier}`;
+        if (command === "my-prs") {
+          const input = giteaRpcContract.listMyPullRequests.input.parse({
+            ...(values[0] ? { repo: values[0] } : {}),
+            state,
+            query,
+          });
+          const value = await handlers.listMyPullRequests(input);
+          return succeed(
+            value,
+            `${value.items.map((entry) => `${entry.repo}#${entry.number} ${entry.state} babysit:${entry.babysit.status} ${entry.title}`).join("\n") || "No pull requests authored by you."}${value.truncated ? "\nResults are capped; narrow the repository or query." : ""}${value.errors.map((entry) => `\n${entry.repo}: ${entry.message}`).join("")}`,
+          );
+        }
+        if (command === "babysit" || command === "babysit-retry") {
+          const input = pullRef();
+          const value =
+            command === "babysit"
+              ? await handlers.startBabysit(input)
+              : await handlers.retryBabysit(input);
+          return succeed(
+            value,
+            `Babysitter for ${input.repo}#${input.number} is thread ${value.threadId}`,
+          );
+        }
+        if (command === "babysit-status") {
+          const input = pullRef();
+          const value = await handlers.getBabysitStatus(input);
+          return succeed(
+            value,
+            describe(value, `${input.repo}#${input.number}`),
+          );
+        }
+        if (command === "babysit-stop") {
+          const input = pullRef();
+          const value = await handlers.stopBabysit(input);
+          return succeed(
+            value,
+            `Babysitter for ${input.repo}#${input.number} is stopped`,
+          );
+        }
+        if (command === "babysit-thread") {
+          const value = await handlers.babysitThread(
+            threadIdSchema.parse({ threadId: values[0] }),
+          );
+          return succeed(
+            value,
+            value
+              ? describe(value, `${value.repo}#${value.number}`)
+              : "No Gitea babysitter owns this thread.",
+          );
+        }
+        if (command === "babysit-sessions") {
+          const value = await handlers.listBabysitSessions();
+          return succeed(
+            value,
+            value.sessions
+              .map((session) =>
+                describe(session, `${session.repo}#${session.number}`),
+              )
+              .join("\n") || "No babysitter sessions.",
+          );
+        }
+        if (command === "auto-babysit") {
+          const value =
+            values[0] === undefined
+              ? await handlers.getBabysitPreferences()
+              : await handlers.setAutoBabysit({
+                  enabled: z.enum(["on", "off"]).parse(values[0]) === "on",
+                });
+          return succeed(value, describePreferences(value));
+        }
+        if (command === "babysit-execution") {
+          if (values.length < 3 || values.length > 4)
+            return {
+              exitCode: 1,
+              stderr:
+                "babysit-execution requires: provider model reasoning [fast|default]",
+            };
+          const value = await handlers.setBabysitExecution(
+            babysitExecutionSchema.parse({
+              providerId: values[0],
+              model: values[1],
+              reasoningLevel: values[2],
+              serviceTier: values[3] ?? "default",
+            }),
+          );
+          return succeed(value, describePreferences(value));
         }
         if (command === "refresh") {
           const value = await handlers.refresh();

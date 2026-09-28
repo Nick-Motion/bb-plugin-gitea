@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-gitea",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Gitea issues and pull requests inside BB, backed by the Gitea tea CLI.",
   "license": "MIT",
   "repository": {
@@ -30,6 +30,8 @@
   "files": [
     "dist",
     "server.ts",
+    "pull-diff.ts",
+    "babysitter.ts",
     "app.tsx",
     "components",
     "lib",
