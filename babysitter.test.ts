@@ -18,6 +18,7 @@ import {
   parseMarker,
   parseStoredPreferences,
   parseStoredSession,
+  stopped,
   type BabysitPolicy,
   type BabysitSession,
 } from "./babysitter";
@@ -93,7 +94,7 @@ describe("decisions", () => {
     ).toEqual({ kind: "reject", reason: "merged" });
     for (const session of [
       watching,
-      { ...watching, status: "stopped" as const },
+      { ...watching, status: "stopped" as const, cleanupPending: false },
       { ...watching, status: "needs_you" as const, note: "" },
     ])
       expect(decideStart({ ...input, session, projectId: "p1" })).toEqual({
@@ -126,35 +127,53 @@ describe("decisions", () => {
       }),
     ).toEqual({ kind: "reject", reason: "closed" });
     expect(decideRetry(closedSession)).toEqual({
-      kind: "start",
-      policy: closedSession.policy,
+      kind: "reject",
+      reason: "inactive",
     });
     expect(
       decideRetry({ ...watching, status: "merged", mergedAt: now }),
     ).toEqual({ kind: "reject", reason: "merged" });
   });
 
-  it("retries resumable sessions and cleans up first after a cleanup failure", () => {
+  it("retries only failed or waiting sessions and cleans up first after a cleanup failure", () => {
     const failed = onCleanupFailed(watching, "stop: offline", now);
     expect(decideRetry(failed)).toEqual({
       kind: "resume",
       session: failed,
       cleanupFirst: true,
     });
-    expect(decideRetry({ ...watching, status: "stopped" })).toMatchObject({
-      kind: "resume",
-      cleanupFirst: false,
-    });
+    expect(
+      decideRetry({ ...watching, status: "needs_you", note: "" }),
+    ).toMatchObject({ kind: "resume", cleanupFirst: false });
     expect(decideRetry(watching)).toEqual({
       kind: "existing",
       threadId: "thread-1",
     });
-    expect(decideRetry(null)).toEqual({ kind: "reject", reason: "idle" });
+    for (const inactive of [
+      null,
+      stopped(watching, now, false),
+      stopped(watching, now, true),
+    ])
+      expect(decideRetry(inactive)).toEqual({
+        kind: "reject",
+        reason: "inactive",
+      });
   });
 
-  it("stops only live or retained non-terminal workers", () => {
+  it("keeps a stopped session's cleanup pending until it succeeds", () => {
+    const pending = stopped(watching, now, true);
+    expect(onCleanupFailed(pending, "archive: offline", now)).toEqual(pending);
+    expect(decideStop(pending)).toBe(pending);
+    expect(decideAutomation(pending, { fix: false })).toEqual({ kind: "stop" });
+    expect(decideAutomation(pending, { fix: true })).toMatchObject({
+      kind: "resume",
+      cleanupFirst: true,
+    });
+  });
+
+  it("stops only live, retained or cleanup-pending workers", () => {
     expect(decideStop(watching)).toBe(watching);
-    expect(decideStop({ ...watching, status: "stopped" })).toBeNull();
+    expect(decideStop(stopped(watching, now, false))).toBeNull();
     expect(
       decideStop({ ...watching, status: "merged", mergedAt: now }),
     ).toBeNull();
@@ -217,10 +236,10 @@ describe("transitions", () => {
   });
 
   it("ignores lifecycle events for sessions that are no longer watching", () => {
-    const stopped: BabysitSession = { ...watching, status: "stopped" };
-    expect(onIdle(stopped, "BB_GITEA_BABYSIT: MERGED", merged, now)).toBeNull();
-    expect(onFailed(stopped, "boom", now)).toBeNull();
-    expect(onArchived(stopped, now)).toBeNull();
+    const halted = stopped(watching, now, false);
+    expect(onIdle(halted, "BB_GITEA_BABYSIT: MERGED", merged, now)).toBeNull();
+    expect(onFailed(halted, "boom", now)).toBeNull();
+    expect(onArchived(halted, now)).toBeNull();
     expect(onArchived(watching, now)).toMatchObject({ status: "stopped" });
     expect(onFailed(watching, null, now)).toMatchObject({
       status: "failed",
@@ -261,8 +280,8 @@ describe("views and automation", () => {
     expect(babysitView(null, null).actions).toEqual([]);
     expect(babysitView(watching, openFacts).actions).toEqual(["stop"]);
     expect(
-      babysitView({ ...watching, status: "stopped" }, openFacts).actions,
-    ).toEqual(["retry"]);
+      babysitView(stopped(watching, now, false), openFacts).actions,
+    ).toEqual(["start"]);
     expect(
       babysitView({ ...watching, status: "merged", mergedAt: now }, openFacts)
         .actions,
@@ -308,7 +327,15 @@ describe("views and automation", () => {
         projects: new Map([["acme/widgets", "p1"]]),
         sessions: new Map<string, BabysitSession>([
           ["acme/widgets#6", { ...watching, number: 6 }],
-          ["acme/widgets#7", { ...watching, number: 7, status: "stopped" }],
+          [
+            "acme/widgets#7",
+            {
+              ...watching,
+              number: 7,
+              status: "stopped",
+              cleanupPending: false,
+            },
+          ],
           [
             "acme/widgets#8",
             { ...watching, number: 8, status: "closed", closedAt: now },
@@ -403,6 +430,14 @@ describe("Auto-fix and Auto-merge policy", () => {
       parseStoredSession({ ...watching, policy: { fix: false, merge: true } }),
     ).toEqual({ ...watching, policy: { fix: false, merge: true } });
     expect(parseStoredSession({ status: "watching" })).toBeNull();
+    const { cleanupPending: _pending, ...legacyStopped } = stopped(
+      watching,
+      now,
+      false,
+    );
+    expect(parseStoredSession(legacyStopped)).toEqual(
+      stopped(watching, now, false),
+    );
   });
 
   it("maps legacy automatic babysitting to both automatic options without losing execution", () => {
@@ -449,7 +484,7 @@ describe("Auto-fix and Auto-merge policy", () => {
         .automation,
     ).toEqual({ fix: true, merge: false });
     for (const retained of [
-      { ...fixOnly, status: "stopped" as const },
+      { ...fixOnly, status: "stopped" as const, cleanupPending: false },
       { ...fixOnly, status: "merged" as const, mergedAt: now },
       { ...fixOnly, status: "closed" as const, closedAt: now },
     ])
@@ -486,10 +521,10 @@ describe("Auto-fix and Auto-merge policy", () => {
             ? { kind: "unchanged" }
             : { kind: "update", session: watching, policy },
       );
-      const stopped: BabysitSession = { ...watching, status: "stopped" };
-      expect(decideAutomation(stopped, patch)).toEqual(
+      const halted = stopped(watching, now, false);
+      expect(decideAutomation(halted, patch)).toEqual(
         policy
-          ? { kind: "resume", session: stopped, policy, cleanupFirst: false }
+          ? { kind: "resume", session: halted, policy, cleanupFirst: false }
           : { kind: "unchanged" },
       );
     }

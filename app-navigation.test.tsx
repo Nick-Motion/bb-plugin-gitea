@@ -30,7 +30,8 @@ const panel = app.navPanels[0]!;
 const overlay = app.appOverlays[0]!;
 
 const preferences = {
-  autoBabysit: false,
+  autoFix: false,
+  autoMerge: false,
   execution: {
     providerId: "codex",
     model: "gpt-5.6-luna",
@@ -60,7 +61,11 @@ function pull(number: number, title: string) {
     url: `https://gitea.example/acme/widgets/pulls/${number}`,
     body: "",
     updatedAt: "2026-09-28T12:00:00Z",
-    babysit: { status: "idle" as const, actions: ["start" as const] },
+    babysit: {
+      status: "idle" as const,
+      actions: ["start" as const],
+      automation: { fix: false, merge: false },
+    },
   };
 }
 
@@ -227,9 +232,7 @@ it("repaints remembered My PRs rows at once after visiting a thread, then applie
   expect(screen.getByText("Faster pages")).toBeTruthy();
   expect(skeleton()).toBeNull();
   expect(screen.queryByText("Checking Gitea configuration…")).toBeNull();
-  expect(
-    screen.getByLabelText("Automatically babysit my pull requests"),
-  ).toBeTruthy();
+  expect(screen.getByLabelText("Turn on Auto-fix")).toBeTruthy();
   expect(search().value).toBe("faster");
   expect(
     screen.getByRole("tab", { name: /My PRs/ }).getAttribute("aria-selected"),
@@ -641,4 +644,55 @@ it("confirms the account before repainting remembered rows after a realtime reco
   expect(listCalls(returned)).toHaveLength(1);
   await list.release();
   expect(await screen.findByText("Refreshed row")).toBeTruthy();
+});
+
+function conversation(title: string) {
+  return {
+    freshness: { state: "fresh", fetchedAt },
+    threadId: null,
+    conversation: {
+      ...pull(10, title),
+      comments: [],
+      commentsTruncated: false,
+      headRefName: "feature",
+      baseRefName: "main",
+      revision: { head: "a".repeat(40), base: "b".repeat(40) },
+      changedFiles: 1,
+      checks: [],
+      checksTruncated: false,
+      reviews: [],
+      reviewsTruncated: false,
+    },
+  };
+}
+
+it("hides a pull request from the previous display scope until it reloads", async () => {
+  const scope = await watchScope();
+  let title = "Work account change";
+  let reread = held();
+  let reads = 0;
+  renderSlot(
+    panel,
+    { subPath: "pulls/acme/widgets/10" },
+    {
+      settings,
+      rpc: {
+        status: () => status(),
+        getBabysitPreferences: () => preferences,
+        conversation: async () => {
+          reads += 1;
+          const shown = title;
+          if (reads > 1) await reread.opened;
+          return conversation(shown);
+        },
+      },
+    },
+  );
+  expect(await screen.findByText("Work account change")).toBeTruthy();
+  title = "Ops account change";
+  await scope.emitRealtime("display-changed", { item: null });
+  await waitFor(() => expect(reads).toBe(2));
+  expect(screen.queryByText("Work account change")).toBeNull();
+  await reread.release();
+  expect(await screen.findByText("Ops account change")).toBeTruthy();
 });

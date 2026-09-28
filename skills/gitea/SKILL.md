@@ -33,7 +33,7 @@ Turning either option on starts a babysitter, a hidden BB thread that watches th
 - `bb gitea auto-fix <owner/repo> <number> on|off [--json]` turns Auto-fix on or off.
 - `bb gitea auto-merge <owner/repo> <number> on|off [--json]` turns Auto-merge on or off.
 - `bb gitea babysit-status <owner/repo> <number> [--json]` shows the state (`idle`, `watching`, `needs_you`, `failed`, `stopped`, `merged`, `closed`), the `automation` (`fix`, `merge`), and available actions.
-- `bb gitea babysit-retry <owner/repo> <number> [--json]` resumes a stopped, failed, or needs-you session in the same thread with its last options, finishing any pending cleanup first. If the thread was deleted, or the session is closed and the pull request reopened, it starts a fresh thread instead. With no session it is rejected; turn on an option instead.
+- `bb gitea babysit-retry <owner/repo> <number> [--json]` resumes a failed or needs-you session in the same thread with its last options, finishing any pending cleanup first. If the thread was deleted it starts a fresh thread instead. A stopped or closed session has no options left, so Retry rejects it along with a missing session; turn on Auto-fix or Auto-merge instead.
 - `bb gitea babysit-thread <thread-id> [--json]` shows the session owned by a BB thread.
 - `bb gitea babysit-sessions [--json]` lists retained sessions.
 - `bb gitea automation-defaults [fix|merge on|off] [--json]` shows or sets whether Auto-fix and Auto-merge turn on automatically for your open PRs in project-backed repositories without a session or with only a closed session. Both are off by default.

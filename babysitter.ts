@@ -107,14 +107,23 @@ export const babysitSessionSchema = z.discriminatedUnion("status", [
   }),
   sessionBase.extend({ status: z.literal("merged"), mergedAt: z.string() }),
   sessionBase.extend({ status: z.literal("closed"), closedAt: z.string() }),
-  sessionBase.extend({ status: z.literal("stopped") }),
+  sessionBase.extend({
+    status: z.literal("stopped"),
+    cleanupPending: z.boolean(),
+  }),
 ]);
 export type BabysitSession = z.infer<typeof babysitSessionSchema>;
+function upgradeStoredSession(raw: unknown): unknown {
+  if (typeof raw !== "object" || raw === null) return raw;
+  const upgraded = "policy" in raw ? raw : { ...raw, policy: legacyPolicy };
+  return "status" in upgraded &&
+    upgraded.status === "stopped" &&
+    !("cleanupPending" in upgraded)
+    ? { ...upgraded, cleanupPending: false }
+    : upgraded;
+}
 const storedSessionSchema = z.preprocess(
-  (raw) =>
-    typeof raw === "object" && raw !== null && !("policy" in raw)
-      ? { ...raw, policy: legacyPolicy }
-      : raw,
+  upgradeStoredSession,
   babysitSessionSchema,
 );
 
@@ -210,7 +219,7 @@ export function sessionActions(session: BabysitSession): BabysitAction[] {
     case "failed":
       return ["stop", "retry"];
     case "stopped":
-      return ["retry"];
+      return ["start"];
     case "merged":
     case "closed":
       return [];
@@ -316,7 +325,7 @@ export function decideAutomation(
         kind: "resume",
         session,
         policy,
-        cleanupFirst: session.status === "failed" && session.cleanupPending,
+        cleanupFirst: session.status !== "needs_you" && session.cleanupPending,
       };
 }
 
@@ -325,22 +334,26 @@ function samePolicy(left: BabysitPolicy, right: BabysitPolicy): boolean {
 }
 
 export type RetryDecision =
-  | { kind: "start"; policy: BabysitPolicy }
   | { kind: "existing"; threadId: string }
-  | { kind: "reject"; reason: "merged" | "idle" }
-  | { kind: "resume"; session: ResumableSession; cleanupFirst: boolean };
+  | { kind: "reject"; reason: "merged" | "inactive" }
+  | {
+      kind: "resume";
+      session: Extract<BabysitSession, { status: "needs_you" | "failed" }>;
+      cleanupFirst: boolean;
+    };
 export type ResumableSession = Extract<
   BabysitSession,
   { status: "needs_you" | "failed" | "stopped" }
 >;
 
 export function decideRetry(session: BabysitSession | null): RetryDecision {
-  if (session === null) return { kind: "reject", reason: "idle" };
-  switch (session.status) {
+  switch (session?.status) {
+    case undefined:
+    case "closed":
+    case "stopped":
+      return { kind: "reject", reason: "inactive" };
     case "merged":
       return { kind: "reject", reason: "merged" };
-    case "closed":
-      return { kind: "start", policy: session.policy };
     case "watching":
       return { kind: "existing", threadId: session.threadId };
     case "failed":
@@ -350,22 +363,23 @@ export function decideRetry(session: BabysitSession | null): RetryDecision {
         cleanupFirst: session.cleanupPending,
       };
     case "needs_you":
-    case "stopped":
       return { kind: "resume", session, cleanupFirst: false };
   }
 }
 
 export function decideStop(
   session: BabysitSession | null,
-): Extract<
-  BabysitSession,
-  { status: "watching" | "needs_you" | "failed" }
-> | null {
-  return session?.status === "watching" ||
-    session?.status === "needs_you" ||
-    session?.status === "failed"
-    ? session
-    : null;
+): Exclude<BabysitSession, { status: "merged" | "closed" }> | null {
+  switch (session?.status) {
+    case "watching":
+    case "needs_you":
+    case "failed":
+      return session;
+    case "stopped":
+      return session.cleanupPending ? session : null;
+    default:
+      return null;
+  }
 }
 
 function retained(session: BabysitSession, now: string) {
@@ -474,7 +488,7 @@ export function onArchived(
   session: BabysitSession,
   now: string,
 ): BabysitSession | null {
-  return session.status === "watching" ? stopped(session, now) : null;
+  return session.status === "watching" ? stopped(session, now, false) : null;
 }
 
 export function onCleanupFailed(
@@ -482,6 +496,8 @@ export function onCleanupFailed(
   detail: string,
   now: string,
 ): BabysitSession {
+  if (session.status === "stopped")
+    return { ...session, cleanupPending: true, updatedAt: now };
   const previous =
     session.status === "failed"
       ? ` (${session.error.replace(/^Cleanup failed: /, "")})`
@@ -492,8 +508,9 @@ export function onCleanupFailed(
 export function stopped(
   session: BabysitSession,
   now: string,
+  cleanupPending: boolean,
 ): Extract<BabysitSession, { status: "stopped" }> {
-  return { ...retained(session, now), status: "stopped" };
+  return { ...retained(session, now), status: "stopped", cleanupPending };
 }
 
 export function watching(

@@ -1304,6 +1304,7 @@ export default async function plugin(bb: BbPluginApi) {
     number: z.number().int().positive(),
   });
   const babysitQueues = new Map<string, Promise<void>>();
+  let defaultsQueue: Promise<void> = Promise.resolve();
   const now = () => new Date().toISOString();
   const message = (error: unknown) =>
     error instanceof Error ? error.message : String(error);
@@ -1693,14 +1694,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (await writeIfCurrent(session, watching(session, policy, now())))
       return result;
     const latest = await getSession(repo, number);
-    if (latest?.threadId === session.threadId && latest.status === "stopped") {
-      const cleanup = await archiveAndStop(session.threadId);
-      if (!cleanup.ok)
-        await writeIfCurrent(
-          latest,
-          onCleanupFailed(latest, cleanup.error, now()),
-        );
-    }
+    if (latest?.threadId === session.threadId && latest.status === "stopped")
+      await finishStop(latest);
     return result;
   }
 
@@ -1720,8 +1715,8 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(
         `The babysitter for ${repo}#${number} changed while its automation was updated; try again.`,
       );
-    try {
-      await bb.sdk.threads.send({
+    const delivery = await bb.sdk.threads
+      .send({
         threadId: session.threadId,
         mode: "steer",
         input: [
@@ -1731,23 +1726,36 @@ export default async function plugin(bb: BbPluginApi) {
             mentions: [],
           },
         ],
+      })
+      .catch(async (error: unknown) => {
+        await stopBabysitter(repo, number);
+        throw new Error(
+          `Could not deliver the automation change, so the babysitter was stopped: ${message(error)}`,
+        );
       });
-    } catch (error) {
-      await stopBabysitter(repo, number);
-      throw new Error(
-        `Could not deliver the automation change, so the babysitter was stopped: ${message(error)}`,
+    if (delivery.delivery === "sent") return;
+    await bb.sdk.threads.queuedMessages
+      .delete({
+        threadId: session.threadId,
+        queuedMessageId: delivery.queuedMessage.id,
+      })
+      .catch((error: unknown) =>
+        bb.log.warn(
+          `Could not withdraw the queued automation change for ${repo}#${number}: ${message(error)}`,
+        ),
       );
-    }
+    await stopBabysitter(repo, number);
+    throw new Error(
+      `The babysitter for ${repo}#${number} could not take the automation change immediately, so it was stopped; turn Auto-fix or Auto-merge on again to restart it.`,
+    );
   }
 
   function retryBabysitter(repo: string, number: number) {
     return serialized(repo, number, async () => {
       const decision = decideRetry(await getSession(repo, number));
-      if (decision.kind === "start")
-        return await spawnBabysitter(repo, number, decision.policy);
       if (decision.kind === "reject")
         throw new Error(
-          decision.reason === "idle"
+          decision.reason === "inactive"
             ? `${repo}#${number} has no babysitter to retry; turn on Auto-fix or Auto-merge.`
             : startError(`${repo}#${number}`, decision.reason),
         );
@@ -1784,13 +1792,25 @@ export default async function plugin(bb: BbPluginApi) {
     for (;;) {
       const target = decideStop(await getSession(repo, number));
       if (!target) return { ok: true as const };
-      const next = stopped(target, now());
+      const next = stopped(target, now(), true);
       if (!(await writeIfCurrent(target, next))) continue;
-      const cleanup = await archiveAndStop(target.threadId);
+      const cleanup = await finishStop(next);
       if (cleanup.ok) return { ok: true as const };
-      await writeIfCurrent(next, onCleanupFailed(next, cleanup.error, now()));
       throw new Error(`Cleanup failed: ${cleanup.error}`);
     }
+  }
+
+  async function finishStop(
+    session: Extract<BabysitSession, { status: "stopped" }>,
+  ) {
+    const cleanup = await archiveAndStop(session.threadId);
+    await writeIfCurrent(
+      session,
+      cleanup.ok
+        ? stopped(session, now(), false)
+        : onCleanupFailed(session, cleanup.error, now()),
+    );
+    return cleanup;
   }
 
   async function babysitStatus(repo: string, number: number) {
@@ -1810,13 +1830,25 @@ export default async function plugin(bb: BbPluginApi) {
     return login;
   }
 
-  async function reconcileAutoBabysit(signal?: AbortSignal) {
+  async function defaultPolicy() {
     const preferences = await getPreferences();
-    const policy = activePolicy({
+    return activePolicy({
       fix: preferences.autoFix,
       merge: preferences.autoMerge,
     });
-    if (policy === null) return;
+  }
+
+  function withDefaults<T>(run: () => Promise<T>): Promise<T> {
+    const result = defaultsQueue.then(run);
+    defaultsQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async function reconcileAutoBabysit(signal?: AbortSignal) {
+    if ((await defaultPolicy()) === null) return;
     const [login, tracked, pulls, sessions] = await Promise.all([
       currentLogin(signal),
       repos(),
@@ -1837,8 +1869,12 @@ export default async function plugin(bb: BbPluginApi) {
     for (const target of targets) {
       signal?.throwIfAborted();
       try {
-        await serialized(target.repo, target.number, () =>
-          spawnBabysitter(target.repo, target.number, policy),
+        await withDefaults(() =>
+          serialized(target.repo, target.number, async () => {
+            const policy = await defaultPolicy();
+            if (policy !== null)
+              await spawnBabysitter(target.repo, target.number, policy);
+          }),
         );
       } catch (error) {
         bb.log.warn(
@@ -1855,6 +1891,10 @@ export default async function plugin(bb: BbPluginApi) {
         const thread = await readThreadPresence(session.threadId);
         if (thread.state === "deleted")
           await forgetDeletedThread(session.threadId);
+        else if (session.status === "stopped" && session.cleanupPending)
+          await serialized(session.repo, session.number, () =>
+            stopBabysitter(session.repo, session.number),
+          );
         else if (session.status !== "watching") continue;
         else if (thread.archived) await handleArchived(session.threadId);
         else if (thread.status === "idle")
@@ -2284,13 +2324,15 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     getBabysitPreferences: () => getPreferences(),
     setAutoAutomation: async (patch) => {
-      const preferences = await updatePreferences((current) => {
-        const next = applyAutomationPatch(
-          { fix: current.autoFix, merge: current.autoMerge },
-          patch,
-        );
-        return { ...current, autoFix: next.fix, autoMerge: next.merge };
-      });
+      const preferences = await withDefaults(() =>
+        updatePreferences((current) => {
+          const next = applyAutomationPatch(
+            { fix: current.autoFix, merge: current.autoMerge },
+            patch,
+          );
+          return { ...current, autoFix: next.fix, autoMerge: next.merge };
+        }),
+      );
       if (preferences.autoFix || preferences.autoMerge)
         await reconcileAutoBabysit().catch((error: unknown) =>
           bb.log.warn(`Automatic Gitea babysitting failed: ${message(error)}`),
@@ -2468,7 +2510,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "babysit-retry",
-        summary: "Resume a stopped, failed, or waiting babysitter",
+        summary: "Resume a failed or waiting babysitter",
         usage: "bb gitea babysit-retry <owner/repo> <number> [--json]",
       },
       {

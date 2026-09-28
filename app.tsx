@@ -585,7 +585,8 @@ function useItemList(
 
 function useItemDisplay(target: ItemRef | null, wantFiles: boolean) {
   const rpc = useRpc<typeof giteaRpcContract>();
-  const key = target ? `${target.kind}:${itemTag(target)}` : null;
+  const { epoch } = useDisplayMemory();
+  const key = target ? `${epoch}:${target.kind}:${itemTag(target)}` : null;
   const [conversation, setConversation] =
     useState<Keyed<ConversationView> | null>(null);
   const [files, setFiles] = useState<Keyed<FilesView> | null>(null);
@@ -1030,6 +1031,8 @@ const automationToggles = [
 function babysitDetail(view: BabysitView) {
   if (view.status === "failed") return view.error;
   if (view.status === "needs_you") return view.note;
+  if (view.status === "stopped" && view.cleanupPending)
+    return "The babysitter thread has not been archived yet; BB keeps retrying.";
   return "";
 }
 
