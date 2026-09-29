@@ -1518,31 +1518,58 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function settle(
-    current: BabysitSession,
-    next: BabysitSession,
+    observed: BabysitSession,
+    decide: (current: BabysitSession) => Promise<BabysitSession | null>,
     event: "idle" | "failed",
     detail: string | null,
   ) {
-    if (!(await writeIfCurrent(current, next))) return;
-    await notifySupervisor(next.threadId, event, detail);
-    if (!sameSession(next, await getSession(next.repo, next.number))) return;
-    const cleanup = await archiveAndStop(next.threadId);
-    if (!cleanup.ok)
-      await writeIfCurrent(next, onCleanupFailed(next, cleanup.error, now()));
+    const next = await serialized(observed.repo, observed.number, async () => {
+      const current = await getSession(observed.repo, observed.number);
+      if (!sameSession(observed, current)) return null;
+      const next = await decide(current);
+      if (!next || !(await writeIfCurrent(current, next))) return null;
+      const cleanup = await archiveAndStop(next.threadId);
+      if (!cleanup.ok)
+        await writeIfCurrent(next, onCleanupFailed(next, cleanup.error, now()));
+      return next;
+    });
+    if (next) await notifySupervisor(next.threadId, event, detail);
   }
 
-  async function handleIdle(threadId: string, lastText: string | null) {
-    const current = await getSessionByThread(threadId);
-    if (current?.status !== "watching") return;
-    const lifecycle = await readLifecycle(current.repo, current.number);
-    const next = onIdle(current, lastText, lifecycle, now());
-    if (next) await settle(current, next, "idle", lastText);
+  async function handleIdle(
+    threadId: string,
+    lastText: string | null,
+    observed?: BabysitSession,
+  ) {
+    const session = observed ?? (await getSessionByThread(threadId));
+    if (session?.status !== "watching") return;
+    await settle(
+      session,
+      async (current) =>
+        onIdle(
+          current,
+          lastText,
+          await readLifecycle(current.repo, current.number),
+          now(),
+        ),
+      "idle",
+      lastText,
+    );
   }
 
-  async function handleFailed(threadId: string, error: string | null) {
-    const current = await getSessionByThread(threadId);
-    const next = current && onFailed(current, error, now());
-    if (current && next) await settle(current, next, "failed", error);
+  async function handleFailed(
+    threadId: string,
+    error: string | null,
+    observed?: BabysitSession,
+  ) {
+    const session = observed ?? (await getSessionByThread(threadId));
+    if (session?.status !== "watching") return;
+    await settle(
+      session,
+      async (current) => onFailed(current, error, now()),
+      "failed",
+      error,
+    );
   }
 
   async function handleArchived(threadId: string) {
@@ -1916,11 +1943,13 @@ export default async function plugin(bb: BbPluginApi) {
             session.threadId,
             (await bb.sdk.threads.output({ threadId: session.threadId }))
               .output,
+            session,
           );
         else if (thread.status === "error")
           await handleFailed(
             session.threadId,
             "The babysitter thread ended in error while the Gitea plugin was not observing it.",
+            session,
           );
       } catch (error) {
         bb.log.warn(

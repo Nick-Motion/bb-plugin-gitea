@@ -1283,6 +1283,7 @@ type ThreadState = {
   withdrawFailures: number;
   onStop: ((threadId: string) => Promise<void>) | null;
   output: string;
+  outputGate: Promise<void> | null;
   threads: Map<string, Partial<ReturnType<typeof makeThreadResponse>>>;
 };
 
@@ -1322,6 +1323,7 @@ async function startBabysitters() {
     withdrawFailures: 0,
     onStop: null,
     output: "",
+    outputGate: null,
     threads: new Map(),
   };
   const patchThread = (
@@ -1383,7 +1385,12 @@ async function startBabysitters() {
         ...state.threads.get(threadId),
       });
     },
-    output: async () => ({ output: state.output }),
+    output: async () => {
+      const gate = state.outputGate;
+      state.outputGate = null;
+      await gate;
+      return { output: state.output };
+    },
     queuedMessages: {
       list: async ({ threadId }) => [
         ...(state.queued.get(threadId) ?? []),
@@ -2127,6 +2134,68 @@ it("lets an explicit enable win over background cleanup that read the session ea
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "watching",
     policy: { fix: true, merge: false },
+  });
+});
+
+it("discards an idle observation from before the babysitter was turned off and on again", async () => {
+  const { host, state } = await startBabysitters();
+  await enable(host, pr42);
+  state.output = "BB_GITEA_BABYSIT: NEEDS_YOU";
+  state.threads.set("babysit-1", { status: "idle" });
+  let release!: () => void;
+  state.outputGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const service = host.harness.behavior.runService("babysitters");
+  await vi.waitFor(() =>
+    expect(host.harness.sdk.callsTo("threads.output")).toHaveLength(1),
+  );
+  await disable(host, pr42);
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
+    { status: "watching", policy: { fix: true, merge: false } },
+  );
+  state.threads.set("babysit-1", { status: "active" });
+  const stops = host.harness.sdk.callsTo("threads.stop").length;
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  service.controller.abort();
+  await service.done;
+  expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(stops);
+  await expect(babysitStatus(host)).resolves.toMatchObject({
+    status: "watching",
+    policy: { fix: true, merge: false },
+  });
+});
+
+it("finishes settling a babysitter before Retry resumes it", async () => {
+  const { host, state } = await startBabysitters();
+  await enable(host, pr42);
+  let release!: () => void;
+  const stopGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  state.onStop = async () => {
+    state.onStop = null;
+    await stopGate;
+  };
+  const settling = idle(host, "BB_GITEA_BABYSIT: NEEDS_YOU");
+  await vi.waitFor(() =>
+    expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(1),
+  );
+  let retried = false;
+  const retry = rpc(host, "retryBabysit", pr42).then((result) => {
+    retried = true;
+    return result;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(retried).toBe(false);
+  release();
+  await settling;
+  await expect(retry).resolves.toEqual({ threadId: "babysit-1" });
+  expect(state.threads.get("babysit-1")?.archivedAt).toBeNull();
+  await expect(babysitStatus(host)).resolves.toMatchObject({
+    status: "watching",
+    policy: { fix: true, merge: true },
   });
 });
 
