@@ -836,7 +836,11 @@ async function readItemList(
   return {
     account,
     items,
-    autoFixers: new Map(),
+    autoFixers: new Map(
+      items.flatMap((item) =>
+        item.autoFixer ? [[itemKey(item), item.autoFixer] as const] : [],
+      ),
+    ),
     truncated,
     errors,
     freshness,
@@ -1883,7 +1887,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     void loadStatus();
   }, [loadStatus, epoch]);
   const reloadAutoFixers = useCallback(() => {
-    if (view === "my-prs") void loadItems();
+    if (view === "my-prs" || view === "pulls") void loadItems();
   }, [loadItems, view]);
   useRealtime("auto-fixer-changed", useCoalesced(reloadAutoFixers, 500));
   const openItem = useCallback(

@@ -204,6 +204,7 @@ export const giteaRpcContract = defineRpcContract({
       refresh: z.boolean().default(false),
     }),
     output: listOutputSchema.extend({
+      items: z.array(itemSchema.extend({ autoFixer: autoFixerViewSchema.optional() })),
       account: z.string(),
       freshness: freshnessSchema,
     }),
@@ -1967,7 +1968,12 @@ export default async function plugin(bb: BbPluginApi) {
         `Could not deliver the automation change, so the auto-fixer was stopped: ${message(error)}`,
       );
     });
-    if (delivery.delivery === "sent") return;
+    if (
+      delivery.delivery === "sent" ||
+      ((!session.policy.fix || policy.fix) &&
+        (!session.policy.merge || policy.merge))
+    )
+      return;
     await stopAutoFixer(repo, number);
     throw new Error(
       `The auto-fixer for ${repo}#${number} could not take the automation change immediately, so it was stopped; turn Auto-fix or Auto-merge on again to restart it.`,
@@ -2046,6 +2052,24 @@ export default async function plugin(bb: BbPluginApi) {
       projectFor(repo),
     ]);
     return autoFixerView(session, { lifecycle, projectId });
+  }
+
+  async function withAutoFixers(items: ListItem[]) {
+    const projects = trackedProjects(await repos());
+    return await Promise.all(
+      items.map(async (item) => ({
+        ...item,
+        autoFixer: autoFixerView(
+          await getSession(item.repo, item.number),
+          item.state === "open"
+            ? {
+                lifecycle: { state: "open" as const },
+                projectId: projects.get(item.repo.toLowerCase()) ?? null,
+              }
+            : null,
+        ),
+      })),
+    );
   }
 
   async function currentLogin(signal?: AbortSignal): Promise<string> {
@@ -2233,8 +2257,10 @@ export default async function plugin(bb: BbPluginApi) {
         (loadSignal) => readItemPage(kind, repo, state, loadSignal),
         signal,
       );
+      const page = pickItems(list.value, query);
       return {
-        ...pickItems(list.value, query),
+        ...page,
+        items: kind === "pr" ? await withAutoFixers(page.items) : page.items,
         account: list.account,
         freshness: list.freshness,
       };
@@ -2623,7 +2649,7 @@ export default async function plugin(bb: BbPluginApi) {
       { repo, state, query, refresh },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      const [mine, tracked, preferences] = await Promise.all([
+      const [mine, preferences] = await Promise.all([
         readList(
           myPullLists,
           "my-prs",
@@ -2633,26 +2659,11 @@ export default async function plugin(bb: BbPluginApi) {
           (loadSignal) => fetchMyPulls(repo, state, loadSignal),
           signal,
         ),
-        repos(),
         getPreferences(),
       ]);
       const { login, page } = mine.value;
       const list = pickItems(page, query);
-      const projects = trackedProjects(tracked);
-      const items = await Promise.all(
-        list.items.map(async (item) => ({
-          ...item,
-          autoFixer: autoFixerView(
-            await getSession(item.repo, item.number),
-            item.state === "open"
-              ? {
-                  lifecycle: { state: "open" },
-                  projectId: projects.get(item.repo.toLowerCase()) ?? null,
-                }
-              : null,
-          ),
-        })),
-      );
+      const items = await withAutoFixers(list.items);
       return {
         ...list,
         account: mine.account,

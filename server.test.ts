@@ -1768,6 +1768,15 @@ it("lists authored pull requests and starts one hidden pinned auto-fixer for con
       .every(({ endpoint }) => endpoint.includes("created_by=dev")),
   ).toBe(true);
   expect(mine.preferences).toMatchObject({ autoFix: false, autoMerge: false });
+  const allPulls = giteaRpcContract.listItems.output.parse(
+    await rpc(host, "listItems", { kind: "pr", state: "open", query: "" }),
+  );
+  expect(
+    allPulls.items.find((item) => item.number === 42)?.autoFixer,
+  ).toMatchObject({ status: "idle", actions: ["start"] });
+  expect(
+    allPulls.items.find((item) => item.number === 43)?.autoFixer,
+  ).toMatchObject({ status: "idle", actions: ["start"] });
   expect(
     mine.items
       .map((item) => [
@@ -1783,6 +1792,15 @@ it("lists authored pull requests and starts one hidden pinned auto-fixer for con
   ]);
 
   const starts = await Promise.all([enable(host, pr42), enable(host, pr42)]);
+  const updatedAllPulls = giteaRpcContract.listItems.output.parse(
+    await rpc(host, "listItems", { kind: "pr", state: "open", query: "" }),
+  );
+  expect(
+    updatedAllPulls.items.find((item) => item.number === 42)?.autoFixer,
+  ).toMatchObject({
+    status: "watching",
+    automation: { fix: true, merge: true },
+  });
   expect(starts.map((view) => "threadId" in view && view.threadId)).toEqual([
     "auto-fixer-1",
     "auto-fixer-1",
@@ -2312,12 +2330,26 @@ it("withdraws a queued authority change and stops the auto-fixer", async () => {
   });
 });
 
+it("keeps Auto-merge running when enabling Auto-fix queues the expanded authority", async () => {
+  const { host, state } = await startAutoFixers();
+  await setAutomation(host, pr42, { merge: true });
+  state.queueSends = true;
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject({
+    status: "watching",
+    automation: { fix: true, merge: true },
+  });
+  expect(state.queued.get("auto-fixer-1")?.[0]?.text).toContain(
+    "Auto-fix is on. Fix failing CI checks",
+  );
+  expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(0);
+});
+
 it("keeps cleanup pending until a queued authority change is withdrawn", async () => {
   const { host, state } = await startAutoFixers();
-  await setAutomation(host, pr42, { fix: true });
+  await enable(host, pr42);
   state.queueSends = true;
   state.withdrawFailures = 1;
-  await expect(setAutomation(host, pr42, { merge: true })).rejects.toThrow(
+  await expect(setAutomation(host, pr42, { merge: false })).rejects.toThrow(
     "Cleanup failed: withdraw: ",
   );
   expect(state.queued.get("auto-fixer-1")).toHaveLength(1);

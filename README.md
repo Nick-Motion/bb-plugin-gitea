@@ -52,7 +52,7 @@ The same views appear in the side panel of a BB thread linked to the item.
 
 ## Auto-fix and Auto-merge
 
-Each of your pull requests has two independent switches, both off by default:
+Pull request rows in **My PRs** and **Pull requests** have two independent switches, both off by default:
 
 - **Auto-fix**: fix CI failures and address review feedback. It may commit, push, rebase, reply to and resolve review comments, and mark a WIP pull request ready. It never merges.
 - **Auto-merge**: merge once permissions, branch protection, required checks, approvals, and conflicts allow. It never changes code.
