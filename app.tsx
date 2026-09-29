@@ -914,7 +914,10 @@ function useItemList(
 
 function useItemDisplay(target: ItemRef | null, wantFiles: boolean) {
   const rpc = useRpc<typeof giteaRpcContract>();
-  const { epoch } = useDisplayMemory();
+  const epoch = useSyncExternalStore(
+    subscribeMemory,
+    () => displayMemory.epoch,
+  );
   const key = target ? `${epoch}:${target.kind}:${itemTag(target)}` : null;
   const [conversation, setConversation] =
     useState<Keyed<ConversationView> | null>(null);
