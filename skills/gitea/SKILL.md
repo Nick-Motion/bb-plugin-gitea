@@ -69,3 +69,5 @@ Set in the plugin settings page or with `bb plugin config gitea set <key> <value
 - `baseUrl`: Gitea root URL, default `https://gitea.com`. HTTPS is required except on localhost. A path prefix is kept.
 - `teaProfile`: optional `tea` login name. When empty, the plugin uses the login whose URL matches `baseUrl`. Set it when matching logins belong to different users. A login for another instance is rejected.
 - `extraRepos`: optional `owner/repo` names, comma or space separated. They work without a project, but agent features need a project checkout.
+- `cacheEntryLimitMiB` (default 16): largest Gitea response read and cached. Larger reads fail with "exceeded the N MiB limit"; raise it for huge diffs.
+- `cacheLimitMiB` (default 64): memory for each display cache.

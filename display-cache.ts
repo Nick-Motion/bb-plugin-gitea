@@ -27,8 +27,7 @@ type Stored<T> = {
 };
 
 export type ReadDecision =
-  | { kind: "serve"; freshness: Freshness; refresh: boolean }
-  | { kind: "load" };
+  { kind: "serve"; freshness: Freshness; refresh: boolean } | { kind: "load" };
 
 export function decideRead<T>(
   stored: Stored<T> | null,
@@ -92,7 +91,7 @@ export type ReadOptions<T> = {
 
 export class DisplayCache<T> {
   readonly #entries = new Map<string, Entry<T>>();
-  readonly #bounds: CacheBounds;
+  #bounds: CacheBounds;
   readonly #now: () => number;
   readonly #classify: (error: unknown) => FailureScope;
   readonly #onBackgroundSettled: (tag: string) => void;
@@ -147,6 +146,11 @@ export class DisplayCache<T> {
   invalidate(tag: string): void {
     for (const [key, entry] of this.#entries)
       if (entry.tag === tag) this.#remove(key, entry);
+  }
+
+  resize(bounds: CacheBounds): boolean {
+    this.#bounds = bounds;
+    return this.clear();
   }
 
   clear(): boolean {

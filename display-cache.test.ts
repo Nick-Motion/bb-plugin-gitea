@@ -176,6 +176,17 @@ it("evicts least recently used entries within entry and byte bounds and skips ov
   expect(cache.size.bytes).toBeLessThanOrEqual(30);
 });
 
+it("applies new bounds on resize and drops entries cached under the old ones", async () => {
+  const { cache } = setup({ maxEntries: 2, maxBytes: 30, maxEntryBytes: 20 });
+  await cache.read("a", "a", async () => "a", { policy });
+  cache.resize({ maxEntries: 2, maxBytes: 100, maxEntryBytes: 60 });
+  expect(cache.size).toEqual({ entries: 0, bytes: 0 });
+  await cache.read("big", "big", async () => "x".repeat(40), { policy });
+  expect(
+    await cache.read("big", "big", async () => "reloaded", { policy }),
+  ).toMatchObject({ value: "x".repeat(40) });
+});
+
 it("does not let a load that was in flight during invalidation repopulate the cache", async () => {
   const { cache } = setup();
   const gate = deferred<string>();

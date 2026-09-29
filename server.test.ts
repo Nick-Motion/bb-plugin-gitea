@@ -34,6 +34,8 @@ const defaultSettings = {
   baseUrl: "https://gitea.example/prefix/",
   teaProfile: "",
   extraRepos: "acme/widgets",
+  cacheEntryLimitMiB: 16,
+  cacheLimitMiB: 64,
 };
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -420,6 +422,16 @@ it("lists repository labels across pages and assignable users", async () => {
   const seen = calls.length;
   await host.harness.behavior.callRpc("repoOptions", { repo: "Acme/Widgets" });
   expect(calls).toHaveLength(seen);
+});
+
+it("rejects Gitea responses over the configured size limit", async () => {
+  const { host } = await start(
+    () => ({ json: [{ name: "x".repeat(1_200_000), color: "000000" }] }),
+    { settings: { cacheEntryLimitMiB: 1 } },
+  );
+  await expect(
+    host.harness.behavior.callRpc("repoOptions", { repo: "acme/widgets" }),
+  ).rejects.toThrow("exceeded the 1 MiB limit");
 });
 
 it("reuses repository discovery across list requests", async () => {

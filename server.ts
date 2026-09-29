@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import {
   DisplayCache,
+  type CacheBounds,
   type Display,
   type FailureScope,
   type FreshnessPolicy,
@@ -437,6 +438,7 @@ const filesPolicy: FreshnessPolicy = {
   retryMs: 30_000,
 };
 const mebibyte = 1024 * 1024;
+const cacheMiBSchema = z.number().int().min(1).max(1024);
 
 function cleanBaseUrl(raw: string): URL {
   const url = new URL(raw);
@@ -652,6 +654,22 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Additional repositories (owner/repo, comma separated)",
       default: "",
     },
+    cacheEntryLimitMiB: {
+      type: "number",
+      label: "Largest Gitea response to read and cache (MiB)",
+      description:
+        "Larger responses fail to load. Diffs and lists up to this size stay cached.",
+      experimental_schema: cacheMiBSchema,
+      default: 16,
+    },
+    cacheLimitMiB: {
+      type: "number",
+      label: "Memory for each display cache (MiB)",
+      description:
+        "Conversations, diffs, and lists each have a cache of this size.",
+      experimental_schema: cacheMiBSchema,
+      default: 64,
+    },
   });
   let config = await settings.get();
   let loginLookup: Promise<TeaLogin> | null = null;
@@ -661,44 +679,38 @@ export default async function plugin(bb: BbPluginApi) {
     bb.realtime.publish("display-changed", { item });
   const publishFiles = (item: string | null) =>
     bb.realtime.publish("display-changed", { item, files: true });
+  const cacheBounds = (maxEntries: number): CacheBounds => ({
+    maxEntries,
+    maxBytes: config.cacheLimitMiB * mebibyte,
+    maxEntryBytes:
+      Math.min(config.cacheEntryLimitMiB, config.cacheLimitMiB) * mebibyte,
+  });
   const conversations = new DisplayCache<Conversation>({
-    bounds: {
-      maxEntries: 64,
-      maxBytes: 16 * mebibyte,
-      maxEntryBytes: 2 * mebibyte,
-    },
+    bounds: cacheBounds(64),
     now: Date.now,
     classify: classifyDisplayFailure,
     onBackgroundSettled: publishDisplay,
   });
   const pullFiles = new DisplayCache<PullFiles>({
-    bounds: {
-      maxEntries: 16,
-      maxBytes: 32 * mebibyte,
-      maxEntryBytes: 8 * mebibyte,
-    },
+    bounds: cacheBounds(16),
     now: Date.now,
     classify: classifyDisplayFailure,
     onBackgroundSettled: publishFiles,
   });
-  const listBounds = {
-    maxEntries: 32,
-    maxBytes: 32 * mebibyte,
-    maxEntryBytes: 8 * mebibyte,
-  };
   const itemLists = new DisplayCache<ItemPage>({
-    bounds: listBounds,
+    bounds: cacheBounds(32),
     now: Date.now,
     classify: classifyDisplayFailure,
     onBackgroundSettled: publishDisplay,
   });
   const myPullLists = new DisplayCache<{ login: string; page: ItemPage }>({
-    bounds: listBounds,
+    bounds: cacheBounds(32),
     now: Date.now,
     classify: classifyDisplayFailure,
     onBackgroundSettled: publishDisplay,
   });
   const displays = [conversations, pullFiles, itemLists, myPullLists];
+  const displayEntries = [64, 16, 32, 32];
   function forgetDisplay() {
     const removed = displays.map((cache) => cache.clear());
     if (removed.includes(true)) publishDisplay(null);
@@ -721,7 +733,9 @@ export default async function plugin(bb: BbPluginApi) {
     loginLookup = null;
     repoDiscovery = null;
     repoOptionCache.clear();
-    for (const cache of displays) cache.clear();
+    displays.forEach((cache, index) =>
+      cache.resize(cacheBounds(displayEntries[index]!)),
+    );
     publishDisplay(null);
   });
   const repoDiscoveryTtlMs = 30_000;
@@ -790,7 +804,7 @@ export default async function plugin(bb: BbPluginApi) {
           {
             cwd: tmpdir(),
             timeout: options.timeoutMs ?? teaTimeoutMs,
-            maxBuffer: 16 * 1024 * 1024,
+            maxBuffer: config.cacheEntryLimitMiB * mebibyte,
             ...(options.signal ? { signal: options.signal } : {}),
           },
           (error, stdout, stderr) => {
@@ -956,7 +970,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function api(path: string, request: ApiRequest = {}): Promise<unknown> {
     const response = await teaApi(path, request);
     if (response.kind === "too-large")
-      throw new Error("The Gitea response exceeded the 16 MiB limit.");
+      throw new Error(
+        `The Gitea response exceeded the ${config.cacheEntryLimitMiB} MiB limit.`,
+      );
     if (!response.body.trim()) return null;
     try {
       return JSON.parse(response.body) as unknown;
