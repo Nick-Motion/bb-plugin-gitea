@@ -318,6 +318,22 @@ function DisplayScopeWatch() {
   return null;
 }
 
+function useDebouncedValue<T>(value: T, delayMs: number) {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), delayMs);
+    return () => clearTimeout(timer);
+  }, [value, delayMs]);
+  return settled;
+}
+
+const openMyPullRequests: ListFilters = {
+  view: "my-prs",
+  state: "open",
+  repo: "all",
+  query: "",
+};
+
 function listKey({ view, state, repo, query }: ListFilters) {
   return view === "auto-fixers"
     ? null
@@ -1766,9 +1782,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const [state, setState] = useState(panelMemory.filters.state);
   const [repo, setRepo] = useState(panelMemory.filters.repo);
   const [query, setQuery] = useState(panelMemory.filters.query);
+  const searchQuery = useDebouncedValue(query, 250);
   useEffect(() => {
-    panelMemory.filters = { view, state, repo, query };
-  }, [view, state, repo, query]);
+    panelMemory.filters = { view, state, repo, query: searchQuery };
+  }, [view, state, repo, searchQuery]);
   const settings = useScopeWatch();
   const memory = useDisplayMemory();
   const status = trustedStatus(memory, settings);
@@ -1783,12 +1800,13 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   }, [rpc]);
   const verify = useCallback(() => void loadStatus(), [loadStatus]);
   const itemList = useItemList(
-    { view, state, repo, query },
+    { view, state, repo, query: searchQuery },
     memory,
     settings,
     verify,
   );
   const { list, load: loadList } = itemList;
+  const openMine = useItemList(openMyPullRequests, memory, settings, verify);
   const [newIssue, setNewIssue] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newBody, setNewBody] = useState("");
@@ -1974,10 +1992,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
 
   const shownList = list.state === "ready" ? list.value : null;
   const visibleItems = shownList?.items ?? [];
-  const myPrsKey = listKey({ view: "my-prs", state, repo, query });
-  const myPrs =
-    myPrsKey === null ? undefined : trustedList(memory, settings, myPrsKey);
-  const count = myPrs?.items.filter((item) => item.state === "open").length;
+  const count =
+    openMine.list.state === "ready"
+      ? `${openMine.list.value.items.length}${openMine.list.value.truncated ? "+" : ""}`
+      : undefined;
   if (newIssue) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto p-4 text-sm md:p-5">
