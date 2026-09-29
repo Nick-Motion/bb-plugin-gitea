@@ -16,6 +16,7 @@ import {
   useRealtimeConnectionState,
   useRpc,
   useSettings,
+  Markdown,
   UrlLink,
   type ExperimentalProviderModelPickerValue,
   type PluginNavPanelProps,
@@ -555,7 +556,7 @@ function LineThread({
             </span>{" "}
             · {comment.createdAt}
           </div>
-          <div className="whitespace-pre-wrap">{comment.body}</div>
+          <Markdown content={comment.body} className="min-w-0" />
         </article>
       ))}
       {onReply && (
@@ -2067,9 +2068,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               <div className="mb-2 text-xs text-muted-foreground">
                 {detail.author} · {detail.updatedAt}
               </div>
-              <div className="whitespace-pre-wrap">
-                {detail.body || "No description"}
-              </div>
+              {detail.body ? (
+                <Markdown content={detail.body} className="min-w-0" />
+              ) : (
+                <div className="text-muted-foreground">No description</div>
+              )}
             </article>
             <section className="space-y-3 rounded-lg border border-border bg-card p-4">
               <h3 className="text-xs font-semibold text-muted-foreground">
@@ -2162,9 +2165,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                       <div className="font-medium">
                         {review.author} · {review.state}
                       </div>
-                      <div className="whitespace-pre-wrap text-muted-foreground">
-                        {review.body}
-                      </div>
+                      <Markdown
+                        content={review.body}
+                        className="min-w-0 text-muted-foreground"
+                      />
                     </article>
                   ))}
                   <Textarea
@@ -2724,7 +2728,7 @@ function CommentCard({
           </div>
         </div>
       ) : (
-        <div className="whitespace-pre-wrap">{comment.body}</div>
+        <Markdown content={comment.body} className="min-w-0" />
       )}
       {mode === "delete" && (
         <div className="mt-2 flex items-center justify-end gap-2 text-xs">
@@ -2784,7 +2788,7 @@ function LineCommentList({ comments }: { comments: ReviewComment[] }) {
               {comment.author} · {comment.createdAt}
             </span>
           </div>
-          <div className="whitespace-pre-wrap">{comment.body}</div>
+          <Markdown content={comment.body} className="min-w-0" />
         </article>
       ))}
     </div>
@@ -2917,9 +2921,11 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
         <div className="mb-2 text-xs text-muted-foreground">
           {detail.author}
         </div>
-        <div className="whitespace-pre-wrap">
-          {detail.body || "No description"}
-        </div>
+        {detail.body ? (
+          <Markdown content={detail.body} className="min-w-0" />
+        ) : (
+          <div className="text-muted-foreground">No description</div>
+        )}
       </article>
       <section className="p-4">
         <h3 className="mb-2 font-medium">Conversation</h3>
