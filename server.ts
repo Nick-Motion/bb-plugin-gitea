@@ -412,7 +412,7 @@ export const giteaRpcContract = defineRpcContract({
   },
 });
 
-type Repo = { repo: string; projectId: string | null };
+type Repo = { repo: string; projectId: string | null; hostId?: string };
 type RepoOptions = z.infer<typeof giteaRpcContract.repoOptions.output>;
 type TeaLogin = { name: string; user: string };
 type RpcContext = { experimental_signal?: AbortSignal };
@@ -1305,7 +1305,11 @@ export default async function plugin(bb: BbPluginApi) {
             );
             const repo = repositoryFromRemote(stdout.trim(), base);
             if (repo && !found.has(repo.toLowerCase()))
-              found.set(repo.toLowerCase(), { repo, projectId: project.id });
+              found.set(repo.toLowerCase(), {
+                repo,
+                projectId: project.id,
+                hostId: source.hostId,
+              });
           } catch {}
         }
     } catch {}
@@ -1559,7 +1563,12 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
   ): Promise<
     | { state: "deleted" }
-    | { state: "present"; archived: boolean; status: string }
+    | {
+        state: "present";
+        archived: boolean;
+        canRestoreEnvironment: boolean;
+        status: string;
+      }
   > {
     try {
       const thread = await bb.sdk.threads.get({ threadId });
@@ -1568,6 +1577,7 @@ export default async function plugin(bb: BbPluginApi) {
         : {
             state: "present",
             archived: Boolean(thread.archivedAt),
+            canRestoreEnvironment: Boolean(thread.canRestoreEnvironment),
             status: thread.status,
           };
     } catch (error) {
@@ -1696,11 +1706,11 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
 
-  async function projectFor(repo: string): Promise<string | null> {
+  async function projectFor(repo: string): Promise<Repo | null> {
     return (
       (await repos()).find(
         (entry) => entry.repo.toLowerCase() === repo.toLowerCase(),
-      )?.projectId ?? null
+      ) ?? null
     );
   }
 
@@ -1859,7 +1869,7 @@ export default async function plugin(bb: BbPluginApi) {
     policy: AutoFixerPolicy,
   ): Promise<{ threadId: string }> {
     const key = `${repo}#${number}`;
-    const [pull, projectId] = await Promise.all([
+    const [pull, project] = await Promise.all([
       api(repoPath(repo, `pulls/${number}`)).then(record),
       projectFor(repo),
     ]);
@@ -1868,7 +1878,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("Gitea returned an unrecognized pull request state.");
     const decision = decideStart({
       session: await getSession(repo, number),
-      projectId,
+      projectId: project?.projectId ?? null,
       lifecycle,
     });
     if (decision.kind === "reject")
@@ -1881,7 +1891,16 @@ export default async function plugin(bb: BbPluginApi) {
     ]);
     const thread = await bb.sdk.threads.spawn({
       projectId: decision.projectId,
-      environment: { type: "project-default" },
+      environment: project?.hostId
+        ? {
+            type: "host",
+            hostId: project.hostId,
+            workspace: {
+              type: "managed-worktree",
+              baseBranch: { kind: "default" },
+            },
+          }
+        : { type: "project-default" },
       visibility: "hidden",
       title: `${giteaAutoFixerTitlePrefix} ${key}: ${title}`.slice(0, 120),
       prompt,
@@ -1953,6 +1972,8 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error(`Cleanup failed: ${cleanup.error}`);
       }
     }
+    if (presence.canRestoreEnvironment)
+      await bb.sdk.threads.restoreEnvironment({ threadId: session.threadId });
     const pull = record(await api(repoPath(repo, `pulls/${number}`)));
     const lifecycle = parseLifecycle(pull);
     if (!lifecycle)
@@ -2100,11 +2121,14 @@ export default async function plugin(bb: BbPluginApi) {
     const session = await getSession(repo, number);
     if (session !== null && session.status !== "closed")
       return autoFixerView(session, null);
-    const [lifecycle, projectId] = await Promise.all([
+    const [lifecycle, project] = await Promise.all([
       readLifecycle(repo, number),
       projectFor(repo),
     ]);
-    return autoFixerView(session, { lifecycle, projectId });
+    return autoFixerView(session, {
+      lifecycle,
+      projectId: project?.projectId ?? null,
+    });
   }
 
   async function withAutoFixers(items: ListItem[]) {

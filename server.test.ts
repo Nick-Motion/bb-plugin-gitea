@@ -117,7 +117,7 @@ async function start(
     settings?: Partial<typeof defaultSettings>;
     projects?: Array<{
       id: string;
-      sources: Array<{ type: string; path: string }>;
+      sources: Array<{ type: string; path: string; hostId?: string }>;
     }>;
     threads?: FakeSdkOverrides["threads"];
   } = {},
@@ -1608,6 +1608,10 @@ async function startAutoFixers() {
       patchThread(threadId, { archivedAt: null });
       return { ok: true };
     },
+    restoreEnvironment: async ({ threadId }) => {
+      patchThread(threadId, { canRestoreEnvironment: false, archivedAt: null });
+      return makeThreadResponse({ id: threadId });
+    },
     get: async ({ threadId }) => {
       const gate = state.getGate;
       state.getGate = null;
@@ -1690,7 +1694,12 @@ async function startAutoFixers() {
     {
       settings: { extraRepos: "ops/api" },
       projects: [
-        { id: "project-1", sources: [{ type: "local_path", path: widgets }] },
+        {
+          id: "project-1",
+          sources: [
+            { type: "local_path", path: widgets, hostId: "source-host" },
+          ],
+        },
       ],
       threads,
     },
@@ -1951,6 +1960,13 @@ it("starts automatic auto-fixers from a live pull request list rather than the r
       .callsTo("threads.spawn")
       .map((call) => (call[0] as { title: string }).title),
   ).toEqual(["Gitea auto-fixer: acme/widgets#42: Change 42"]);
+  expect(host.harness.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
+    environment: {
+      type: "host",
+      hostId: "source-host",
+      workspace: { type: "managed-worktree" },
+    },
+  });
 });
 
 it("fails an unconfirmed marker and resumes the retained thread on retry", async () => {
@@ -1999,6 +2015,19 @@ it("fails an unconfirmed marker and resumes the retained thread on retry", async
   await idle(host, "Need approval.\nBB_GITEA_AUTO_FIX: NEEDS_YOU");
   await expect(autoFixerStatus(host)).resolves.toMatchObject({
     status: "failed",
+  });
+});
+
+it("restores a retired auto-fixer workspace before retrying its thread", async () => {
+  const { host, patchThread } = await startAutoFixers();
+  await enable(host, pr42);
+  await idle(host, "BB_GITEA_AUTO_FIX: FAILED");
+  patchThread("auto-fixer-1", { canRestoreEnvironment: true });
+  await rpc(host, "retryAutoFixer", pr42);
+  expect(host.harness.sdk.callsTo("threads.restoreEnvironment")).toHaveLength(1);
+  expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({
+    status: "watching",
   });
 });
 
