@@ -764,6 +764,34 @@ function changedItem(payload: unknown): string | null | undefined {
   return item === null || typeof item === "string" ? item : undefined;
 }
 
+function changedSettings(payload: unknown) {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    "settings" in payload &&
+    payload.settings === true
+  );
+}
+
+function useCoalesced(run: () => void, delayMs: number) {
+  const latest = useRef(run);
+  latest.current = run;
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (timer.current !== null) clearTimeout(timer.current);
+    },
+    [],
+  );
+  return useCallback(() => {
+    if (timer.current !== null) return;
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      latest.current();
+    }, delayMs);
+  }, [delayMs]);
+}
+
 function changedFiles(payload: unknown) {
   return (
     typeof payload === "object" &&
@@ -1608,7 +1636,13 @@ function AutoFixerPreferencesControl() {
       );
   }, [rpc]);
   useEffect(load, [load]);
-  useRealtime("auto-fixer-changed", load);
+  const reloadSettings = useCallback(
+    (payload: unknown) => {
+      if (changedSettings(payload)) load();
+    },
+    [load],
+  );
+  useRealtime("auto-fixer-changed", reloadSettings);
   if (loaded.state === "loading") return null;
   if (loaded.state === "error")
     return (
@@ -1721,7 +1755,7 @@ function AutoFixerList() {
       );
   }, [rpc]);
   useEffect(load, [load]);
-  useRealtime("auto-fixer-changed", load);
+  useRealtime("auto-fixer-changed", useCoalesced(load, 500));
   if (error)
     return (
       <div role="alert" className="p-8 text-center text-muted-foreground">
@@ -1848,7 +1882,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const reloadAutoFixers = useCallback(() => {
     if (view === "my-prs") void loadItems();
   }, [loadItems, view]);
-  useRealtime("auto-fixer-changed", reloadAutoFixers);
+  useRealtime("auto-fixer-changed", useCoalesced(reloadAutoFixers, 500));
   const openItem = useCallback(
     async (item: Item) => {
       navigate.toPluginPanel("gitea", {
