@@ -403,6 +403,7 @@ export const giteaRpcContract = defineRpcContract({
 });
 
 type Repo = { repo: string; projectId: string | null };
+type RepoOptions = z.infer<typeof giteaRpcContract.repoOptions.output>;
 type TeaLogin = { name: string; user: string };
 type RpcContext = { experimental_signal?: AbortSignal };
 type ApiRequest = {
@@ -718,9 +719,15 @@ export default async function plugin(bb: BbPluginApi) {
   settings.onChange((next) => {
     config = next;
     loginLookup = null;
+    repoDiscovery = null;
+    repoOptionCache.clear();
     for (const cache of displays) cache.clear();
     publishDisplay(null);
   });
+  const repoDiscoveryTtlMs = 30_000;
+  let repoDiscovery: { at: number; value: Promise<Repo[]> } | null = null;
+  const repoOptionTtlMs = 60_000;
+  const repoOptionCache = new Map<string, { at: number; value: RepoOptions }>();
   let teaPath: string | null = null;
   let activeTea = 0;
   type TeaWaiter = {
@@ -1249,7 +1256,15 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function repos(): Promise<Repo[]> {
+  function repos(): Promise<Repo[]> {
+    const now = Date.now();
+    if (repoDiscovery && now - repoDiscovery.at < repoDiscoveryTtlMs)
+      return repoDiscovery.value;
+    const value = discoverRepos();
+    repoDiscovery = { at: now, value };
+    return value;
+  }
+  async function discoverRepos(): Promise<Repo[]> {
     const found = new Map<string, Repo>();
     const base = cleanBaseUrl(config.baseUrl);
     try {
@@ -2435,11 +2450,15 @@ export default async function plugin(bb: BbPluginApi) {
       { repo },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
+      const key = repo.toLowerCase();
+      const cached = repoOptionCache.get(key);
+      if (cached && Date.now() - cached.at < repoOptionTtlMs)
+        return cached.value;
       const [labels, assignees] = await Promise.all([
         paginated(repoPath(repo, "labels"), signal),
         api(repoPath(repo, "assignees"), { signal }),
       ]);
-      return {
+      const value: RepoOptions = {
         labels: labels.values
           .map((raw) => {
             const label = record(raw);
@@ -2450,6 +2469,8 @@ export default async function plugin(bb: BbPluginApi) {
           .map((user) => text(record(user).login))
           .filter(Boolean),
       };
+      repoOptionCache.set(key, { at: Date.now(), value });
+      return value;
     },
     reviewComment: async (
       { repo, number, commitId, path, line, side, body },

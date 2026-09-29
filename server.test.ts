@@ -393,7 +393,7 @@ it("edits and deletes a conversation comment by id", async () => {
 });
 
 it("lists repository labels across pages and assignable users", async () => {
-  const { host } = await start(({ endpoint }) => {
+  const { host, calls } = await start(({ endpoint }) => {
     const path = endpoint.split("?")[0]!;
     if (path.endsWith("/labels"))
       return {
@@ -417,6 +417,33 @@ it("lists repository labels across pages and assignable users", async () => {
   expect(result.labels).toHaveLength(51);
   expect(result.labels.at(-1)).toEqual({ name: "last", color: "#00ff00" });
   expect(result.assignees).toEqual(["ann", "bo"]);
+  const seen = calls.length;
+  await host.harness.behavior.callRpc("repoOptions", { repo: "Acme/Widgets" });
+  expect(calls).toHaveLength(seen);
+});
+
+it("reuses repository discovery across list requests", async () => {
+  let listed = 0;
+  isolateTeaEnvironment(`${fixtureDir}:${process.env.PATH ?? ""}`);
+  await startTea(() => ({ json: [] }), defaultProfiles);
+  const host = createFakePluginHost({
+    pluginId: "gitea",
+    settings: defaultSettings,
+    sdk: {
+      projects: {
+        list: async () => {
+          listed += 1;
+          return [];
+        },
+      },
+    },
+  });
+  cleanups.push(() => host.harness.lifecycle.dispose());
+  await plugin(host.bb);
+  await status(host);
+  await listItems(host, {});
+  await listItems(host, { state: "closed" });
+  expect(listed).toBe(1);
 });
 
 it("marks a full bounded issue result window as potentially truncated", async () => {
