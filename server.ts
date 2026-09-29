@@ -658,6 +658,8 @@ export default async function plugin(bb: BbPluginApi) {
     error instanceof GiteaAccessError ? "drop-entry" : "retain";
   const publishDisplay = (item: string | null) =>
     bb.realtime.publish("display-changed", { item });
+  const publishFiles = (item: string | null) =>
+    bb.realtime.publish("display-changed", { item, files: true });
   const conversations = new DisplayCache<Conversation>({
     bounds: {
       maxEntries: 64,
@@ -676,7 +678,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     now: Date.now,
     classify: classifyDisplayFailure,
-    onBackgroundSettled: publishDisplay,
+    onBackgroundSettled: publishFiles,
   });
   const listBounds = {
     maxEntries: 32,
@@ -703,7 +705,6 @@ export default async function plugin(bb: BbPluginApi) {
   function forgetDisplayItem(repo: string, number: number) {
     const tag = displayTag(repo, number);
     conversations.invalidate(tag);
-    pullFiles.invalidate(tag);
     publishDisplay(tag);
   }
   function forgetLists() {

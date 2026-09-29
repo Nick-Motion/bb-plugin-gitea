@@ -748,6 +748,15 @@ function changedItem(payload: unknown): string | null | undefined {
   return item === null || typeof item === "string" ? item : undefined;
 }
 
+function changedFiles(payload: unknown) {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    "files" in payload &&
+    payload.files === true
+  );
+}
+
 function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
@@ -895,10 +904,19 @@ function useItemDisplay(target: ItemRef | null, wantFiles: boolean) {
     };
   }, [loadConversation]);
   const shown = conversation?.key === key ? conversation.view : loading;
-  const revision =
+  const shownRevision =
     shown.state === "ready" && shown.value.conversation.kind === "pr"
       ? shown.value.conversation.revision
       : null;
+  const revisionHead = shownRevision?.head;
+  const revisionBase = shownRevision?.base;
+  const revision = useMemo(
+    () =>
+      revisionHead !== undefined && revisionBase !== undefined
+        ? { head: revisionHead, base: revisionBase }
+        : null,
+    [revisionHead, revisionBase],
+  );
   const filesKey =
     key && revision ? `${key}@${revision.head}:${revision.base}` : null;
   const loadFiles = useCallback(
@@ -938,8 +956,9 @@ function useItemDisplay(target: ItemRef | null, wantFiles: boolean) {
       const item = changedItem(payload);
       if (item === undefined || !target) return;
       if (item !== null && item !== itemTag(target)) return;
-      void loadConversation(false);
-      if (wantFiles) void loadFiles(false);
+      if (!changedFiles(payload)) void loadConversation(false);
+      if (wantFiles && (item === null || changedFiles(payload)))
+        void loadFiles(false);
     },
     [loadConversation, loadFiles, target, wantFiles],
   );

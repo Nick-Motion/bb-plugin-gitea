@@ -1006,6 +1006,29 @@ it("reads the pull request conversation without files, loads files on request, a
   expect(calls).toHaveLength(fileCalls);
 });
 
+it("keeps revision-bound files cached when a comment changes the conversation", async () => {
+  const { host, calls } = await start(
+    diffApi(
+      rawFiles,
+      () => ({ raw: rawDiff }),
+      () => ({ ...pullJson(), changed_files: rawFiles.length }),
+    ),
+  );
+  const revision = { head: headSha, base: baseSha };
+  await conversation(host);
+  await files(host, { revision });
+  await host.harness.behavior.callRpc("comment", {
+    repo: "acme/widgets",
+    number: 9,
+    body: "Looks good",
+  });
+  const afterComment = calls.length;
+  await files(host, { revision });
+  expect(calls.slice(afterComment).some(readsFiles)).toBe(false);
+  await conversation(host);
+  expect(calls.length).toBeGreaterThan(afterComment);
+});
+
 it("names team reviewers and ghost authors instead of rejecting the response", async () => {
   const { host } = await start(({ endpoint }) => {
     const path = endpoint.split("?")[0]!;
