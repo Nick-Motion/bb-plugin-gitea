@@ -27,7 +27,7 @@ The plugin runs `tea api` without a shell, always passes the resolved profile wi
 
 ## Use
 
-The panel copies My GitHub's tab header, compact state-and-title rows, list/detail navigation, themed diff renderer, and card spacing. It provides **My PRs**, **Issues**, **Pull requests**, and **Auto-fixers**, repository/state/text filters, refresh, issue creation, detail conversations, comments, close/reopen, label and assignee editing, PR checks and reviews, agent dispatch, and links to BB threads. A pull request opens on its **Conversation** tab; **Files changed** is a separate tab in both the nav panel and the linked-thread panel, and its files load only when that tab is opened. My PRs lists pull requests in tracked repositories whose author is the signed-in Gitea login. Gitea limitations mean inline review threads and native auto-merge are unavailable; checks come from commit statuses.
+The panel copies My GitHub's tab header, compact state-and-title rows, list/detail navigation, themed diff renderer, and card spacing. It provides **My PRs**, **Issues**, **Pull requests**, and **Auto-fixers**, repository/state/text filters, refresh, issue creation, detail conversations, comments, close/reopen, label and assignee editing, PR checks and reviews, agent dispatch, and links to BB threads. A pull request opens on its **Conversation** tab; **Files changed** is a separate tab in both the nav panel and the linked-thread panel, and its files load only when that tab is opened. My PRs lists pull requests in tracked repositories whose author is the signed-in Gitea login. In **Files changed**, click a line's gutter button to leave a line comment; existing line comments show inline and under **Line comments** in the conversation. Native auto-merge is unavailable; checks come from commit statuses.
 
 **Files changed** shows a changed-files tree built with [`@pierre/trees`](https://www.npmjs.com/package/@pierre/trees) beside per-file diffs rendered with `@pierre/diffs` inside its virtualizer, so off-screen diffs are not rendered. The tree colors files as added, deleted, renamed, or modified, shows `+additions −deletions` for each file, supports keyboard navigation and search, and scrolls the diff list to the selected file. Each diff card shows `previous → new` for renames, the counts, and Gitea's status. In a narrow panel the tree stacks above the diffs.
 
@@ -98,6 +98,7 @@ bb gitea conversation <issue|pr> <owner/repo> <number> [--refresh] [--json]
 bb gitea files <owner/repo> <number> [--refresh] [--json]
 bb gitea create-issue <owner/repo> <title> [--body text]
 bb gitea comment <owner/repo> <number> <body>
+bb gitea line-comment <owner/repo> <number> <path> <line> [--old] <body>
 bb gitea set-state <owner/repo> <number> <open|closed>
 bb gitea metadata <owner/repo> <number> <labels-csv> <assignees-csv>
 bb gitea review <owner/repo> <number> <APPROVED|REQUEST_CHANGES|COMMENT> [body]

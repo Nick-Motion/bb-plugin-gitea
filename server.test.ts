@@ -971,6 +971,123 @@ it("names team reviewers and ghost authors instead of rejecting the response", a
   ]);
 });
 
+it("places review comments on the diff side Gitea reports and skips pending drafts", async () => {
+  const { host, calls } = await start(({ endpoint }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/issues/9")) return { json: issue(9, "Lines") };
+    if (path.endsWith("/pulls/9")) return { json: pullJson() };
+    if (path.endsWith("/pulls/9/reviews"))
+      return {
+        json:
+          page(endpoint) === 1
+            ? [
+                {
+                  id: 1,
+                  user: { login: "ann" },
+                  state: "COMMENT",
+                  comments_count: 2,
+                },
+                {
+                  id: 2,
+                  user: { login: "me" },
+                  state: "PENDING",
+                  comments_count: 1,
+                },
+                {
+                  id: 3,
+                  user: { login: "bo" },
+                  state: "APPROVED",
+                  comments_count: 0,
+                },
+              ]
+            : [],
+      };
+    if (path.endsWith("/pulls/9/reviews/1/comments"))
+      return {
+        json: [
+          {
+            id: 10,
+            user: { login: "ann" },
+            body: "new side",
+            path: "src/a.ts",
+            position: 12,
+            original_position: 0,
+          },
+          {
+            id: 11,
+            user: { login: "ann" },
+            body: "old side",
+            path: "src/a.ts",
+            position: 0,
+            original_position: 4,
+          },
+          {
+            id: 12,
+            user: { login: "ann" },
+            body: "no line",
+            path: "src/a.ts",
+            position: 0,
+            original_position: 0,
+          },
+        ],
+      };
+    return { json: [] };
+  });
+  const { conversation: loaded } = await conversation(host);
+  expect(
+    loaded.kind === "pr" &&
+      loaded.reviewComments.map(({ id, line, side, body }) => ({
+        id,
+        line,
+        side,
+        body,
+      })),
+  ).toEqual([
+    { id: 10, line: 12, side: "additions", body: "new side" },
+    { id: 11, line: 4, side: "deletions", body: "old side" },
+  ]);
+  expect(calls.some((call) => call.endpoint.includes("/reviews/2/"))).toBe(
+    false,
+  );
+  expect(calls.some((call) => call.endpoint.includes("/reviews/3/"))).toBe(
+    false,
+  );
+});
+
+it("posts a line comment as a single-comment review on the given side", async () => {
+  const { host, calls } = await start(() => ({ json: {} }));
+  await host.harness.behavior.callRpc("reviewComment", {
+    repo: "acme/widgets",
+    number: 9,
+    commitId: headSha,
+    path: "src/a.ts",
+    line: 4,
+    side: "deletions",
+    body: "Why remove this?",
+  });
+  expect(
+    calls.map(({ method, endpoint, body }) => ({ method, endpoint, body })),
+  ).toEqual([
+    {
+      method: "POST",
+      endpoint: "/api/v1/repos/acme/widgets/pulls/9/reviews",
+      body: {
+        event: "COMMENT",
+        body: "",
+        commit_id: headSha,
+        comments: [
+          {
+            path: "src/a.ts",
+            body: "Why remove this?",
+            new_position: 0,
+            old_position: 4,
+          },
+        ],
+      },
+    },
+  ]);
+});
+
 it("invalidates a cached item after a mutation and announces the change without content", async () => {
   let title = "Before";
   const { host, calls } = await start(({ endpoint, method }) => {

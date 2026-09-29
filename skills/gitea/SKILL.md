@@ -17,6 +17,7 @@ Use `bb gitea` and typed Gitea RPCs to inspect or explicitly update Gitea issues
 - Use `show`, not `conversation`, when a decision needs Gitea's current state; `show` and babysitter, merge and mutation paths never read the display cache.
 - `bb gitea create-issue <owner/repo> <title> [--body text]` creates an issue.
 - `bb gitea comment <owner/repo> <number> <body>` posts a conversation comment.
+- `bb gitea line-comment <owner/repo> <number> <path> <line> [--old] <body>` comments on a line of the PR head diff; `--old` targets the removed-line side.
 - `bb gitea set-state <owner/repo> <number> <open|closed>` changes issue or pull request state.
 - `bb gitea metadata <owner/repo> <number> <labels-csv> <assignees-csv>` replaces labels and assignees. Use an empty string to clear either field.
 - `bb gitea review <owner/repo> <number> <APPROVED|REQUEST_CHANGES|COMMENT> [body]` submits a pull request review.
@@ -53,4 +54,4 @@ List APIs inspect at most 50 repositories, fetch ten pages of 50 items per repos
 
 Configure settings in the plugin settings page or with `bb plugin config gitea set <baseUrl|teaProfile|extraRepos> <value>`, then use `bb plugin reload gitea` if the plugin needs a reload.
 
-All external writes require an explicit panel action or CLI invocation; a babysitter acts on its pull request with the selected tea login's permissions, within its Auto-fix and Auto-merge options. Inline review threads and native auto-merge are not implemented; PR checks are read from commit statuses.
+All external writes require an explicit panel action or CLI invocation; a babysitter acts on its pull request with the selected tea login's permissions, within its Auto-fix and Auto-merge options. Native auto-merge is not implemented; PR checks are read from commit statuses.

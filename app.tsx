@@ -35,10 +35,12 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { Icon } from "@/components/ui/icon";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import {
   parsePatchFiles,
+  type DiffLineAnnotation,
   type FileDiffMetadata,
   type FileDiffOptions,
 } from "@pierre/diffs";
@@ -352,10 +354,25 @@ const unavailableText = {
   "diff-failed": "Gitea did not return the raw diff for this pull request.",
 } as const;
 
-type Check = Extract<
+type PullConversation = Extract<
   ConversationView["conversation"],
   { kind: "pr" }
->["checks"][number];
+>;
+type Check = PullConversation["checks"][number];
+type ReviewComment = PullConversation["reviewComments"][number];
+type LineTarget = Pick<ReviewComment, "line" | "side">;
+type FileReview = {
+  comments: ReviewComment[];
+  post: (target: LineTarget, body: string) => Promise<void>;
+};
+type LineReview = {
+  repo: string;
+  number: number;
+  comments: ReviewComment[];
+  onPosted: () => Promise<unknown>;
+};
+type LineNote =
+  { kind: "thread"; comments: ReviewComment[] } | { kind: "draft" };
 
 function CheckRow({ check }: { check: Check }) {
   const content = (
@@ -457,12 +474,15 @@ function GiteaDiff({
   path,
   diff,
   filesUrl,
+  review,
 }: {
   path: string;
   diff: FileDiff;
   filesUrl: string;
+  review: FileReview;
 }) {
-  if (diff.kind === "text") return <PatchView path={path} patch={diff.patch} />;
+  if (diff.kind === "text")
+    return <PatchView path={path} patch={diff.patch} review={review} />;
   if (diff.kind === "empty")
     return (
       <DiffNotice filesUrl="">
@@ -482,9 +502,140 @@ function GiteaDiff({
   );
 }
 
-function PatchView({ path, patch }: { path: string; patch: string }) {
+function sameLine(a: LineTarget, b: LineTarget) {
+  return a.line === b.line && a.side === b.side;
+}
+
+function lineNotes(
+  comments: ReviewComment[],
+  draft: LineTarget | null,
+): DiffLineAnnotation<LineNote>[] {
+  const threads = new Map<string, DiffLineAnnotation<LineNote>>();
+  for (const comment of comments) {
+    const key = `${comment.side}:${comment.line}`;
+    const thread = threads.get(key);
+    if (thread?.metadata.kind === "thread")
+      thread.metadata.comments.push(comment);
+    else
+      threads.set(key, {
+        side: comment.side,
+        lineNumber: comment.line,
+        metadata: { kind: "thread", comments: [comment] },
+      });
+  }
+  const notes = [...threads.values()];
+  if (draft)
+    notes.push({
+      side: draft.side,
+      lineNumber: draft.line,
+      metadata: { kind: "draft" },
+    });
+  return notes;
+}
+
+function LineThread({
+  comments,
+  onReply,
+}: {
+  comments: ReviewComment[];
+  onReply: (() => void) | null;
+}) {
+  return (
+    <div
+      data-testid="bb-line-thread"
+      className="mx-2 my-1.5 space-y-2 rounded-md border border-border bg-card p-2 font-sans text-xs"
+    >
+      {comments.map((comment) => (
+        <article key={comment.id}>
+          <div className="mb-0.5 text-muted-foreground">
+            <span className="font-medium text-foreground">
+              {comment.author}
+            </span>{" "}
+            · {comment.createdAt}
+          </div>
+          <div className="whitespace-pre-wrap">{comment.body}</div>
+        </article>
+      ))}
+      {onReply && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 px-2 text-xs"
+          onClick={onReply}
+        >
+          Reply
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function LineDraft({
+  onSubmit,
+  onCancel,
+}: {
+  onSubmit: (body: string) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [body, setBody] = useState("");
+  const [posting, setPosting] = useState(false);
+  const submit = async () => {
+    if (!body.trim()) return;
+    setPosting(true);
+    try {
+      await onSubmit(body);
+    } finally {
+      setPosting(false);
+    }
+  };
+  return (
+    <div className="mx-2 my-1.5 space-y-2 rounded-md border border-border bg-card p-2 font-sans">
+      <Textarea
+        autoFocus
+        aria-label="Line comment"
+        value={body}
+        onChange={(event) => setBody(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") onCancel();
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            void submit();
+          }
+        }}
+        placeholder="Comment on this line"
+      />
+      <div className="flex justify-end gap-2">
+        <Button size="sm" variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button
+          size="sm"
+          disabled={posting || !body.trim()}
+          onClick={() => void submit()}
+        >
+          Comment
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PatchView({
+  path,
+  patch,
+  review,
+}: {
+  path: string;
+  patch: string;
+  review: FileReview;
+}) {
   const dark = useIsDarkTheme();
   const diffStyle = useDiffStyle();
+  const [draft, setDraft] = useState<LineTarget | null>(null);
+  const annotations = useMemo(
+    () => lineNotes(review.comments, draft),
+    [review.comments, draft],
+  );
   const fileDiff = useMemo<FileDiffMetadata | null>(() => {
     const normalized = patch.replace(/\r\n/g, "\n").trimEnd();
     const text = normalized.startsWith("diff --git")
@@ -496,12 +647,18 @@ function PatchView({ path, patch }: { path: string; patch: string }) {
       return null;
     }
   }, [path, patch]);
-  const options = useMemo<FileDiffOptions<undefined>>(
+  const options = useMemo<FileDiffOptions<LineNote>>(
     () => ({
       diffStyle,
       overflow: "scroll",
       disableFileHeader: true,
       themeType: dark ? "dark" : "light",
+      enableGutterUtility: true,
+      onGutterUtilityClick: (range) =>
+        setDraft({
+          line: range.end,
+          side: range.endSide ?? range.side ?? "additions",
+        }),
     }),
     [dark, diffStyle],
   );
@@ -513,7 +670,35 @@ function PatchView({ path, patch }: { path: string; patch: string }) {
     );
   return (
     <div data-testid="bb-diff" data-path={path}>
-      <PierreFileDiff fileDiff={fileDiff} options={options} />
+      <PierreFileDiff
+        fileDiff={fileDiff}
+        options={options}
+        lineAnnotations={annotations}
+        renderAnnotation={(note) =>
+          note.metadata.kind === "draft" ? (
+            <LineDraft
+              onCancel={() => setDraft(null)}
+              onSubmit={async (body) => {
+                await review.post(
+                  { line: note.lineNumber, side: note.side },
+                  body,
+                );
+                setDraft(null);
+              }}
+            />
+          ) : (
+            <LineThread
+              comments={note.metadata.comments}
+              onReply={
+                draft &&
+                sameLine(draft, { line: note.lineNumber, side: note.side })
+                  ? null
+                  : () => setDraft({ line: note.lineNumber, side: note.side })
+              }
+            />
+          )
+        }
+      />
     </div>
   );
 }
@@ -851,10 +1036,12 @@ function PullFilesPane({
   files,
   url,
   moved,
+  review,
 }: {
   files: Loadable<FilesView>;
   url: string;
   moved: boolean;
+  review: LineReview;
 }) {
   if (files.state === "loading")
     return (
@@ -888,6 +1075,7 @@ function PullFilesPane({
       key={`${value.revision.head}:${value.revision.base}`}
       view={value}
       url={url}
+      review={review}
     />
   );
 }
@@ -945,7 +1133,58 @@ function DeferredDiff({
   return <div ref={placeholder} style={{ height: lines * 20 + 16 }} />;
 }
 
-function ChangedFiles({ view, url }: { view: FilesView; url: string }) {
+const noComments: ReviewComment[] = [];
+
+function ChangedFiles({
+  view,
+  url,
+  review,
+}: {
+  view: FilesView;
+  url: string;
+  review: LineReview;
+}) {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const { repo, number, onPosted } = review;
+  const head = view.revision.head;
+  const byPath = useMemo(() => {
+    const grouped = new Map<string, ReviewComment[]>();
+    for (const comment of review.comments)
+      grouped.set(comment.path, [
+        ...(grouped.get(comment.path) ?? []),
+        comment,
+      ]);
+    return grouped;
+  }, [review.comments]);
+  const reviews = useMemo(
+    () =>
+      new Map(
+        view.files.map((file) => [
+          file.path,
+          {
+            comments: byPath.get(file.path) ?? noComments,
+            post: async (target: LineTarget, body: string) => {
+              try {
+                await rpc.call("reviewComment", {
+                  repo,
+                  number,
+                  commitId: head,
+                  path: file.path,
+                  body,
+                  ...target,
+                });
+              } catch (error) {
+                toast.error(errorText(error, "Comment failed"));
+                throw error;
+              }
+              toast.success("Comment added");
+              await onPosted();
+            },
+          },
+        ]),
+      ),
+    [byPath, head, number, onPosted, repo, rpc, view.files],
+  );
   const cards = useRef(new Map<string, HTMLElement>());
   const [scrollRoot, setScrollRoot] = useState<Element | null>(null);
   const observe = useRevealWhenNear(scrollRoot);
@@ -1040,6 +1279,12 @@ function ChangedFiles({ view, url }: { view: FilesView; url: string }) {
                   >
                     {fileLabel(file)}
                   </span>
+                  {reviews.get(file.path)!.comments.length > 0 && (
+                    <Badge variant="secondary" className="gap-1">
+                      <Icon name="MessageSquare" className="size-3" />
+                      {reviews.get(file.path)!.comments.length}
+                    </Badge>
+                  )}
                   <span className="shrink-0 text-green-600 dark:text-green-400">
                     +{file.additions}
                   </span>
@@ -1057,10 +1302,16 @@ function ChangedFiles({ view, url }: { view: FilesView; url: string }) {
                       path={file.path}
                       diff={file.diff}
                       filesUrl={url}
+                      review={reviews.get(file.path)!}
                     />
                   </DeferredDiff>
                 ) : (
-                  <GiteaDiff path={file.path} diff={file.diff} filesUrl={url} />
+                  <GiteaDiff
+                    path={file.path}
+                    diff={file.diff}
+                    filesUrl={url}
+                    review={reviews.get(file.path)!}
+                  />
                 )}
               </section>
             ))}
@@ -1290,45 +1541,45 @@ function BabysitPreferencesControl() {
   const fields = { fix: "autoFix", merge: "autoMerge" } as const;
   return (
     <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-        {automationToggles.map(({ option, label, description }) => {
-          const field = fields[option];
-          return (
-            <label
-              key={option}
-              title={description}
-              className="flex items-center gap-2"
-            >
-              <input
-                type="checkbox"
-                checked={preferences[field]}
-                disabled={saving}
-                onChange={(event) => {
-                  const enabled = event.target.checked;
-                  void save(
-                    () => rpc.call("setAutoAutomation", { [option]: enabled }),
-                    { ...preferences, [field]: enabled },
-                  );
-                }}
-              />
-              {label}
-            </label>
-          );
-        })}
-        <ProviderModelPicker
-          value={execution}
-          disabled={saving}
-          align="end"
-          onChange={(value) => {
-            const next = {
-              ...value,
-              serviceTier: value.serviceTier ?? "default",
-            };
-            void save(() => rpc.call("setBabysitExecution", next), {
-              ...preferences,
-              execution: next,
-            });
-          }}
-        />
+      {automationToggles.map(({ option, label, description }) => {
+        const field = fields[option];
+        return (
+          <label
+            key={option}
+            title={description}
+            className="flex items-center gap-2"
+          >
+            <input
+              type="checkbox"
+              checked={preferences[field]}
+              disabled={saving}
+              onChange={(event) => {
+                const enabled = event.target.checked;
+                void save(
+                  () => rpc.call("setAutoAutomation", { [option]: enabled }),
+                  { ...preferences, [field]: enabled },
+                );
+              }}
+            />
+            {label}
+          </label>
+        );
+      })}
+      <ProviderModelPicker
+        value={execution}
+        disabled={saving}
+        align="end"
+        onChange={(value) => {
+          const next = {
+            ...value,
+            serviceTier: value.serviceTier ?? "default",
+          };
+          void save(() => rpc.call("setBabysitExecution", next), {
+            ...preferences,
+            execution: next,
+          });
+        }}
+      />
     </div>
   );
 }
@@ -1819,6 +2070,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   <div className="whitespace-pre-wrap">{comment.body}</div>
                 </article>
               ))}
+              {detail.kind === "pr" && (
+                <LineCommentList comments={detail.reviewComments} />
+              )}
               <CommentComposer
                 key={itemKey(detail)}
                 item={detail}
@@ -1975,6 +2229,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               files={display.files}
               url={filesUrl(detail)}
               moved={display.filesMoved}
+              review={{
+                repo: detail.repo,
+                number: detail.number,
+                comments: detail.reviewComments,
+                onPosted: display.reload,
+              }}
             />
           </div>
         </TabsContent>
@@ -2028,22 +2288,15 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               {status?.error ?? "Checking Gitea configuration…"}
             </div>
           )}
-          {shownList &&
-            (shownList.truncated || shownList.errors.length > 0) && (
-              <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                {shownList.truncated && (
-                  <div>
-                    The bounded result window is full; older items may be
-                    outside it.
-                  </div>
-                )}
-                {shownList.errors.map((entry) => (
-                  <div key={entry.repo}>
-                    {entry.repo}: {entry.message}
-                  </div>
-                ))}
-              </div>
-            )}
+          {shownList && shownList.errors.length > 0 && (
+            <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              {shownList.errors.map((entry) => (
+                <div key={entry.repo}>
+                  {entry.repo}: {entry.message}
+                </div>
+              ))}
+            </div>
+          )}
           {(view === "my-prs" || view === "babysitters") && (
             <BabysitPreferencesControl />
           )}
@@ -2191,6 +2444,33 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function LineCommentList({ comments }: { comments: ReviewComment[] }) {
+  if (!comments.length) return null;
+  return (
+    <div className="space-y-2">
+      <h4 className="text-xs font-semibold text-muted-foreground">
+        Line comments
+      </h4>
+      {comments.map((comment) => (
+        <article
+          key={comment.id}
+          className="rounded-md border border-border p-3 text-sm"
+        >
+          <div className="mb-1 flex flex-wrap gap-x-2 text-xs text-muted-foreground">
+            <span className="font-mono text-foreground">
+              {comment.path}:{comment.line}
+            </span>
+            <span>
+              {comment.author} · {comment.createdAt}
+            </span>
+          </div>
+          <div className="whitespace-pre-wrap">{comment.body}</div>
+        </article>
+      ))}
     </div>
   );
 }
@@ -2343,6 +2623,9 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
             <div className="whitespace-pre-wrap">{comment.body}</div>
           </article>
         ))}
+        {detail.kind === "pr" && (
+          <LineCommentList comments={detail.reviewComments} />
+        )}
         <CommentComposer
           key={itemKey(detail)}
           item={detail}
@@ -2376,6 +2659,12 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
           files={display.files}
           url={filesUrl(detail)}
           moved={display.filesMoved}
+          review={{
+            repo: detail.repo,
+            number: detail.number,
+            comments: detail.reviewComments,
+            onPosted: display.reload,
+          }}
         />
       </TabsContent>
     </Tabs>

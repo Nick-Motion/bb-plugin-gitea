@@ -108,6 +108,16 @@ const reviewSchema = z.object({
   body: z.string(),
   createdAt: z.string(),
 });
+const reviewCommentSchema = z.object({
+  id: z.number().int(),
+  author: z.string(),
+  body: z.string(),
+  createdAt: z.string(),
+  path: z.string(),
+  line: z.number().int().positive(),
+  side: z.enum(["additions", "deletions"]),
+  url: z.string(),
+});
 const revisionSchema = z.object({ head: z.string(), base: z.string() });
 const detailSchema = itemSchema.extend({
   comments: z.array(commentSchema),
@@ -118,6 +128,7 @@ const detailSchema = itemSchema.extend({
   reviews: z.array(reviewSchema),
   filesTruncated: z.boolean(),
   reviewsTruncated: z.boolean(),
+  reviewComments: z.array(reviewCommentSchema),
   headRefName: z.string(),
   baseRefName: z.string(),
   threadId: z.string().nullable(),
@@ -138,6 +149,7 @@ const conversationSchema = z.discriminatedUnion("kind", [
     checksTruncated: z.boolean(),
     reviews: z.array(reviewSchema),
     reviewsTruncated: z.boolean(),
+    reviewComments: z.array(reviewCommentSchema),
   }),
 ]);
 const pullFilesSchema = z.object({
@@ -159,6 +171,7 @@ type Conversation = z.infer<typeof conversationSchema>;
 type PullFiles = z.infer<typeof pullFilesSchema>;
 type FileView = z.infer<typeof fileSchema>;
 type Check = z.infer<typeof checkSchema>;
+type ReviewComment = z.infer<typeof reviewCommentSchema>;
 const okSchema = z.object({ ok: z.literal(true) });
 const pullRefSchema = z.object({
   repo: repositorySchema,
@@ -234,6 +247,18 @@ export const giteaRpcContract = defineRpcContract({
     input: z.object({
       repo: repositorySchema,
       number: z.number().int().positive(),
+      body: z.string().trim().min(1).max(100000),
+    }),
+    output: okSchema,
+  },
+  reviewComment: {
+    input: z.object({
+      repo: repositorySchema,
+      number: z.number().int().positive(),
+      commitId: z.string().regex(/^[0-9a-f]{7,64}$/i),
+      path: z.string().min(1).max(4096),
+      line: z.number().int().positive(),
+      side: z.enum(["additions", "deletions"]),
       body: z.string().trim().min(1).max(100000),
     }),
     output: okSchema,
@@ -346,6 +371,7 @@ const teaTimeoutMs = 15_000;
 const maxConcurrentTea = 8;
 const pageSize = 50;
 const maxPages = 10;
+const maxReviewCommentReads = 50;
 const maxListRepositories = 50;
 const conversationPolicy: FreshnessPolicy = {
   freshMs: 15_000,
@@ -1002,18 +1028,66 @@ export default async function plugin(bb: BbPluginApi) {
       repoPath(repo, `pulls/${number}/reviews`),
       signal,
     );
+    const reviews = page.values.map(record);
+    const commented = reviews
+      .filter(
+        (review) =>
+          Number(review.comments_count) > 0 &&
+          text(review.state) !== "PENDING" &&
+          Number.isInteger(review.id),
+      )
+      .slice(0, maxReviewCommentReads);
+    const reviewComments: ReviewComment[] = [];
+    for (let index = 0; index < commented.length; index += 4) {
+      const batch = await Promise.all(
+        commented
+          .slice(index, index + 4)
+          .map((review) =>
+            api(
+              repoPath(repo, `pulls/${number}/reviews/${review.id}/comments`),
+              { signal },
+            ),
+          ),
+      );
+      for (const response of batch)
+        if (Array.isArray(response))
+          reviewComments.push(...response.flatMap(mapReviewComment));
+    }
     return {
       truncated: page.truncated,
-      reviews: page.values.map((entry) => {
-        const review = record(entry);
-        return {
-          author: actor(review),
-          state: text(review.state),
-          body: text(review.body),
-          createdAt: text(review.submitted_at),
-        };
-      }),
+      reviews: reviews.map((review) => ({
+        author: actor(review),
+        state: text(review.state),
+        body: text(review.body),
+        createdAt: text(review.submitted_at),
+      })),
+      reviewComments,
     };
+  }
+
+  function mapReviewComment(raw: unknown): ReviewComment[] {
+    const value = record(raw);
+    const added = Number(value.position);
+    const removed = Number(value.original_position);
+    const side =
+      Number.isInteger(added) && added > 0
+        ? { line: added, side: "additions" as const }
+        : Number.isInteger(removed) && removed > 0
+          ? { line: removed, side: "deletions" as const }
+          : null;
+    const path = text(value.path);
+    if (!side || !path || !Number.isInteger(value.id)) return [];
+    return [
+      {
+        id: value.id as number,
+        author: actor(value),
+        body: text(value.body),
+        createdAt: text(value.created_at),
+        path,
+        ...side,
+        url: safeLink(cleanBaseUrl(config.baseUrl), value.html_url),
+      },
+    ];
   }
 
   async function readChecks(
@@ -1085,6 +1159,7 @@ export default async function plugin(bb: BbPluginApi) {
       checksTruncated: loaded.checks.truncated,
       reviews: reviewPage.reviews,
       reviewsTruncated: reviewPage.truncated,
+      reviewComments: reviewPage.reviewComments,
     });
   }
 
@@ -1181,7 +1256,7 @@ export default async function plugin(bb: BbPluginApi) {
       return response;
     };
     const values: unknown[] = [];
-    for (let page = 1; page <= pageLimit; ) {
+    for (let page = 1; page <= pageLimit;) {
       const count = page === 1 ? 1 : Math.min(batchSize, pageLimit - page + 1);
       const responses = await Promise.all(
         Array.from({ length: count }, (_, index) => readPage(page + index)),
@@ -2083,6 +2158,7 @@ export default async function plugin(bb: BbPluginApi) {
           checksTruncated: false,
           reviews: [],
           reviewsTruncated: false,
+          reviewComments: [],
           headRefName: "",
           baseRefName: "",
         });
@@ -2095,6 +2171,7 @@ export default async function plugin(bb: BbPluginApi) {
         checksTruncated: bound.checks.truncated,
         reviews: reviewPage.reviews,
         reviewsTruncated: reviewPage.truncated,
+        reviewComments: reviewPage.reviewComments,
         headRefName: text(record(bound.pull.head).ref),
         baseRefName: text(record(bound.pull.base).ref),
       });
@@ -2234,6 +2311,33 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return { ok: true as const };
     },
+    reviewComment: async (
+      { repo, number, commitId, path, line, side, body },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      try {
+        await api(repoPath(repo, `pulls/${number}/reviews`), {
+          method: "POST",
+          body: {
+            event: "COMMENT",
+            body: "",
+            commit_id: commitId,
+            comments: [
+              {
+                path,
+                body,
+                new_position: side === "additions" ? line : 0,
+                old_position: side === "deletions" ? line : 0,
+              },
+            ],
+          },
+          signal,
+        });
+      } finally {
+        forgetDisplayItem(repo, number);
+      }
+      return { ok: true as const };
+    },
     sendAgent: async (
       { repo, number, kind },
       { experimental_signal: signal }: RpcContext = {},
@@ -2333,17 +2437,17 @@ export default async function plugin(bb: BbPluginApi) {
       const projects = trackedProjects(tracked);
       const items = await Promise.all(
         list.items.map(async (item) => ({
-            ...item,
-            babysit: babysitView(
-              await getSession(item.repo, item.number),
-              item.state === "open"
-                ? {
-                    lifecycle: { state: "open" },
-                    projectId: projects.get(item.repo.toLowerCase()) ?? null,
-                  }
-                : null,
-            ),
-          })),
+          ...item,
+          babysit: babysitView(
+            await getSession(item.repo, item.number),
+            item.state === "open"
+              ? {
+                  lifecycle: { state: "open" },
+                  projectId: projects.get(item.repo.toLowerCase()) ?? null,
+                }
+              : null,
+          ),
+        })),
       );
       return {
         ...list,
@@ -2496,6 +2600,12 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb gitea comment <owner/repo> <number> <body>",
       },
       {
+        name: "line-comment",
+        summary: "Comment on one line of a pull request diff",
+        usage:
+          "bb gitea line-comment <owner/repo> <number> <path> <line> [--old] <body>",
+      },
+      {
         name: "set-state",
         summary: "Open or close an issue or pull request",
         usage: "bb gitea set-state <owner/repo> <number> <open|closed>",
@@ -2594,8 +2704,10 @@ export default async function plugin(bb: BbPluginApi) {
         .sort((a, b) => b - a))
         args.splice(index, 2);
       const refresh = args.includes("--refresh");
+      const old = args.includes("--old");
       const positional = args.filter(
-        (value) => value !== "--json" && value !== "--refresh",
+        (value) =>
+          value !== "--json" && value !== "--refresh" && value !== "--old",
       );
       const [command, ...values] = positional;
       const succeed = (value: unknown, human: string) => ({
@@ -2691,6 +2803,28 @@ export default async function plugin(bb: BbPluginApi) {
           return succeed(
             value,
             `Comment added to ${input.repo}#${input.number}`,
+          );
+        }
+        if (command === "line-comment") {
+          const [repo, number] = values;
+          const { revision } = await readPull(
+            repositorySchema.parse(repo),
+            Number(number),
+            undefined,
+          );
+          const input = giteaRpcContract.reviewComment.input.parse({
+            repo,
+            number: Number(number),
+            commitId: revision.head,
+            path: values[2],
+            line: Number(values[3]),
+            side: old ? "deletions" : "additions",
+            body: values.slice(4).join(" "),
+          });
+          const value = await handlers.reviewComment(input);
+          return succeed(
+            value,
+            `Commented on ${input.path}:${input.line} in ${input.repo}#${input.number}`,
           );
         }
         if (command === "set-state") {
