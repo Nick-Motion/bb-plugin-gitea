@@ -1561,7 +1561,7 @@ function BabysitPreferencesControl() {
                 );
               }}
             />
-            {label}
+            {label} all
           </label>
         );
       })}
