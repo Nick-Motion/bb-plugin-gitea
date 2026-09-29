@@ -14,7 +14,7 @@ Write to Gitea only when the user asks. Read commands accept `--json`. List comm
 - `bb gitea files <owner/repo> <number> [--refresh]` returns changed files and diffs for the returned `revision`, with `freshness` and a `stale` flag when the pull request moved during the read. Each file's `diff.kind` is `text` (with `patch`), `empty`, `binary`, `too-large` (over 256 KiB), or `unavailable` with `reason` `missing`, `stale`, `diff-too-large`, or `diff-failed`.
 - `bb gitea options <owner/repo>` lists the repository's labels (name and color) and assignable users.
 - `bb gitea thread <thread-id>` reads the item linked to a BB thread.
-- `bb gitea refresh` rediscovers repositories.
+- `bb gitea refresh` rediscovers repositories now. Otherwise discovery is reused for 30 seconds, so a newly added project can take that long to appear.
 
 ## Write
 

@@ -2598,7 +2598,11 @@ export default async function plugin(bb: BbPluginApi) {
     },
     threadItem: async ({ threadId }) =>
       (await bb.storage.kv.get(`thread-link:${threadId}`)) ?? null,
-    refresh: async () => ({ repos: (await repos()).length, items: 0 }),
+    refresh: async () => {
+      repoDiscovery = null;
+      repoOptionCache.clear();
+      return { repos: (await repos()).length, items: 0 };
+    },
     listMyPullRequests: async (
       { repo, state, query, refresh },
       { experimental_signal: signal }: RpcContext = {},

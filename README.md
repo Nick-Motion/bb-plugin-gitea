@@ -96,7 +96,7 @@ Comment ids come from `bb gitea conversation ... --json`. `--old` puts a line co
 
 ## Behavior and limits
 
-- `conversation`, `files`, and the panel read through a short in-memory cache (about 15 seconds for conversations and lists, 5 minutes for diffs) and refresh in the background. Any write through the plugin clears the affected entries. `show`, `issues`, `prs`, `my-prs`, auto-fixers, and merges always read Gitea directly.
+- `conversation`, `files`, and the panel read through a short in-memory cache (about 15 seconds for conversations and lists, 5 minutes for diffs) and refresh in the background. Repository discovery is reused for 30 seconds and label and assignee options for 60 seconds; `bb gitea refresh` clears both. Any write through the plugin clears the affected entries. `show`, `issues`, `prs`, `my-prs`, auto-fixers, and merges always read Gitea directly.
 - Lists cover at most 50 repositories and 200 items. Comments and reviews stop at 500, files at 500, checks at 100. Results that hit a cap say so.
 - Checks come from commit statuses.
 - Gitea marks a draft by title prefix. `draft on` adds `WIP: `; `draft off` removes `WIP:` or `[WIP]`.
