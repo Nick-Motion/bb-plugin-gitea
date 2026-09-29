@@ -1723,6 +1723,11 @@ it("lists authored pull requests and starts one hidden pinned auto-fixer for con
     await rpc(host, "listMyPullRequests", { state: "open", query: "" }),
   );
   expect(mine.login).toBe("dev");
+  expect(
+    calls
+      .filter(({ endpoint }) => /\/issues\?/.test(endpoint))
+      .every(({ endpoint }) => endpoint.includes("created_by=dev")),
+  ).toBe(true);
   expect(mine.preferences).toMatchObject({ autoFix: false, autoMerge: false });
   expect(
     mine.items

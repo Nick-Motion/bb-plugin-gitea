@@ -1322,6 +1322,7 @@ export default async function plugin(bb: BbPluginApi) {
     repo: string | undefined,
     state: "open" | "closed" | "all",
     signal?: AbortSignal,
+    author?: string,
   ): Promise<ItemPage> {
     const discovered = repo ? [{ repo, projectId: null }] : await repos();
     const candidates = discovered.slice(0, maxListRepositories);
@@ -1329,7 +1330,11 @@ export default async function plugin(bb: BbPluginApi) {
       candidates.map(async ({ repo: name }) => {
         const endpointPath = repoPath(
           name,
-          `issues?${new URLSearchParams({ state, type: kind === "pr" ? "pulls" : "issues" })}`,
+          `issues?${new URLSearchParams({
+            state,
+            type: kind === "pr" ? "pulls" : "issues",
+            ...(author && { created_by: author }),
+          })}`,
         );
         return { repo: name, page: await paginated(endpointPath, signal) };
       }),
@@ -1389,6 +1394,23 @@ export default async function plugin(bb: BbPluginApi) {
     if (page.reachable === 0 && page.errors.length > 0)
       throw new Error(page.errors[0]!.message);
     return page;
+  }
+  async function fetchMyPulls(
+    repo: string | undefined,
+    state: "open" | "closed" | "all",
+    signal: AbortSignal,
+  ) {
+    const login = await currentLogin(signal);
+    const page = await fetchItems("pr", repo, state, signal, login);
+    if (page.reachable === 0 && page.errors.length > 0)
+      throw new Error(page.errors[0]!.message);
+    return {
+      login,
+      page: {
+        ...page,
+        items: page.items.filter((item) => item.author === login),
+      },
+    };
   }
   async function readList<T>(
     cache: DisplayCache<T>,
@@ -2020,15 +2042,23 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function reconcileAutoAutoFixer(signal?: AbortSignal) {
     if ((await defaultPolicy()) === null) return;
-    const [login, tracked, pulls, sessions] = await Promise.all([
-      currentLogin(signal),
+    const [mine, tracked, sessions] = await Promise.all([
+      readList(
+        myPullLists,
+        "my-prs",
+        undefined,
+        "open",
+        true,
+        (loadSignal) => fetchMyPulls(undefined, "open", loadSignal),
+        signal,
+      ),
       repos(),
-      listItems("pr", undefined, "open", "", signal),
       listSessions(),
     ]);
+    const { login, page } = mine.value;
     const targets = autoStartTargets({
       login,
-      pulls: pulls.items,
+      pulls: page.items,
       projects: trackedProjects(tracked),
       sessions: new Map(
         sessions.map((session) => [
@@ -2049,7 +2079,7 @@ export default async function plugin(bb: BbPluginApi) {
         );
       } catch (error) {
         bb.log.warn(
-          `Automatic Gitean auto-fixer failed for ${target.repo}#${target.number}: ${message(error)}`,
+          `Automatic Gitea auto-fixer failed for ${target.repo}#${target.number}: ${message(error)}`,
         );
       }
     }
@@ -2559,19 +2589,7 @@ export default async function plugin(bb: BbPluginApi) {
           repo,
           state,
           refresh,
-          async (loadSignal) => {
-            const [login, page] = await Promise.all([
-              currentLogin(loadSignal),
-              readItemPage("pr", repo, state, loadSignal),
-            ]);
-            return {
-              login,
-              page: {
-                ...page,
-                items: page.items.filter((item) => item.author === login),
-              },
-            };
-          },
+          (loadSignal) => fetchMyPulls(repo, state, loadSignal),
           signal,
         ),
         repos(),
