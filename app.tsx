@@ -1865,7 +1865,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
 
   const shownList = list.state === "ready" ? list.value : null;
   const visibleItems = shownList?.items ?? [];
-  const count = visibleItems.filter((item) => item.state === "open").length;
+  const myPrsKey = listKey({ view: "my-prs", state, repo, query });
+  const myPrs =
+    myPrsKey === null ? undefined : trustedList(memory, settings, myPrsKey);
+  const count = myPrs?.items.filter((item) => item.state === "open").length;
   if (newIssue) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto p-4 text-sm md:p-5">
@@ -2251,10 +2254,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           >
             <TabsList>
               <TabsTrigger value="my-prs" className="gap-1.5">
-                My PRs{" "}
-                <Badge variant="secondary">
-                  {view === "my-prs" ? count : ""}
-                </Badge>
+                My PRs
+                {count === undefined ? null : (
+                  <Badge variant="secondary">{count}</Badge>
+                )}
               </TabsTrigger>
               <TabsTrigger value="auto-fixers">Auto-fixers</TabsTrigger>
               <TabsTrigger value="issues">Issues</TabsTrigger>
