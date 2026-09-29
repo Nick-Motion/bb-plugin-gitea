@@ -81,6 +81,7 @@ const sessionBase = z.object({
   repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
   number: z.number().int().positive(),
   threadId: z.string().min(1),
+  hostId: z.string().min(1).optional(),
   updatedAt: z.string().min(1),
   policy: autoFixerPolicySchema,
 });
@@ -214,10 +215,9 @@ export function startError(key: string, reason: StartRejection): string {
     : `Cannot auto-fix ${key}: the pull request is ${reason}.`;
 }
 
-type ClosedSession = Extract<AutoFixerSession, { status: "closed" }>;
 export type StartDecision =
   | { kind: "existing"; threadId: string }
-  | { kind: "spawn"; projectId: string; replaces: ClosedSession | null }
+  | { kind: "spawn"; projectId: string; replaces: AutoFixerSession | null }
   | { kind: "reject"; reason: StartRejection };
 
 export function decideStart(input: {
@@ -363,6 +363,7 @@ function retained(session: AutoFixerSession, now: string) {
     repo: session.repo,
     number: session.number,
     threadId: session.threadId,
+    ...(session.hostId ? { hostId: session.hostId } : {}),
     updatedAt: now,
     policy: session.policy,
   };

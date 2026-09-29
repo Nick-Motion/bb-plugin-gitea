@@ -1608,10 +1608,6 @@ async function startAutoFixers() {
       patchThread(threadId, { archivedAt: null });
       return { ok: true };
     },
-    restoreEnvironment: async ({ threadId }) => {
-      patchThread(threadId, { canRestoreEnvironment: false, archivedAt: null });
-      return makeThreadResponse({ id: threadId });
-    },
     get: async ({ threadId }) => {
       const gate = state.getGate;
       state.getGate = null;
@@ -2018,15 +2014,35 @@ it("fails an unconfirmed marker and resumes the retained thread on retry", async
   });
 });
 
-it("restores a retired auto-fixer workspace before retrying its thread", async () => {
+it("replaces a retired auto-fixer workspace before retrying", async () => {
   const { host, patchThread } = await startAutoFixers();
   await enable(host, pr42);
   await idle(host, "BB_GITEA_AUTO_FIX: FAILED");
   patchThread("auto-fixer-1", { canRestoreEnvironment: true });
   await rpc(host, "retryAutoFixer", pr42);
-  expect(host.harness.sdk.callsTo("threads.restoreEnvironment")).toHaveLength(1);
-  expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
+  expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
   await expect(autoFixerStatus(host)).resolves.toMatchObject({
+    threadId: "auto-fixer-2",
+    status: "watching",
+  });
+});
+
+it("replaces a legacy auto-fixer on another host without deleting its thread", async () => {
+  const { host } = await startAutoFixers();
+  await enable(host, pr42);
+  await idle(host, "BB_GITEA_AUTO_FIX: FAILED");
+  const old = await autoFixerStatus(host);
+  await host.bb.storage.kv.set("auto-fixer:acme/widgets#42", {
+    ...old,
+    hostId: undefined,
+  });
+  await rpc(host, "retryAutoFixer", pr42);
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
+  expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({
+    threadId: "auto-fixer-2",
+    hostId: "source-host",
     status: "watching",
   });
 });

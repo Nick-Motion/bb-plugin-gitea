@@ -1867,6 +1867,7 @@ export default async function plugin(bb: BbPluginApi) {
     repo: string,
     number: number,
     policy: AutoFixerPolicy,
+    replacement: AutoFixerSession | null = null,
   ): Promise<{ threadId: string }> {
     const key = `${repo}#${number}`;
     const [pull, project] = await Promise.all([
@@ -1876,11 +1877,20 @@ export default async function plugin(bb: BbPluginApi) {
     const lifecycle = parseLifecycle(pull);
     if (!lifecycle)
       throw new Error("Gitea returned an unrecognized pull request state.");
-    const decision = decideStart({
-      session: await getSession(repo, number),
-      projectId: project?.projectId ?? null,
-      lifecycle,
-    });
+    const decision =
+      replacement !== null &&
+      lifecycle.state === "open" &&
+      project?.projectId
+        ? {
+            kind: "spawn" as const,
+            projectId: project.projectId,
+            replaces: replacement,
+          }
+        : decideStart({
+            session: await getSession(repo, number),
+            projectId: project?.projectId ?? null,
+            lifecycle,
+          });
     if (decision.kind === "reject")
       throw new Error(startError(key, decision.reason));
     if (decision.kind === "existing") return { threadId: decision.threadId };
@@ -1933,6 +1943,7 @@ export default async function plugin(bb: BbPluginApi) {
       repo,
       number,
       threadId: thread.id,
+      ...(project?.hostId ? { hostId: project.hostId } : {}),
       updatedAt: now(),
       policy,
       status: "watching",
@@ -1962,6 +1973,17 @@ export default async function plugin(bb: BbPluginApi) {
       await forgetDeletedThread(session.threadId);
       return await spawnAutoFixer(repo, number, policy);
     }
+    const replace = async () => {
+      const cleanup = await archiveAndStop(session.threadId);
+      if (!cleanup.ok) throw new Error(`Cleanup failed: ${cleanup.error}`);
+      return await spawnAutoFixer(repo, number, policy, session);
+    };
+    const project = await projectFor(repo);
+    if (
+      presence.canRestoreEnvironment ||
+      (project?.hostId && session.hostId !== project.hostId)
+    )
+      return await replace();
     if (cleanupFirst) {
       const cleanup = await archiveAndStop(session.threadId);
       if (!cleanup.ok) {
@@ -1972,8 +1994,6 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error(`Cleanup failed: ${cleanup.error}`);
       }
     }
-    if (presence.canRestoreEnvironment)
-      await bb.sdk.threads.restoreEnvironment({ threadId: session.threadId });
     const pull = record(await api(repoPath(repo, `pulls/${number}`)));
     const lifecycle = parseLifecycle(pull);
     if (!lifecycle)
@@ -1983,21 +2003,27 @@ export default async function plugin(bb: BbPluginApi) {
       await writeIfCurrent(session, done);
       return result;
     }
-    if (presence.archived || cleanupFirst)
-      await bb.sdk.threads.unarchive({ threadId: session.threadId });
-    await withdrawQueued(session.threadId);
-    if (!sameSession(session, await getSession(repo, number))) return result;
-    await bb.sdk.threads.send({
-      threadId: session.threadId,
-      mode: "start",
-      input: [
-        {
-          type: "text",
-          text: `${await autoFixerPrompt(repo, number, text(pull.title), policy)}\n\nContinue from the preserved transcript and current Gitea state.`,
-          mentions: [],
-        },
-      ],
-    });
+    try {
+      if (presence.archived || cleanupFirst)
+        await bb.sdk.threads.unarchive({ threadId: session.threadId });
+      await withdrawQueued(session.threadId);
+      if (!sameSession(session, await getSession(repo, number))) return result;
+      await bb.sdk.threads.send({
+        threadId: session.threadId,
+        mode: "start",
+        input: [
+          {
+            type: "text",
+            text: `${await autoFixerPrompt(repo, number, text(pull.title), policy)}\n\nContinue from the preserved transcript and current Gitea state.`,
+            mentions: [],
+          },
+        ],
+      });
+    } catch (error) {
+      if (!message(error).includes("Thread environment is unavailable"))
+        throw error;
+      return await replace();
+    }
     if (await writeIfCurrent(session, watching(session, policy, now())))
       return result;
     const latest = await getSession(repo, number);
