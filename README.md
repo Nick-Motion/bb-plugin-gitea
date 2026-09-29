@@ -8,7 +8,7 @@ Gitea brings issues and pull requests from a Gitea instance into BB through the 
 bb plugin install https://github.com/Nick-Motion/bb-plugin-gitea
 ```
 
-This README describes version 1.2.1. Once the `v1.2.1` tag is published, pin it with `bb plugin install git:https://github.com/Nick-Motion/bb-plugin-gitea.git@v1.2.1`. To move an existing installation to a new release, run `bb plugin update gitea --yes`; settings and babysitter state are kept. The plugin id is `gitea`, and it registers the `bb gitea` command; do not install it alongside another plugin that registers the same command.
+This README describes version 1.3.0. Once the `v1.3.0` tag is published, pin it with `bb plugin install git:https://github.com/Nick-Motion/bb-plugin-gitea.git@v1.3.0`. To move an existing installation to a new release, run `bb plugin update gitea --yes`; settings and babysitter state are kept. The plugin id is `gitea`, and it registers the `bb gitea` command; do not install it alongside another plugin that registers the same command.
 
 ## Configure
 
