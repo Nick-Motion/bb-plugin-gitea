@@ -2760,3 +2760,47 @@ it("starts send-agent threads with the chosen model or the project default", asy
     executionInputSources: { model: "explicit" },
   });
 });
+
+it("waits for cheap pull request change signals with pr-watch", async () => {
+  const { host, gitea } = await startAutoFixers();
+  const cli = (argv: string[]) => host.harness.behavior.runCli(argv);
+  const first = await cli(["pr-watch", "acme/widgets", "42", "--json"]);
+  expect(first.exitCode).toBe(0);
+  const initial = JSON.parse(first.stdout) as {
+    outcome: string;
+    token: string;
+  };
+  expect(initial.outcome).toBe("changed");
+  const quiet = await cli([
+    "pr-watch",
+    "acme/widgets",
+    "42",
+    "--since",
+    initial.token,
+    "--timeout",
+    "0",
+  ]);
+  expect(quiet).toMatchObject({
+    exitCode: 0,
+    stdout: expect.stringMatching(new RegExp(`^unchanged ${initial.token}\\n`)),
+  });
+  gitea.pulls.set("acme/widgets#42", {
+    ...gitea.pulls.get("acme/widgets#42"),
+    comments: 1,
+  });
+  const moved = await cli([
+    "pr-watch",
+    "acme/widgets",
+    "42",
+    "--since",
+    initial.token,
+    "--timeout",
+    "0",
+  ]);
+  expect(moved.stdout).toMatch(/^changed /);
+  expect(moved.stdout).not.toContain(initial.token);
+  expect(
+    (await cli(["pr-watch", "acme/widgets", "42", "--timeout", "601"]))
+      .exitCode,
+  ).not.toBe(0);
+});

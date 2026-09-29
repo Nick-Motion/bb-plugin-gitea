@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 export const autoFixerExecutionSchema = z
@@ -570,6 +571,7 @@ export function buildAutoFixerPrompt(input: {
   const ref = `${input.repo}#${input.number}`;
   const flags = `--login ${input.login} --repo ${input.repo}`;
   const api = `tea api --login ${input.login} /api/v1/repos/${input.repo}`;
+  const watch = `bb gitea pr-watch ${input.repo} ${input.number} --since <token>`;
   return [
     `You are the Gitea PR auto-fixer for ${ref}: ${input.title}`,
     `Gitea instance: ${input.baseUrl}`,
@@ -583,10 +585,11 @@ export function buildAutoFixerPrompt(input: {
     `- \`${api}/commits/<head sha>/status\``,
     "",
     "Repeat these steps while the PR is open:",
-    "1. Read the current PR state.",
+    "1. Read the current PR state. Reread the diff and conversation only when the head, comments, or reviews changed.",
     "2. Complete the next permitted action that can advance the PR.",
     "3. After each state change, return to step 1.",
-    "4. If no permitted action is possible, run `sleep 300`. Then return to step 1.",
+    `4. If no permitted action is possible, wait for a change: \`${watch}\`, passing the token from its previous output as \`--since\` (omit it the first time). It checks the PR and its CI status every 30 seconds and returns within a few minutes. On \`changed\`, return to step 1. On \`unchanged\`, run it again. On \`inactive\`, this auto-fixer was stopped: end your turn without further action.`,
+    "Do not use `sleep` to wait for Gitea.",
     "",
     "These Auto-fix and Auto-merge settings replace any earlier instructions in this thread:",
     ...policyInstructions(input.policy, flags, api, input.number),
@@ -602,4 +605,75 @@ export function buildAutoFixerPrompt(input: {
     "",
     `Start by running: tea pulls ${flags} --comments ${input.number}`,
   ].join("\n");
+}
+
+export const pullWatchIntervalMs = 30_000;
+export const pullWatchDefaultTimeoutMs = 240_000;
+export const pullWatchMaxTimeoutMs = 600_000;
+
+export type PullSignal = {
+  state: string;
+  merged: boolean;
+  head: string;
+  base: string;
+  mergeable: boolean | null;
+  updatedAt: string;
+  comments: number;
+  reviewComments: number;
+  checks: string;
+  statuses: string[];
+};
+
+function count(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function sha(value: unknown): string {
+  return typeof value === "object" && value !== null
+    ? (nonEmpty((value as Record<string, unknown>).sha) ?? "")
+    : "";
+}
+
+/** The cheap change signal for one pull request: its record plus the combined head status. */
+export function pullSignal(pull: unknown, combined: unknown): PullSignal {
+  const entry = (
+    typeof pull === "object" && pull !== null ? pull : {}
+  ) as Record<string, unknown>;
+  const status = (
+    typeof combined === "object" && combined !== null ? combined : {}
+  ) as Record<string, unknown>;
+  const statuses = Array.isArray(status.statuses) ? status.statuses : [];
+  return {
+    state: nonEmpty(entry.state) ?? "",
+    merged: entry.merged === true,
+    head: sha(entry.head),
+    base: sha(entry.base),
+    mergeable: typeof entry.mergeable === "boolean" ? entry.mergeable : null,
+    updatedAt: nonEmpty(entry.updated_at) ?? "",
+    comments: count(entry.comments),
+    reviewComments: count(entry.review_comments),
+    checks: nonEmpty(status.state) ?? "",
+    statuses: statuses
+      .map((raw) => {
+        const item = (
+          typeof raw === "object" && raw !== null ? raw : {}
+        ) as Record<string, unknown>;
+        return `${nonEmpty(item.context) ?? ""}=${nonEmpty(item.status) ?? nonEmpty(item.state) ?? ""}@${nonEmpty(item.updated_at) ?? ""}`;
+      })
+      .sort(),
+  };
+}
+
+export function signalToken(signal: PullSignal): string {
+  return createHash("sha256")
+    .update(JSON.stringify(signal))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+export function describeSignal(signal: PullSignal): string {
+  const state = signal.merged ? "merged" : signal.state || "unknown";
+  const mergeable =
+    signal.mergeable === null ? "unknown" : signal.mergeable ? "yes" : "no";
+  return `state ${state} · head ${signal.head.slice(0, 12) || "unknown"} · checks ${signal.checks || "none"} · mergeable ${mergeable} · updated ${signal.updatedAt || "unknown"}`;
 }

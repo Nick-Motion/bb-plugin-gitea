@@ -59,9 +59,11 @@ Pull request rows in **My PRs** and **Pull requests** have two independent switc
 
 Turning either on starts an auto-fixer: a hidden BB thread that watches the pull request until it is merged or closed, or until it needs you. Changing a switch updates the same thread. Turning both off stops it and archives the thread. **Retry** resumes a failed or needs-you auto-fixer.
 
+While idle, an auto-fixer waits with `bb gitea pr-watch`, which checks the pull request record and its combined CI status every 30 seconds and returns as soon as either changes. It rereads the full diff and conversation only after a change.
+
 Gitea has no native auto-merge. The auto-fixer acts with your `tea` login's permissions, and the limits above are enforced by its instructions, not by Gitea. A reported merge or close counts only when Gitea confirms it.
 
-The top of **My PRs** has **Auto-fix all** and **Auto-merge all**. When on, the plugin checks every five minutes and starts auto-fixers for your open pull requests that have none. The same bar picks the model for new auto-fixers.
+The top of **My PRs** has **Auto-fix all** and **Auto-merge all**. When on, the plugin checks every 30 seconds and starts auto-fixers for your open pull requests that have none. The same bar picks the model for new auto-fixers.
 
 ## CLI
 
@@ -88,6 +90,7 @@ bb gitea agent-execution [<provider> <model> <reasoning> [fast|default] | defaul
 bb gitea thread <thread-id>
 bb gitea auto-fix|auto-merge <owner/repo> <number> on|off
 bb gitea auto-fixer-status|auto-fixer-retry <owner/repo> <number>
+bb gitea pr-watch <owner/repo> <number> [--since token] [--timeout seconds]
 bb gitea auto-fixer-thread <thread-id>
 bb gitea auto-fixers
 bb gitea automation-defaults [fix|merge on|off]

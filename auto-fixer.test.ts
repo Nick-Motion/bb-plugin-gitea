@@ -18,6 +18,8 @@ import {
   parseMarker,
   parseStoredPreferences,
   parseStoredSession,
+  pullSignal,
+  signalToken,
   stopped,
   type AutoFixerPolicy,
   type AutoFixerSession,
@@ -550,5 +552,64 @@ describe("Auto-fix and Auto-merge policy", () => {
         { merge: true },
       ),
     ).toEqual({ kind: "start", policy: { fix: false, merge: true } });
+  });
+});
+
+describe("pull change signal", () => {
+  const pull = {
+    state: "open",
+    merged: false,
+    head: { sha: "a".repeat(40) },
+    base: { sha: "b".repeat(40) },
+    mergeable: true,
+    updated_at: now,
+    comments: 2,
+    review_comments: 1,
+    body: "long description",
+  };
+  const combined = {
+    state: "pending",
+    statuses: [
+      { context: "lint", status: "success", updated_at: now },
+      { context: "test", status: "pending", updated_at: now },
+    ],
+  };
+  const token = (p: unknown, c: unknown) => signalToken(pullSignal(p, c));
+
+  it("changes with the head, comments, mergeability, or CI and ignores unrelated fields", () => {
+    const base = token(pull, combined);
+    expect(token({ ...pull, body: "edited" }, combined)).toBe(base);
+    expect(
+      token(pull, { ...combined, statuses: [...combined.statuses].reverse() }),
+    ).toBe(base);
+    expect(
+      token({ ...pull, head: { sha: "c".repeat(40) } }, combined),
+    ).not.toBe(base);
+    expect(token({ ...pull, review_comments: 2 }, combined)).not.toBe(base);
+    expect(token({ ...pull, mergeable: false }, combined)).not.toBe(base);
+    expect(
+      token(pull, {
+        state: "failure",
+        statuses: [
+          combined.statuses[0],
+          { context: "test", status: "failure", updated_at: now },
+        ],
+      }),
+    ).not.toBe(base);
+  });
+
+  it("tells idle auto-fixers to wait with pr-watch instead of sleeping", () => {
+    const prompt = buildAutoFixerPrompt({
+      repo: "acme/widgets",
+      number: 42,
+      title: "Fix it",
+      baseUrl: "https://gitea.example/",
+      login: "work",
+      policy: { fix: true, merge: false },
+    });
+    expect(prompt).toContain(
+      "bb gitea pr-watch acme/widgets 42 --since <token>",
+    );
+    expect(prompt).not.toMatch(/sleep \d/);
   });
 });

@@ -44,7 +44,8 @@ Turning either on starts an auto-fixer: a hidden BB thread in the repository's p
 - `bb gitea auto-fixer-retry <owner/repo> <number>` resumes a failed or needs-you auto-fixer in its thread with its last switches, or in a new thread if the old one was deleted. It rejects stopped, closed, and missing sessions; turn a switch on instead.
 - `bb gitea auto-fixer-thread <thread-id>` shows the session owned by a thread.
 - `bb gitea auto-fixers` lists sessions.
-- `bb gitea automation-defaults [fix|merge on|off]` shows or sets Auto-fix all and Auto-merge all. When on, every five minutes the plugin turns the switch on for your open pull requests in project-backed repositories that have no session or only a closed one.
+- `bb gitea automation-defaults [fix|merge on|off]` shows or sets Auto-fix all and Auto-merge all. When on, every 30 seconds the plugin turns the switch on for your open pull requests in project-backed repositories that have no session or only a closed one.
+- `bb gitea pr-watch <owner/repo> <number> [--since token] [--timeout seconds]` waits for a cheap change signal: the pull request record (state, head, base, mergeability, update time, comment counts) and the combined head commit status, checked every 30 seconds for up to 240 seconds (at most 600). It prints `changed`, `unchanged`, or `inactive` (the auto-fixer session is no longer watching) and a token for the next `--since`. Auto-fixers use it instead of rereading the full diff and conversation.
 - `bb gitea auto-fixer-execution <provider> <model> <reasoning> [fast|default]` sets the model for new auto-fixers.
 
 ## RPCs

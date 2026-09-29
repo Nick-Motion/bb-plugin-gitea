@@ -36,6 +36,12 @@ import {
   autoFixerView,
   autoFixerViewSchema,
   buildAutoFixerPrompt,
+  describeSignal,
+  pullSignal,
+  pullWatchDefaultTimeoutMs,
+  pullWatchIntervalMs,
+  pullWatchMaxTimeoutMs,
+  signalToken,
   confirmedTerminal,
   decideAutomation,
   decideRetry,
@@ -1472,7 +1478,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
   const autoFixerPrefix = "auto-fixer:";
-  const autoFixerIntervalMs = 5 * 60_000;
+  const autoFixerIntervalMs = 30_000;
   const autoFixerKey = (repo: string, number: number) =>
     `${autoFixerPrefix}${pullKey(repo, number)}`;
   const autoFixerThreadKey = (threadId: string) =>
@@ -1628,6 +1634,49 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       if (signal?.aborted) throw error;
       return { state: "unknown", error: message(error) };
+    }
+  }
+
+  async function readSignal(repo: string, number: number) {
+    const pull = await api(repoPath(repo, `pulls/${number}`));
+    const head = pullSignal(pull, null).head;
+    const combined = head
+      ? await api(
+          repoPath(repo, `commits/${encodeURIComponent(head)}/status`),
+        ).catch((error: unknown) => {
+          if (error instanceof GiteaAccessError) throw error;
+          return null;
+        })
+      : null;
+    return pullSignal(pull, combined);
+  }
+
+  /** Waits for a cheap pull request change signal, so auto-fixers reread full state only when it moves. */
+  async function watchPull(
+    repo: string,
+    number: number,
+    since: string | null,
+    timeoutMs: number,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const signal = await readSignal(repo, number);
+      const token = signalToken(signal);
+      const session = await getSession(repo, number);
+      const result = {
+        token,
+        signal,
+        session: session?.status ?? null,
+      } as const;
+      if (since === null || token !== since)
+        return { ...result, outcome: "changed" as const };
+      if (signal.merged || signal.state !== "open")
+        return { ...result, outcome: "changed" as const };
+      if (session !== null && session.status !== "watching")
+        return { ...result, outcome: "inactive" as const };
+      if (Date.now() + pullWatchIntervalMs > deadline)
+        return { ...result, outcome: "unchanged" as const };
+      await new Promise((resolve) => setTimeout(resolve, pullWatchIntervalMs));
     }
   }
 
@@ -2931,17 +2980,35 @@ export default async function plugin(bb: BbPluginApi) {
         usage:
           "bb gitea auto-fixer-execution <provider> <model> <reasoning> [fast|default] [--json]",
       },
+      {
+        name: "pr-watch",
+        summary:
+          "Wait up to a few minutes for a cheap pull request or CI change signal",
+        usage:
+          "bb gitea pr-watch <owner/repo> <number> [--since token] [--timeout seconds] [--json]",
+      },
     ],
     async run(argv) {
       const args = [...argv];
       const json = args.includes("--json");
       const stateIndex = args.indexOf("--state"),
         queryIndex = args.indexOf("--query"),
-        bodyIndex = args.indexOf("--body");
+        bodyIndex = args.indexOf("--body"),
+        sinceIndex = args.indexOf("--since"),
+        timeoutIndex = args.indexOf("--timeout");
       const state = stateIndex >= 0 ? args[stateIndex + 1] : "open";
       const query = queryIndex >= 0 ? args[queryIndex + 1] : "";
       const bodyOption = bodyIndex >= 0 ? args[bodyIndex + 1] : "";
-      for (const index of [stateIndex, queryIndex, bodyIndex]
+      const since = sinceIndex >= 0 ? (args[sinceIndex + 1] ?? null) : null;
+      const timeoutOption =
+        timeoutIndex >= 0 ? args[timeoutIndex + 1] : undefined;
+      for (const index of [
+        stateIndex,
+        queryIndex,
+        bodyIndex,
+        sinceIndex,
+        timeoutIndex,
+      ]
         .filter((value) => value >= 0)
         .sort((a, b) => b - a))
         args.splice(index, 2);
@@ -3206,6 +3273,28 @@ export default async function plugin(bb: BbPluginApi) {
           return succeed(
             value,
             `Auto-fixer for ${input.repo}#${input.number} is thread ${value.threadId}`,
+          );
+        }
+        if (command === "pr-watch") {
+          const input = pullRef();
+          const timeoutMs =
+            timeoutOption === undefined
+              ? pullWatchDefaultTimeoutMs
+              : z.coerce
+                  .number()
+                  .int()
+                  .min(0)
+                  .max(pullWatchMaxTimeoutMs / 1000)
+                  .parse(timeoutOption) * 1000;
+          const value = await watchPull(
+            input.repo,
+            input.number,
+            since,
+            timeoutMs,
+          );
+          return succeed(
+            value,
+            `${value.outcome} ${value.token}\n${describeSignal(value.signal)}${value.session ? `\nauto-fixer ${value.session}` : ""}`,
           );
         }
         if (command === "auto-fixer-status") {
