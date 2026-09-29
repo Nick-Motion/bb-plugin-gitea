@@ -22,7 +22,7 @@
   },
   "include": [
     "server.ts",
-    "babysitter.ts",
+    "auto-fixer.ts",
     "pull-diff.ts",
     "display-cache.ts",
     "pull-files-view.ts",

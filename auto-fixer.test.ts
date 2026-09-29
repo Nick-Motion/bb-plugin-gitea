@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   activePolicy,
   autoStartTargets,
-  babysitPolicySchema,
-  babysitSessionSchema,
-  babysitView,
-  buildBabysitterPrompt,
+  autoFixerPolicySchema,
+  autoFixerSessionSchema,
+  autoFixerView,
+  buildAutoFixerPrompt,
   decideAutomation,
   decideRetry,
   decideStart,
@@ -19,12 +19,12 @@ import {
   parseStoredPreferences,
   parseStoredSession,
   stopped,
-  type BabysitPolicy,
-  type BabysitSession,
-} from "./babysitter";
+  type AutoFixerPolicy,
+  type AutoFixerSession,
+} from "./auto-fixer";
 
 const now = "2026-09-28T00:00:00Z";
-const watching: BabysitSession = {
+const watching: AutoFixerSession = {
   repo: "acme/widgets",
   number: 42,
   threadId: "thread-1",
@@ -65,14 +65,14 @@ describe("parseLifecycle", () => {
 
 describe("parseMarker", () => {
   it("accepts one distinct marker only", () => {
-    expect(parseMarker("done\nBB_GITEA_BABYSIT: MERGED")).toBe("merged");
+    expect(parseMarker("done\nBB_GITEA_AUTO_FIX: MERGED")).toBe("merged");
     expect(
-      parseMarker("BB_GITEA_BABYSIT: MERGED\nBB_GITEA_BABYSIT: MERGED"),
+      parseMarker("BB_GITEA_AUTO_FIX: MERGED\nBB_GITEA_AUTO_FIX: MERGED"),
     ).toBe("merged");
     expect(
-      parseMarker("BB_GITEA_BABYSIT: MERGED\nBB_GITEA_BABYSIT: FAILED"),
+      parseMarker("BB_GITEA_AUTO_FIX: MERGED\nBB_GITEA_AUTO_FIX: FAILED"),
     ).toBeNull();
-    expect(parseMarker("BB_GITHUB_BABYSIT: MERGED")).toBeNull();
+    expect(parseMarker("BB_GITHUB_AUTO_FIXER: MERGED")).toBeNull();
     expect(parseMarker(null)).toBeNull();
   });
 });
@@ -111,7 +111,7 @@ describe("decisions", () => {
   });
 
   it("replaces a closed session only when Gitea reports the pull request open again", () => {
-    const closedSession: BabysitSession = {
+    const closedSession: AutoFixerSession = {
       ...watching,
       status: "closed",
       closedAt: now,
@@ -184,7 +184,7 @@ describe("decisions", () => {
 describe("transitions", () => {
   it("trusts Gitea's terminal state over the agent marker", () => {
     expect(
-      onIdle(watching, "BB_GITEA_BABYSIT: NEEDS_YOU", merged, now),
+      onIdle(watching, "BB_GITEA_AUTO_FIX: NEEDS_YOU", merged, now),
     ).toEqual({
       repo: "acme/widgets",
       number: 42,
@@ -195,7 +195,7 @@ describe("transitions", () => {
       mergedAt: merged.mergedAt,
     });
     expect(
-      onIdle(watching, "BB_GITEA_BABYSIT: MERGED", closed, now),
+      onIdle(watching, "BB_GITEA_AUTO_FIX: MERGED", closed, now),
     ).toMatchObject({
       status: "failed",
       error: "Gitea reported CLOSED, not MERGED.",
@@ -204,7 +204,7 @@ describe("transitions", () => {
 
   it("fails an unconfirmed terminal marker and records human requests", () => {
     expect(
-      onIdle(watching, "BB_GITEA_BABYSIT: MERGED", open, now),
+      onIdle(watching, "BB_GITEA_AUTO_FIX: MERGED", open, now),
     ).toMatchObject({
       status: "failed",
       error:
@@ -212,15 +212,20 @@ describe("transitions", () => {
       cleanupPending: false,
     });
     expect(
-      onIdle(watching, "Need a token.\nBB_GITEA_BABYSIT: NEEDS_YOU", open, now),
+      onIdle(
+        watching,
+        "Need a token.\nBB_GITEA_AUTO_FIX: NEEDS_YOU",
+        open,
+        now,
+      ),
     ).toMatchObject({
       status: "needs_you",
-      note: "Need a token.\nBB_GITEA_BABYSIT: NEEDS_YOU",
+      note: "Need a token.\nBB_GITEA_AUTO_FIX: NEEDS_YOU",
     });
     expect(
       onIdle(
         watching,
-        "BB_GITEA_BABYSIT: CLOSED",
+        "BB_GITEA_AUTO_FIX: CLOSED",
         { state: "unknown", error: "HTTP 500" },
         now,
       ),
@@ -231,19 +236,19 @@ describe("transitions", () => {
     expect(onIdle(watching, "  ", open, now)).toMatchObject({
       status: "failed",
       error:
-        "Babysitter turn ended without a terminal marker or a confirmed Gitea terminal state.",
+        "Auto-fixer turn ended without a terminal marker or a confirmed Gitea terminal state.",
     });
   });
 
   it("ignores lifecycle events for sessions that are no longer watching", () => {
     const halted = stopped(watching, now, false);
-    expect(onIdle(halted, "BB_GITEA_BABYSIT: MERGED", merged, now)).toBeNull();
+    expect(onIdle(halted, "BB_GITEA_AUTO_FIX: MERGED", merged, now)).toBeNull();
     expect(onFailed(halted, "boom", now)).toBeNull();
     expect(onArchived(halted, now)).toBeNull();
     expect(onArchived(watching, now)).toMatchObject({ status: "stopped" });
     expect(onFailed(watching, null, now)).toMatchObject({
       status: "failed",
-      error: "Gitea babysitter thread failed.",
+      error: "Gitean auto-fixer thread failed.",
     });
   });
 
@@ -258,7 +263,7 @@ describe("transitions", () => {
 
   it("clips long messages to a valid session", () => {
     const next = onFailed(watching, "x".repeat(10_000), now)!;
-    expect(babysitSessionSchema.parse(next)).toMatchObject({
+    expect(autoFixerSessionSchema.parse(next)).toMatchObject({
       status: "failed",
     });
     expect(next.status === "failed" && next.error.length).toBe(4000);
@@ -268,30 +273,30 @@ describe("transitions", () => {
 describe("views and automation", () => {
   it("offers only the actions each state and current Gitea fact supports", () => {
     const openFacts = { lifecycle: open, projectId: "p1" };
-    const closedSession: BabysitSession = {
+    const closedSession: AutoFixerSession = {
       ...watching,
       status: "closed",
       closedAt: now,
     };
-    expect(babysitView(null, openFacts).actions).toEqual(["start"]);
+    expect(autoFixerView(null, openFacts).actions).toEqual(["start"]);
     expect(
-      babysitView(null, { ...openFacts, projectId: null }).actions,
+      autoFixerView(null, { ...openFacts, projectId: null }).actions,
     ).toEqual([]);
-    expect(babysitView(null, null).actions).toEqual([]);
-    expect(babysitView(watching, openFacts).actions).toEqual(["stop"]);
+    expect(autoFixerView(null, null).actions).toEqual([]);
+    expect(autoFixerView(watching, openFacts).actions).toEqual(["stop"]);
     expect(
-      babysitView(stopped(watching, now, false), openFacts).actions,
+      autoFixerView(stopped(watching, now, false), openFacts).actions,
     ).toEqual(["start"]);
     expect(
-      babysitView({ ...watching, status: "merged", mergedAt: now }, openFacts)
+      autoFixerView({ ...watching, status: "merged", mergedAt: now }, openFacts)
         .actions,
     ).toEqual([]);
-    expect(babysitView(closedSession, openFacts).actions).toEqual(["start"]);
+    expect(autoFixerView(closedSession, openFacts).actions).toEqual(["start"]);
     expect(
-      babysitView(closedSession, { ...openFacts, lifecycle: closed }).actions,
+      autoFixerView(closedSession, { ...openFacts, lifecycle: closed }).actions,
     ).toEqual([]);
     expect(
-      babysitView(closedSession, {
+      autoFixerView(closedSession, {
         ...openFacts,
         lifecycle: { state: "unknown", error: "HTTP 500" },
       }).actions,
@@ -325,7 +330,7 @@ describe("views and automation", () => {
           pull("acme/widgets", 9),
         ],
         projects: new Map([["acme/widgets", "p1"]]),
-        sessions: new Map<string, BabysitSession>([
+        sessions: new Map<string, AutoFixerSession>([
           ["acme/widgets#6", { ...watching, number: 6 }],
           [
             "acme/widgets#7",
@@ -350,7 +355,7 @@ describe("views and automation", () => {
   });
 
   it("instructs tea with explicit flags and never enables a Gitea auto-merge", () => {
-    const prompt = buildBabysitterPrompt({
+    const prompt = buildAutoFixerPrompt({
       repo: "acme/widgets",
       number: 42,
       title: "Fix it",
@@ -372,8 +377,8 @@ describe("views and automation", () => {
   });
 
   it("grants code changes only with Auto-fix and merging only with Auto-merge", () => {
-    const prompt = (policy: BabysitPolicy) =>
-      buildBabysitterPrompt({
+    const prompt = (policy: AutoFixerPolicy) =>
+      buildAutoFixerPrompt({
         repo: "acme/widgets",
         number: 42,
         title: "Fix it",
@@ -413,74 +418,31 @@ describe("Auto-fix and Auto-merge policy", () => {
       merge: true,
     });
     expect(
-      babysitPolicySchema.safeParse({ fix: false, merge: false }).success,
+      autoFixerPolicySchema.safeParse({ fix: false, merge: false }).success,
     ).toBe(false);
     expect(
-      babysitSessionSchema.safeParse({
+      autoFixerSessionSchema.safeParse({
         ...watching,
         policy: { fix: false, merge: false },
       }).success,
     ).toBe(false);
   });
 
-  it("reads legacy sessions with their original fix-and-merge authority", () => {
-    const { policy: _policy, ...legacy } = watching;
-    expect(parseStoredSession(legacy)).toEqual(watching);
-    expect(
-      parseStoredSession({ ...watching, policy: { fix: false, merge: true } }),
-    ).toEqual({ ...watching, policy: { fix: false, merge: true } });
-    expect(parseStoredSession({ status: "watching" })).toBeNull();
-    const { cleanupPending: _pending, ...legacyStopped } = stopped(
-      watching,
-      now,
-      false,
-    );
-    expect(parseStoredSession(legacyStopped)).toEqual(
-      stopped(watching, now, false),
-    );
-  });
-
-  it("maps legacy automatic babysitting to both automatic options without losing execution", () => {
-    const execution = {
-      providerId: "claude",
-      model: "claude-sonnet-5",
-      reasoningLevel: "high",
-      serviceTier: "fast",
-    } as const;
-    expect(parseStoredPreferences({ autoBabysit: false, execution })).toEqual({
-      autoFix: false,
-      autoMerge: false,
-      execution,
-    });
-    expect(parseStoredPreferences({ autoBabysit: true, execution })).toEqual({
-      autoFix: true,
-      autoMerge: true,
-      execution,
-    });
-    expect(
-      parseStoredPreferences({ autoFix: false, autoMerge: true, execution }),
-    ).toEqual({ autoFix: false, autoMerge: true, execution });
-    expect(parseStoredPreferences(undefined)).toMatchObject({
-      autoFix: false,
-      autoMerge: false,
-    });
-  });
-
   it("shows automation as on only while a session is live or waiting on you", () => {
-    const fixOnly: BabysitSession = {
+    const fixOnly: AutoFixerSession = {
       ...watching,
       policy: { fix: true, merge: false },
     };
-    expect(babysitView(null, null).automation).toEqual({
+    expect(autoFixerView(null, null).automation).toEqual({
       fix: false,
       merge: false,
     });
-    expect(babysitView(fixOnly, null).automation).toEqual({
+    expect(autoFixerView(fixOnly, null).automation).toEqual({
       fix: true,
       merge: false,
     });
     expect(
-      babysitView({ ...fixOnly, status: "needs_you", note: "" }, null)
+      autoFixerView({ ...fixOnly, status: "needs_you", note: "" }, null)
         .automation,
     ).toEqual({ fix: true, merge: false });
     for (const retained of [
@@ -488,7 +450,7 @@ describe("Auto-fix and Auto-merge policy", () => {
       { ...fixOnly, status: "merged" as const, mergedAt: now },
       { ...fixOnly, status: "closed" as const, closedAt: now },
     ])
-      expect(babysitView(retained, null).automation).toEqual({
+      expect(autoFixerView(retained, null).automation).toEqual({
         fix: false,
         merge: false,
       });
@@ -531,7 +493,7 @@ describe("Auto-fix and Auto-merge policy", () => {
   });
 
   it("patches one option and keeps the other", () => {
-    const mergeOnly: BabysitSession = {
+    const mergeOnly: AutoFixerSession = {
       ...watching,
       policy: { fix: false, merge: true },
     };
@@ -552,7 +514,7 @@ describe("Auto-fix and Auto-merge policy", () => {
       kind: "start",
       policy: { fix: false, merge: true },
     });
-    const failed: BabysitSession = {
+    const failed: AutoFixerSession = {
       ...watching,
       status: "failed",
       error: "x",
@@ -570,7 +532,7 @@ describe("Auto-fix and Auto-merge policy", () => {
   });
 
   it("never re-enables a merged pull request and replaces a closed session", () => {
-    const mergedSession: BabysitSession = {
+    const mergedSession: AutoFixerSession = {
       ...watching,
       status: "merged",
       mergedAt: now,

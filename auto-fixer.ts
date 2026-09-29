@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const babysitExecutionSchema = z
+export const autoFixerExecutionSchema = z
   .object({
     providerId: z.string().min(1),
     model: z.string().min(1),
@@ -17,11 +17,11 @@ export const babysitExecutionSchema = z
     serviceTier: z.enum(["fast", "default"]),
   })
   .strict();
-export const babysitPolicySchema = z.union([
+export const autoFixerPolicySchema = z.union([
   z.object({ fix: z.literal(true), merge: z.boolean() }).strict(),
   z.object({ fix: z.literal(false), merge: z.literal(true) }).strict(),
 ]);
-export type BabysitPolicy = z.infer<typeof babysitPolicySchema>;
+export type AutoFixerPolicy = z.infer<typeof autoFixerPolicySchema>;
 export const automationSchema = z
   .object({ fix: z.boolean(), merge: z.boolean() })
   .strict();
@@ -40,10 +40,9 @@ export const automationPatchSchema = z
   .strict()
   .refine(...setsAutomationOption);
 export type AutomationPatch = z.infer<typeof automationPatchSchema>;
-const legacyPolicy: BabysitPolicy = { fix: true, merge: true };
 const automationOff: Automation = { fix: false, merge: false };
 
-export function activePolicy(automation: Automation): BabysitPolicy | null {
+export function activePolicy(automation: Automation): AutoFixerPolicy | null {
   if (automation.fix) return { fix: true, merge: automation.merge };
   return automation.merge ? { fix: false, merge: true } : null;
 }
@@ -58,28 +57,15 @@ export function applyAutomationPatch(
   };
 }
 
-export const babysitPreferencesSchema = z
+export const autoFixerPreferencesSchema = z
   .object({
     autoFix: z.boolean(),
     autoMerge: z.boolean(),
-    execution: babysitExecutionSchema,
+    execution: autoFixerExecutionSchema,
   })
   .strict();
-export type BabysitPreferences = z.infer<typeof babysitPreferencesSchema>;
-const storedPreferencesSchema = z.union([
-  babysitPreferencesSchema,
-  z
-    .object({ autoBabysit: z.boolean(), execution: babysitExecutionSchema })
-    .strict()
-    .transform(
-      ({ autoBabysit, execution }): BabysitPreferences => ({
-        autoFix: autoBabysit,
-        autoMerge: autoBabysit,
-        execution,
-      }),
-    ),
-]);
-export const defaultBabysitPreferences: BabysitPreferences = {
+export type AutoFixerPreferences = z.infer<typeof autoFixerPreferencesSchema>;
+export const defaultAutoFixerPreferences: AutoFixerPreferences = {
   autoFix: false,
   autoMerge: false,
   execution: {
@@ -95,9 +81,9 @@ const sessionBase = z.object({
   number: z.number().int().positive(),
   threadId: z.string().min(1),
   updatedAt: z.string().min(1),
-  policy: babysitPolicySchema,
+  policy: autoFixerPolicySchema,
 });
-export const babysitSessionSchema = z.discriminatedUnion("status", [
+export const autoFixerSessionSchema = z.discriminatedUnion("status", [
   sessionBase.extend({ status: z.literal("watching") }),
   sessionBase.extend({ status: z.literal("needs_you"), note: z.string() }),
   sessionBase.extend({
@@ -112,32 +98,21 @@ export const babysitSessionSchema = z.discriminatedUnion("status", [
     cleanupPending: z.boolean(),
   }),
 ]);
-export type BabysitSession = z.infer<typeof babysitSessionSchema>;
-function upgradeStoredSession(raw: unknown): unknown {
-  if (typeof raw !== "object" || raw === null) return raw;
-  const upgraded = "policy" in raw ? raw : { ...raw, policy: legacyPolicy };
-  return "status" in upgraded &&
-    upgraded.status === "stopped" &&
-    !("cleanupPending" in upgraded)
-    ? { ...upgraded, cleanupPending: false }
-    : upgraded;
-}
-const storedSessionSchema = z.preprocess(
-  upgradeStoredSession,
-  babysitSessionSchema,
-);
+export type AutoFixerSession = z.infer<typeof autoFixerSessionSchema>;
 
-export function parseStoredSession(raw: unknown): BabysitSession | null {
-  const parsed = storedSessionSchema.safeParse(raw);
+export function parseStoredSession(raw: unknown): AutoFixerSession | null {
+  const parsed = autoFixerSessionSchema.safeParse(raw);
   return parsed.success ? parsed.data : null;
 }
 
-export function parseStoredPreferences(raw: unknown): BabysitPreferences {
-  const parsed = storedPreferencesSchema.safeParse(raw);
-  return parsed.success ? parsed.data : defaultBabysitPreferences;
+export function parseStoredPreferences(raw: unknown): AutoFixerPreferences {
+  const parsed = autoFixerPreferencesSchema.safeParse(raw);
+  return parsed.success ? parsed.data : defaultAutoFixerPreferences;
 }
 
-export function sessionAutomation(session: BabysitSession | null): Automation {
+export function sessionAutomation(
+  session: AutoFixerSession | null,
+): Automation {
   switch (session?.status) {
     case "watching":
     case "needs_you":
@@ -148,23 +123,23 @@ export function sessionAutomation(session: BabysitSession | null): Automation {
   }
 }
 
-export type BabysitAction = "start" | "stop" | "retry";
+export type AutoFixerAction = "start" | "stop" | "retry";
 const actionsSchema = z.object({
   actions: z.array(z.enum(["start", "stop", "retry"])),
   automation: automationSchema,
 });
-export const babysitSessionViewSchema = z.intersection(
-  babysitSessionSchema,
+export const autoFixerSessionViewSchema = z.intersection(
+  autoFixerSessionSchema,
   actionsSchema,
 );
-export const babysitViewSchema = z.intersection(
+export const autoFixerViewSchema = z.intersection(
   z.discriminatedUnion("status", [
     z.object({ status: z.literal("idle") }),
-    ...babysitSessionSchema.options,
+    ...autoFixerSessionSchema.options,
   ]),
   actionsSchema,
 );
-export type BabysitView = z.infer<typeof babysitViewSchema>;
+export type AutoFixerView = z.infer<typeof autoFixerViewSchema>;
 
 export type PullLifecycle =
   | { state: "open" }
@@ -174,7 +149,7 @@ export type LifecycleFact = PullLifecycle | { state: "unknown"; error: string };
 
 type Marker = "merged" | "closed" | "needs_you" | "failed";
 const maxMessageLength = 4000;
-export const giteaBabysitterTitlePrefix = "Gitea babysitter:";
+export const giteaAutoFixerTitlePrefix = "Gitea auto-fixer:";
 
 function clip(value: string) {
   return value.length > maxMessageLength
@@ -205,13 +180,13 @@ export function parseLifecycle(raw: unknown): PullLifecycle | null {
 export function parseMarker(text: string | null): Marker | null {
   const found = [
     ...(text ?? "").matchAll(
-      /BB_GITEA_BABYSIT:\s*(MERGED|CLOSED|NEEDS_YOU|FAILED)\b/g,
+      /BB_GITEA_AUTO_FIX:\s*(MERGED|CLOSED|NEEDS_YOU|FAILED)\b/g,
     ),
   ].map((match) => match[1]!.toLowerCase() as Marker);
   return new Set(found).size === 1 ? found[0]! : null;
 }
 
-export function sessionActions(session: BabysitSession): BabysitAction[] {
+export function sessionActions(session: AutoFixerSession): AutoFixerAction[] {
   switch (session.status) {
     case "watching":
       return ["stop"];
@@ -234,18 +209,18 @@ export type StartRejection = "merged" | "closed" | "no-project";
 
 export function startError(key: string, reason: StartRejection): string {
   return reason === "no-project"
-    ? `Cannot babysit ${key}: no BB project has a checkout of this repository.`
-    : `Cannot babysit ${key}: the pull request is ${reason}.`;
+    ? `Cannot auto-fix ${key}: no BB project has a checkout of this repository.`
+    : `Cannot auto-fix ${key}: the pull request is ${reason}.`;
 }
 
-type ClosedSession = Extract<BabysitSession, { status: "closed" }>;
+type ClosedSession = Extract<AutoFixerSession, { status: "closed" }>;
 export type StartDecision =
   | { kind: "existing"; threadId: string }
   | { kind: "spawn"; projectId: string; replaces: ClosedSession | null }
   | { kind: "reject"; reason: StartRejection };
 
 export function decideStart(input: {
-  session: BabysitSession | null;
+  session: AutoFixerSession | null;
   projectId: string | null;
   lifecycle: PullLifecycle;
 }): StartDecision {
@@ -259,11 +234,11 @@ export function decideStart(input: {
   return { kind: "spawn", projectId: input.projectId, replaces: session };
 }
 
-export function babysitView(
-  session: BabysitSession | null,
+export function autoFixerView(
+  session: AutoFixerSession | null,
   facts: { lifecycle: LifecycleFact; projectId: string | null } | null,
-): BabysitView {
-  const start: BabysitAction[] =
+): AutoFixerView {
+  const start: AutoFixerAction[] =
     facts !== null &&
     facts.lifecycle.state !== "unknown" &&
     decideStart({
@@ -283,7 +258,7 @@ export function babysitView(
       };
 }
 
-export function sessionView(session: BabysitSession) {
+export function sessionView(session: AutoFixerSession) {
   return {
     ...session,
     actions: sessionActions(session),
@@ -294,19 +269,19 @@ export function sessionView(session: BabysitSession) {
 export type AutomationDecision =
   | { kind: "unchanged" }
   | { kind: "stop" }
-  | { kind: "start"; policy: BabysitPolicy }
-  | { kind: "update"; session: WatchingSession; policy: BabysitPolicy }
+  | { kind: "start"; policy: AutoFixerPolicy }
+  | { kind: "update"; session: WatchingSession; policy: AutoFixerPolicy }
   | {
       kind: "resume";
       session: ResumableSession;
-      policy: BabysitPolicy;
+      policy: AutoFixerPolicy;
       cleanupFirst: boolean;
     }
   | { kind: "reject"; reason: "merged" };
-type WatchingSession = Extract<BabysitSession, { status: "watching" }>;
+type WatchingSession = Extract<AutoFixerSession, { status: "watching" }>;
 
 export function decideAutomation(
-  session: BabysitSession | null,
+  session: AutoFixerSession | null,
   patch: AutomationPatch,
 ): AutomationDecision {
   const policy = activePolicy(
@@ -329,7 +304,7 @@ export function decideAutomation(
       };
 }
 
-function samePolicy(left: BabysitPolicy, right: BabysitPolicy): boolean {
+function samePolicy(left: AutoFixerPolicy, right: AutoFixerPolicy): boolean {
   return left.fix === right.fix && left.merge === right.merge;
 }
 
@@ -338,15 +313,15 @@ export type RetryDecision =
   | { kind: "reject"; reason: "merged" | "inactive" }
   | {
       kind: "resume";
-      session: Extract<BabysitSession, { status: "needs_you" | "failed" }>;
+      session: Extract<AutoFixerSession, { status: "needs_you" | "failed" }>;
       cleanupFirst: boolean;
     };
 export type ResumableSession = Extract<
-  BabysitSession,
+  AutoFixerSession,
   { status: "needs_you" | "failed" | "stopped" }
 >;
 
-export function decideRetry(session: BabysitSession | null): RetryDecision {
+export function decideRetry(session: AutoFixerSession | null): RetryDecision {
   switch (session?.status) {
     case undefined:
     case "closed":
@@ -368,8 +343,8 @@ export function decideRetry(session: BabysitSession | null): RetryDecision {
 }
 
 export function decideStop(
-  session: BabysitSession | null,
-): Exclude<BabysitSession, { status: "merged" | "closed" }> | null {
+  session: AutoFixerSession | null,
+): Exclude<AutoFixerSession, { status: "merged" | "closed" }> | null {
   switch (session?.status) {
     case "watching":
     case "needs_you":
@@ -382,7 +357,7 @@ export function decideStop(
   }
 }
 
-function retained(session: BabysitSession, now: string) {
+function retained(session: AutoFixerSession, now: string) {
   return {
     repo: session.repo,
     number: session.number,
@@ -393,10 +368,10 @@ function retained(session: BabysitSession, now: string) {
 }
 
 function terminal(
-  session: BabysitSession,
+  session: AutoFixerSession,
   lifecycle: Exclude<PullLifecycle, { state: "open" }>,
   now: string,
-): BabysitSession {
+): AutoFixerSession {
   const base = retained(session, now);
   return lifecycle.state === "merged"
     ? { ...base, status: "merged", mergedAt: lifecycle.mergedAt }
@@ -404,11 +379,11 @@ function terminal(
 }
 
 function failed(
-  session: BabysitSession,
+  session: AutoFixerSession,
   error: string,
   now: string,
   cleanupPending = false,
-): BabysitSession {
+): AutoFixerSession {
   return {
     ...retained(session, now),
     status: "failed",
@@ -418,21 +393,21 @@ function failed(
 }
 
 export function confirmedTerminal(
-  session: BabysitSession,
+  session: AutoFixerSession,
   lifecycle: LifecycleFact,
   now: string,
-): BabysitSession | null {
+): AutoFixerSession | null {
   return lifecycle.state === "merged" || lifecycle.state === "closed"
     ? terminal(session, lifecycle, now)
     : null;
 }
 
 export function onIdle(
-  session: BabysitSession,
+  session: AutoFixerSession,
   lastText: string | null,
   lifecycle: LifecycleFact,
   now: string,
-): BabysitSession | null {
+): AutoFixerSession | null {
   if (session.status !== "watching") return null;
   const marker = parseMarker(lastText);
   const summary = lastText?.trim() ?? "";
@@ -453,7 +428,7 @@ export function onIdle(
       updatedAt: now,
     };
   if (marker === "failed")
-    return failed(session, summary || "Babysitter reported FAILED.", now);
+    return failed(session, summary || "Auto-fixer reported FAILED.", now);
   if (lifecycle.state === "unknown")
     return failed(
       session,
@@ -464,7 +439,7 @@ export function onIdle(
     return failed(
       session,
       summary ||
-        "Babysitter turn ended without a terminal marker or a confirmed Gitea terminal state.",
+        "Auto-fixer turn ended without a terminal marker or a confirmed Gitea terminal state.",
       now,
     );
   return failed(
@@ -475,27 +450,27 @@ export function onIdle(
 }
 
 export function onFailed(
-  session: BabysitSession,
+  session: AutoFixerSession,
   error: string | null,
   now: string,
-): BabysitSession | null {
+): AutoFixerSession | null {
   return session.status === "watching"
-    ? failed(session, error?.trim() || "Gitea babysitter thread failed.", now)
+    ? failed(session, error?.trim() || "Gitean auto-fixer thread failed.", now)
     : null;
 }
 
 export function onArchived(
-  session: BabysitSession,
+  session: AutoFixerSession,
   now: string,
-): BabysitSession | null {
+): AutoFixerSession | null {
   return session.status === "watching" ? stopped(session, now, false) : null;
 }
 
 export function onCleanupFailed(
-  session: BabysitSession,
+  session: AutoFixerSession,
   detail: string,
   now: string,
-): BabysitSession {
+): AutoFixerSession {
   if (session.status === "stopped")
     return { ...session, cleanupPending: true, updatedAt: now };
   const previous =
@@ -506,25 +481,25 @@ export function onCleanupFailed(
 }
 
 export function stopped(
-  session: BabysitSession,
+  session: AutoFixerSession,
   now: string,
   cleanupPending: boolean,
-): Extract<BabysitSession, { status: "stopped" }> {
+): Extract<AutoFixerSession, { status: "stopped" }> {
   return { ...retained(session, now), status: "stopped", cleanupPending };
 }
 
 export function watching(
-  session: BabysitSession,
-  policy: BabysitPolicy,
+  session: AutoFixerSession,
+  policy: AutoFixerPolicy,
   now: string,
-): BabysitSession {
+): AutoFixerSession {
   return { ...retained(session, now), policy, status: "watching" };
 }
 
 export function sameSession(
-  left: BabysitSession,
-  right: BabysitSession | null,
-): right is BabysitSession {
+  left: AutoFixerSession,
+  right: AutoFixerSession | null,
+): right is AutoFixerSession {
   return (
     right !== null &&
     right.repo === left.repo &&
@@ -542,7 +517,7 @@ export function autoStartTargets<
   login: string;
   pulls: T[];
   projects: Map<string, string>;
-  sessions: Map<string, BabysitSession>;
+  sessions: Map<string, AutoFixerSession>;
 }): T[] {
   return input.pulls.filter(
     (pull) =>
@@ -557,7 +532,7 @@ export function autoStartTargets<
 }
 
 function policyInstructions(
-  policy: BabysitPolicy,
+  policy: AutoFixerPolicy,
   flags: string,
   api: string,
   number: number,
@@ -584,19 +559,19 @@ function policyInstructions(
   return [...fix, ...merge];
 }
 
-export function buildBabysitterPrompt(input: {
+export function buildAutoFixerPrompt(input: {
   repo: string;
   number: number;
   title: string;
   baseUrl: string;
   login: string;
-  policy: BabysitPolicy;
+  policy: AutoFixerPolicy;
 }): string {
   const ref = `${input.repo}#${input.number}`;
   const flags = `--login ${input.login} --repo ${input.repo}`;
   const api = `tea api --login ${input.login} /api/v1/repos/${input.repo}`;
   return [
-    `You are the Gitea PR babysitter for ${ref}: ${input.title}`,
+    `You are the Gitea PR auto-fixer for ${ref}: ${input.title}`,
     `Gitea instance: ${input.baseUrl}`,
     "",
     "Use the existing checkout. Do not clone the repository or create a BB project.",
@@ -619,10 +594,10 @@ export function buildBabysitterPrompt(input: {
     "Stay in this turn until the PR is merged, closed, manually stopped, or requires a human.",
     "",
     "Your final response must contain exactly one of these markers:",
-    "BB_GITEA_BABYSIT: MERGED",
-    "BB_GITEA_BABYSIT: CLOSED",
-    "BB_GITEA_BABYSIT: NEEDS_YOU",
-    "BB_GITEA_BABYSIT: FAILED",
+    "BB_GITEA_AUTO_FIX: MERGED",
+    "BB_GITEA_AUTO_FIX: CLOSED",
+    "BB_GITEA_AUTO_FIX: NEEDS_YOU",
+    "BB_GITEA_AUTO_FIX: FAILED",
     "Use FAILED only for an execution failure.",
     "",
     `Start by running: tea pulls ${flags} --comments ${input.number}`,

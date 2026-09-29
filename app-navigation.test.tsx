@@ -61,7 +61,7 @@ function pull(number: number, title: string) {
     url: `https://gitea.example/acme/widgets/pulls/${number}`,
     body: "",
     updatedAt: "2026-09-28T12:00:00Z",
-    babysit: {
+    autoFixer: {
       status: "idle" as const,
       actions: ["start" as const],
       automation: { fix: false, merge: false },
@@ -105,8 +105,8 @@ async function watchScope() {
 async function visit(
   rows: string[],
   readiness: () =>
-    | Promise<ReturnType<typeof status>>
-    | ReturnType<typeof status> = () => status(),
+    Promise<ReturnType<typeof status>> | ReturnType<typeof status> = () =>
+    status(),
 ) {
   const slot = renderSlot(
     panel,
@@ -115,7 +115,7 @@ async function visit(
       settings,
       rpc: {
         status: readiness,
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: () => mine(rows),
       },
     },
@@ -192,7 +192,7 @@ it("repaints remembered My PRs rows at once after visiting a thread, then applie
       settings,
       rpc: {
         status: () => status(),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: (input: unknown) =>
           mine(
             ["Faster pages", "Tidy docs"].filter((title) =>
@@ -221,7 +221,7 @@ it("repaints remembered My PRs rows at once after visiting a thread, then applie
           await readiness.opened;
           return status();
         },
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: async () => {
           await list.opened;
           return mine(["Faster pages, rebased"]);
@@ -261,7 +261,7 @@ it("never shows another filter's rows and ignores a slower earlier filter reply"
     {
       rpc: {
         status: () => status(),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: async (input: unknown) => {
           const { query } = input as ListInput;
           if (query === "a") {
@@ -295,7 +295,7 @@ it("keeps rows through a failed background refresh and rereads only on a list ch
     {
       rpc: {
         status: () => status(),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: () => reply,
       },
     },
@@ -325,7 +325,7 @@ it("drops remembered rows for another account, forgotten display data, and a los
     {
       rpc: {
         status: () => status(),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: () => mine(["Work account row"]),
       },
     },
@@ -341,7 +341,7 @@ it("drops remembered rows for another account, forgotten display data, and a los
     {
       rpc: {
         status: () => status(ops),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: async () => {
           await list.opened;
           if (rejected)
@@ -386,7 +386,7 @@ it("drops remembered rows for another account, forgotten display data, and a los
     {
       rpc: {
         status: () => status(ops),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: () => new Promise<never>(() => {}),
       },
     },
@@ -418,7 +418,7 @@ it("never shows the previous account's rows when the server clears display data 
           await readiness.opened;
           return status(ops);
         },
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: async () => {
           await list.opened;
           return mine(["Ops account row"], ops);
@@ -452,7 +452,7 @@ it("never shows remembered rows after the plugin settings change while the panel
           await readiness.opened;
           return status();
         },
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: async () => {
           await list.opened;
           return mine(["Row with extra repos"]);
@@ -492,7 +492,7 @@ it.each(["server display invalidation", "settings change"])(
             }
             return status();
           },
-          getBabysitPreferences: () => preferences,
+          getAutoFixerPreferences: () => preferences,
           listMyPullRequests: async () => {
             listCallsCount += 1;
             if (listCallsCount === 1) {
@@ -538,7 +538,7 @@ it("forgets every remembered filter on an auth rejection and ignores a reply tha
       settings,
       rpc: {
         status: () => status(),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: (input: unknown) =>
           mine([`Filter "${(input as ListInput).query}" row`]),
       },
@@ -568,7 +568,7 @@ it("forgets every remembered filter on an auth rejection and ignores a reply tha
           await readiness.opened;
           return rejected;
         },
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: async () => {
           calls += 1;
           if (calls > 1) throw new Error(rejected.error);
@@ -600,7 +600,7 @@ it("forgets every remembered filter on an auth rejection and ignores a reply tha
       settings,
       rpc: {
         status: () => new Promise<never>(() => {}),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: () => new Promise<never>(() => {}),
       },
     },
@@ -629,7 +629,7 @@ it("confirms the account before repainting remembered rows after a realtime reco
           await readiness.opened;
           return status();
         },
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         listMyPullRequests: async () => {
           await list.opened;
           return mine(["Refreshed row"]);
@@ -678,7 +678,7 @@ it("hides a pull request from the previous display scope until it reloads", asyn
       settings,
       rpc: {
         status: () => status(),
-        getBabysitPreferences: () => preferences,
+        getAutoFixerPreferences: () => preferences,
         conversation: async () => {
           reads += 1;
           const shown = title;

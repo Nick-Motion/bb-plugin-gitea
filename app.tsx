@@ -71,11 +71,11 @@ type Loadable<T> =
 type Keyed<T> = { key: string; view: Loadable<T> };
 type MyPulls = PluginRpcResult<(typeof giteaRpcContract)["listMyPullRequests"]>;
 type Preferences = MyPulls["preferences"];
-type BabysitView = MyPulls["items"][number]["babysit"];
-type BabysitSessions = PluginRpcResult<
-  (typeof giteaRpcContract)["listBabysitSessions"]
+type AutoFixerView = MyPulls["items"][number]["autoFixer"];
+type AutoFixerSessions = PluginRpcResult<
+  (typeof giteaRpcContract)["listAutoFixerSessions"]
 >["sessions"];
-type View = "my-prs" | "babysitters" | "issues" | "pulls";
+type View = "my-prs" | "auto-fixers" | "issues" | "pulls";
 type DetailSection = "conversation" | "files";
 type Status = PluginRpcResult<(typeof giteaRpcContract)["status"]>;
 type ItemState = "open" | "closed" | "all";
@@ -88,7 +88,7 @@ type ListFilters = {
 type ItemList = {
   account: string;
   items: Item[];
-  babysits: Map<string, BabysitView>;
+  autoFixers: Map<string, AutoFixerView>;
   truncated: boolean;
   errors: Array<{ repo: string; message: string }>;
   freshness: Freshness;
@@ -317,7 +317,7 @@ function DisplayScopeWatch() {
 }
 
 function listKey({ view, state, repo, query }: ListFilters) {
-  return view === "babysitters"
+  return view === "auto-fixers"
     ? null
     : JSON.stringify([view, repo, state, query]);
 }
@@ -766,8 +766,8 @@ async function readItemList(
     return {
       account,
       items,
-      babysits: new Map(
-        items.map((item) => [itemKey(item), item.babysit] as const),
+      autoFixers: new Map(
+        items.map((item) => [itemKey(item), item.autoFixer] as const),
       ),
       truncated,
       errors,
@@ -778,7 +778,14 @@ async function readItemList(
     "listItems",
     { kind: view === "issues" ? "issue" : "pr", ...input },
   );
-  return { account, items, babysits: new Map(), truncated, errors, freshness };
+  return {
+    account,
+    items,
+    autoFixers: new Map(),
+    truncated,
+    errors,
+    freshness,
+  };
 }
 
 function useItemList(
@@ -1339,7 +1346,7 @@ function parseSubPath(
   };
 }
 
-const babysitLabels = {
+const autoFixerLabels = {
   idle: "off",
   watching: "running",
   needs_you: "needs you",
@@ -1364,7 +1371,7 @@ const automationToggles = [
   },
 ] as const;
 
-function babysitDetail(view: BabysitView) {
+function autoFixerDetail(view: AutoFixerView) {
   if (view.status === "failed") return view.error;
   if (view.status === "needs_you") return view.note;
   if (view.status === "stopped" && view.cleanupPending)
@@ -1372,7 +1379,7 @@ function babysitDetail(view: BabysitView) {
   return "";
 }
 
-function BabysitControls({
+function AutoFixerControls({
   repo,
   number,
   view,
@@ -1380,7 +1387,7 @@ function BabysitControls({
 }: {
   repo: string;
   number: number;
-  view: BabysitView;
+  view: AutoFixerView;
   onChanged: () => void;
 }) {
   const rpc = useRpc<typeof giteaRpcContract>();
@@ -1400,11 +1407,11 @@ function BabysitControls({
       onChanged();
     }
   };
-  const detail = babysitDetail(view);
+  const detail = autoFixerDetail(view);
   const changeable = view.actions.length > 0;
   return (
     <span
-      data-testid="babysit-controls"
+      data-testid="auto-fixer-controls"
       className="flex shrink-0 flex-wrap items-center gap-1"
     >
       {view.status !== "idle" && (
@@ -1412,7 +1419,7 @@ function BabysitControls({
           variant={view.status === "failed" ? "destructive" : "secondary"}
           title={detail || undefined}
         >
-          {babysitLabels[view.status]}
+          {autoFixerLabels[view.status]}
         </Badge>
       )}
       {"threadId" in view && (
@@ -1455,7 +1462,7 @@ function BabysitControls({
           disabled={busy}
           onClick={() =>
             void run(
-              () => rpc.call("retryBabysit", { repo, number }),
+              () => rpc.call("retryAutoFixer", { repo, number }),
               "Auto-fixer resumed",
             )
           }
@@ -1467,7 +1474,7 @@ function BabysitControls({
   );
 }
 
-function BabysitPreferencesControl() {
+function AutoFixerPreferencesControl() {
   const rpc = useRpc<typeof giteaRpcContract>();
   const [loaded, setLoaded] = useState<
     | { state: "loading" }
@@ -1481,7 +1488,7 @@ function BabysitPreferencesControl() {
   const [saving, setSaving] = useState(false);
   const load = useCallback(() => {
     void rpc
-      .call("getBabysitPreferences", null)
+      .call("getAutoFixerPreferences", null)
       .then((preferences) => {
         panelMemory.preferences = preferences;
         setLoaded({ state: "ready", preferences });
@@ -1494,7 +1501,7 @@ function BabysitPreferencesControl() {
       );
   }, [rpc]);
   useEffect(load, [load]);
-  useRealtime("babysit-changed", load);
+  useRealtime("auto-fixer-changed", load);
   if (loaded.state === "loading") return null;
   if (loaded.state === "error")
     return (
@@ -1576,7 +1583,7 @@ function BabysitPreferencesControl() {
             ...value,
             serviceTier: value.serviceTier ?? "default",
           };
-          void save(() => rpc.call("setBabysitExecution", next), {
+          void save(() => rpc.call("setAutoFixerExecution", next), {
             ...preferences,
             execution: next,
           });
@@ -1586,14 +1593,14 @@ function BabysitPreferencesControl() {
   );
 }
 
-function BabysitterSessions() {
+function AutoFixerList() {
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
-  const [sessions, setSessions] = useState<BabysitSessions | null>(null);
+  const [sessions, setSessions] = useState<AutoFixerSessions | null>(null);
   const [error, setError] = useState<string | null>(null);
   const load = useCallback(() => {
     void rpc
-      .call("listBabysitSessions", null)
+      .call("listAutoFixerSessions", null)
       .then((result) => {
         setSessions(result.sessions);
         setError(null);
@@ -1607,7 +1614,7 @@ function BabysitterSessions() {
       );
   }, [rpc]);
   useEffect(load, [load]);
-  useRealtime("babysit-changed", load);
+  useRealtime("auto-fixer-changed", load);
   if (error)
     return (
       <div role="alert" className="p-8 text-center text-muted-foreground">
@@ -1626,7 +1633,7 @@ function BabysitterSessions() {
       {sessions.map((session) => (
         <div
           key={`${session.repo}#${session.number}`}
-          data-testid="babysit-session"
+          data-testid="auto-fixer-session"
           className="flex flex-col gap-2 px-3 py-3 sm:flex-row sm:items-center"
         >
           <button
@@ -1643,13 +1650,13 @@ function BabysitterSessions() {
             <span className="text-xs text-muted-foreground">
               {session.updatedAt}
             </span>
-            {babysitDetail(session) && (
+            {autoFixerDetail(session) && (
               <span className="line-clamp-2 text-xs text-muted-foreground">
-                {babysitDetail(session)}
+                {autoFixerDetail(session)}
               </span>
             )}
           </button>
-          <BabysitControls
+          <AutoFixerControls
             repo={session.repo}
             number={session.number}
             view={session}
@@ -1729,10 +1736,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   useEffect(() => {
     void loadStatus();
   }, [loadStatus, epoch]);
-  const reloadBabysits = useCallback(() => {
+  const reloadAutoFixers = useCallback(() => {
     if (view === "my-prs") void loadItems();
   }, [loadItems, view]);
-  useRealtime("babysit-changed", reloadBabysits);
+  useRealtime("auto-fixer-changed", reloadAutoFixers);
   const openItem = useCallback(
     async (item: Item) => {
       navigate.toPluginPanel("gitea", {
@@ -2249,7 +2256,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   {view === "my-prs" ? count : ""}
                 </Badge>
               </TabsTrigger>
-              <TabsTrigger value="babysitters">Auto-fixers</TabsTrigger>
+              <TabsTrigger value="auto-fixers">Auto-fixers</TabsTrigger>
               <TabsTrigger value="issues">Issues</TabsTrigger>
               <TabsTrigger value="pulls">Pull requests</TabsTrigger>
             </TabsList>
@@ -2286,11 +2293,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               ))}
             </div>
           )}
-          {(view === "my-prs" || view === "babysitters") && (
-            <BabysitPreferencesControl />
+          {(view === "my-prs" || view === "auto-fixers") && (
+            <AutoFixerPreferencesControl />
           )}
-          {view === "babysitters" ? (
-            <BabysitterSessions />
+          {view === "auto-fixers" ? (
+            <AutoFixerList />
           ) : (
             <div className="flex flex-col gap-3">
               <div className="flex flex-wrap items-center gap-2">
@@ -2404,13 +2411,13 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                             ))}
                           </span>
                         </button>
-                        {shownList?.babysits.has(itemKey(item)) && (
+                        {shownList?.autoFixers.has(itemKey(item)) && (
                           <span className="px-3 pb-3 sm:p-0">
-                            <BabysitControls
+                            <AutoFixerControls
                               repo={item.repo}
                               number={item.number}
-                              view={shownList.babysits.get(itemKey(item))!}
-                              onChanged={reloadBabysits}
+                              view={shownList.autoFixers.get(itemKey(item))!}
+                              onChanged={reloadAutoFixers}
                             />
                           </span>
                         )}

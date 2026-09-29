@@ -28,18 +28,18 @@ import {
   automationOptions,
   automationPatchSchema,
   autoStartTargets,
-  babysitExecutionSchema,
-  babysitPreferencesSchema,
-  babysitSessionViewSchema,
-  babysitView,
-  babysitViewSchema,
-  buildBabysitterPrompt,
+  autoFixerExecutionSchema,
+  autoFixerPreferencesSchema,
+  autoFixerSessionViewSchema,
+  autoFixerView,
+  autoFixerViewSchema,
+  buildAutoFixerPrompt,
   confirmedTerminal,
   decideAutomation,
   decideRetry,
   decideStart,
   decideStop,
-  giteaBabysitterTitlePrefix,
+  giteaAutoFixerTitlePrefix,
   onArchived,
   onCleanupFailed,
   onFailed,
@@ -55,12 +55,12 @@ import {
   stopped,
   watching,
   type AutomationPatch,
-  type BabysitPolicy,
-  type BabysitPreferences,
-  type BabysitSession,
+  type AutoFixerPolicy,
+  type AutoFixerPreferences,
+  type AutoFixerSession,
   type LifecycleFact,
   type ResumableSession,
-} from "./babysitter.js";
+} from "./auto-fixer.js";
 const execFileAsync = promisify(execFile);
 
 const repositorySchema = z.string().regex(/^[\w.-]+\/[\w.-]+$/);
@@ -350,8 +350,8 @@ export const giteaRpcContract = defineRpcContract({
       account: z.string(),
       freshness: freshnessSchema,
       login: z.string(),
-      items: z.array(itemSchema.extend({ babysit: babysitViewSchema })),
-      preferences: babysitPreferencesSchema,
+      items: z.array(itemSchema.extend({ autoFixer: autoFixerViewSchema })),
+      preferences: autoFixerPreferencesSchema,
     }),
   },
   setAutomation: {
@@ -359,26 +359,29 @@ export const giteaRpcContract = defineRpcContract({
       .extend(automationOptions)
       .strict()
       .refine(...setsAutomationOption),
-    output: babysitViewSchema,
+    output: autoFixerViewSchema,
   },
-  retryBabysit: { input: pullRefSchema, output: threadIdSchema },
-  getBabysitStatus: { input: pullRefSchema, output: babysitViewSchema },
-  babysitThread: {
+  retryAutoFixer: { input: pullRefSchema, output: threadIdSchema },
+  getAutoFixerStatus: { input: pullRefSchema, output: autoFixerViewSchema },
+  autoFixerThread: {
     input: threadIdSchema,
-    output: babysitSessionViewSchema.nullable(),
+    output: autoFixerSessionViewSchema.nullable(),
   },
-  listBabysitSessions: {
+  listAutoFixerSessions: {
     input: z.null(),
-    output: z.object({ sessions: z.array(babysitSessionViewSchema) }),
+    output: z.object({ sessions: z.array(autoFixerSessionViewSchema) }),
   },
-  getBabysitPreferences: { input: z.null(), output: babysitPreferencesSchema },
+  getAutoFixerPreferences: {
+    input: z.null(),
+    output: autoFixerPreferencesSchema,
+  },
   setAutoAutomation: {
     input: automationPatchSchema,
-    output: babysitPreferencesSchema,
+    output: autoFixerPreferencesSchema,
   },
-  setBabysitExecution: {
-    input: babysitExecutionSchema,
-    output: babysitPreferencesSchema,
+  setAutoFixerExecution: {
+    input: autoFixerExecutionSchema,
+    output: autoFixerPreferencesSchema,
   },
 });
 
@@ -1395,16 +1398,17 @@ export default async function plugin(bb: BbPluginApi) {
       freshness: freshnessView(display.freshness),
     };
   }
-  const babysitPrefix = "babysit:";
-  const babysitIntervalMs = 5 * 60_000;
-  const babysitKey = (repo: string, number: number) =>
-    `${babysitPrefix}${pullKey(repo, number)}`;
-  const babysitThreadKey = (threadId: string) => `babysit-thread:${threadId}`;
-  const babysitRefSchema = z.object({
+  const autoFixerPrefix = "auto-fixer:";
+  const autoFixerIntervalMs = 5 * 60_000;
+  const autoFixerKey = (repo: string, number: number) =>
+    `${autoFixerPrefix}${pullKey(repo, number)}`;
+  const autoFixerThreadKey = (threadId: string) =>
+    `auto-fixer-thread:${threadId}`;
+  const autoFixerRefSchema = z.object({
     repo: repositorySchema,
     number: z.number().int().positive(),
   });
-  const babysitQueues = new Map<string, Promise<void>>();
+  const autoFixerQueues = new Map<string, Promise<void>>();
   let defaultsQueue: Promise<void> = Promise.resolve();
   const now = () => new Date().toISOString();
   const message = (error: unknown) =>
@@ -1413,26 +1417,26 @@ export default async function plugin(bb: BbPluginApi) {
   async function getSession(
     repo: string,
     number: number,
-  ): Promise<BabysitSession | null> {
+  ): Promise<AutoFixerSession | null> {
     return parseStoredSession(
-      await bb.storage.kv.get<unknown>(babysitKey(repo, number)),
+      await bb.storage.kv.get<unknown>(autoFixerKey(repo, number)),
     );
   }
 
   async function getSessionByThread(
     threadId: string,
-  ): Promise<BabysitSession | null> {
-    const ref = babysitRefSchema.safeParse(
-      await bb.storage.kv.get<unknown>(babysitThreadKey(threadId)),
+  ): Promise<AutoFixerSession | null> {
+    const ref = autoFixerRefSchema.safeParse(
+      await bb.storage.kv.get<unknown>(autoFixerThreadKey(threadId)),
     );
     if (!ref.success) return null;
     const session = await getSession(ref.data.repo, ref.data.number);
     return session?.threadId === threadId ? session : null;
   }
 
-  async function listSessions(): Promise<BabysitSession[]> {
-    const sessions: BabysitSession[] = [];
-    for (const key of await bb.storage.kv.list(babysitPrefix)) {
+  async function listSessions(): Promise<AutoFixerSession[]> {
+    const sessions: AutoFixerSession[] = [];
+    for (const key of await bb.storage.kv.list(autoFixerPrefix)) {
       const session = parseStoredSession(await bb.storage.kv.get<unknown>(key));
       if (session) sessions.push(session);
     }
@@ -1441,13 +1445,16 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
 
-  async function setSession(session: BabysitSession): Promise<void> {
-    await bb.storage.kv.set(babysitKey(session.repo, session.number), session);
-    await bb.storage.kv.set(babysitThreadKey(session.threadId), {
+  async function setSession(session: AutoFixerSession): Promise<void> {
+    await bb.storage.kv.set(
+      autoFixerKey(session.repo, session.number),
+      session,
+    );
+    await bb.storage.kv.set(autoFixerThreadKey(session.threadId), {
       repo: session.repo,
       number: session.number,
     });
-    bb.realtime.publish("babysit-changed", {
+    bb.realtime.publish("auto-fixer-changed", {
       repo: session.repo,
       number: session.number,
     });
@@ -1456,13 +1463,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function forgetDeletedThread(threadId: string): Promise<void> {
     const current = await getSessionByThread(threadId);
     if (current !== null) {
-      await bb.storage.kv.delete(babysitKey(current.repo, current.number));
-      bb.realtime.publish("babysit-changed", {
+      await bb.storage.kv.delete(autoFixerKey(current.repo, current.number));
+      bb.realtime.publish("auto-fixer-changed", {
         repo: current.repo,
         number: current.number,
       });
     }
-    await bb.storage.kv.delete(babysitThreadKey(threadId));
+    await bb.storage.kv.delete(autoFixerThreadKey(threadId));
   }
 
   async function readThreadPresence(
@@ -1492,8 +1499,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function writeIfCurrent(
-    expected: BabysitSession,
-    next: BabysitSession,
+    expected: AutoFixerSession,
+    next: AutoFixerSession,
   ): Promise<boolean> {
     if (
       !sameSession(expected, await getSession(expected.repo, expected.number))
@@ -1503,20 +1510,20 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
-  async function getPreferences(): Promise<BabysitPreferences> {
+  async function getPreferences(): Promise<AutoFixerPreferences> {
     return parseStoredPreferences(
-      await bb.storage.kv.get<unknown>("babysit-preferences"),
+      await bb.storage.kv.get<unknown>("auto-fixer-preferences"),
     );
   }
 
   let preferencesUpdate: Promise<unknown> = Promise.resolve();
   function updatePreferences(
-    update: (current: BabysitPreferences) => BabysitPreferences,
-  ): Promise<BabysitPreferences> {
+    update: (current: AutoFixerPreferences) => AutoFixerPreferences,
+  ): Promise<AutoFixerPreferences> {
     const result = preferencesUpdate.then(async () => {
       const next = update(await getPreferences());
-      await bb.storage.kv.set("babysit-preferences", next);
-      bb.realtime.publish("babysit-changed", { settings: true });
+      await bb.storage.kv.set("auto-fixer-preferences", next);
+      bb.realtime.publish("auto-fixer-changed", { settings: true });
       return next;
     });
     preferencesUpdate = result.catch(() => undefined);
@@ -1595,7 +1602,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (!failures.length) return { ok: true };
     const error = failures.join("; ");
-    bb.log.error(`Could not clean up Gitea babysitter ${threadId}: ${error}`);
+    bb.log.error(`Could not clean up Gitean auto-fixer ${threadId}: ${error}`);
     return { ok: false, error };
   }
 
@@ -1607,20 +1614,20 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       await bb.sdk.plugins.callRpc({
         pluginId: "supervisor",
-        method: "notifyBabysitter",
+        method: "notifyAutoFixer",
         input: { threadId, event, detail },
         outputSchema: z.object({ accepted: z.boolean() }).strict(),
       });
     } catch (error) {
       bb.log.debug(
-        `Supervisor unavailable for Gitea babysitter ${threadId}: ${message(error)}`,
+        `Supervisor unavailable for Gitean auto-fixer ${threadId}: ${message(error)}`,
       );
     }
   }
 
   async function settle(
-    observed: BabysitSession,
-    decide: (current: BabysitSession) => Promise<BabysitSession | null>,
+    observed: AutoFixerSession,
+    decide: (current: AutoFixerSession) => Promise<AutoFixerSession | null>,
     event: "idle" | "failed",
     detail: string | null,
   ) {
@@ -1640,7 +1647,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function handleIdle(
     threadId: string,
     lastText: string | null,
-    observed?: BabysitSession,
+    observed?: AutoFixerSession,
   ) {
     const session = observed ?? (await getSessionByThread(threadId));
     if (session?.status !== "watching") return;
@@ -1661,7 +1668,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function handleFailed(
     threadId: string,
     error: string | null,
-    observed?: BabysitSession,
+    observed?: AutoFixerSession,
   ) {
     const session = observed ?? (await getSessionByThread(threadId));
     if (session?.status !== "watching") return;
@@ -1685,25 +1692,25 @@ export default async function plugin(bb: BbPluginApi) {
     run: () => Promise<T>,
   ): Promise<T> {
     const key = pullKey(repo, number);
-    const result = (babysitQueues.get(key) ?? Promise.resolve()).then(run);
+    const result = (autoFixerQueues.get(key) ?? Promise.resolve()).then(run);
     const tail = result.then(
       () => undefined,
       () => undefined,
     );
-    babysitQueues.set(key, tail);
+    autoFixerQueues.set(key, tail);
     void tail.then(() => {
-      if (babysitQueues.get(key) === tail) babysitQueues.delete(key);
+      if (autoFixerQueues.get(key) === tail) autoFixerQueues.delete(key);
     });
     return result;
   }
 
-  async function babysitterPrompt(
+  async function autoFixerPrompt(
     repo: string,
     number: number,
     title: string,
-    policy: BabysitPolicy,
+    policy: AutoFixerPolicy,
   ): Promise<string> {
-    return buildBabysitterPrompt({
+    return buildAutoFixerPrompt({
       repo,
       number,
       title: title || `pull request #${number}`,
@@ -1713,10 +1720,10 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function spawnBabysitter(
+  async function spawnAutoFixer(
     repo: string,
     number: number,
-    policy: BabysitPolicy,
+    policy: AutoFixerPolicy,
   ): Promise<{ threadId: string }> {
     const key = `${repo}#${number}`;
     const [pull, projectId] = await Promise.all([
@@ -1737,13 +1744,13 @@ export default async function plugin(bb: BbPluginApi) {
     const title = text(pull.title) || `pull request #${number}`;
     const [{ execution }, prompt] = await Promise.all([
       getPreferences(),
-      babysitterPrompt(repo, number, title, policy),
+      autoFixerPrompt(repo, number, title, policy),
     ]);
     const thread = await bb.sdk.threads.spawn({
       projectId: decision.projectId,
       environment: { type: "project-default" },
       visibility: "hidden",
-      title: `${giteaBabysitterTitlePrefix} ${key}: ${title}`.slice(0, 120),
+      title: `${giteaAutoFixerTitlePrefix} ${key}: ${title}`.slice(0, 120),
       prompt,
       providerId: execution.providerId,
       model: execution.model,
@@ -1766,7 +1773,7 @@ export default async function plugin(bb: BbPluginApi) {
       const cleanup = await archiveAndStop(thread.id);
       if (!cleanup.ok)
         throw new Error(
-          `Could not discard duplicate babysitter ${thread.id}: ${cleanup.error}`,
+          `Could not discard duplicate auto-fixer ${thread.id}: ${cleanup.error}`,
         );
       return { threadId: raced.threadId };
     }
@@ -1779,19 +1786,21 @@ export default async function plugin(bb: BbPluginApi) {
       status: "watching",
     });
     if (decision.replaces !== null)
-      await bb.storage.kv.delete(babysitThreadKey(decision.replaces.threadId));
+      await bb.storage.kv.delete(
+        autoFixerThreadKey(decision.replaces.threadId),
+      );
     await bb.storage.kv.set(`thread-link:${thread.id}`, {
       repo,
       number,
       kind: "pr",
     });
-    bb.log.info(`Started Gitea babysitter ${thread.id} for ${key}`);
+    bb.log.info(`Started Gitean auto-fixer ${thread.id} for ${key}`);
     return { threadId: thread.id };
   }
 
-  async function resumeBabysitter(
+  async function resumeAutoFixer(
     session: ResumableSession,
-    policy: BabysitPolicy,
+    policy: AutoFixerPolicy,
     cleanupFirst: boolean,
   ): Promise<{ threadId: string }> {
     const { repo, number } = session;
@@ -1799,7 +1808,7 @@ export default async function plugin(bb: BbPluginApi) {
     const presence = await readThreadPresence(session.threadId);
     if (presence.state === "deleted") {
       await forgetDeletedThread(session.threadId);
-      return await spawnBabysitter(repo, number, policy);
+      return await spawnAutoFixer(repo, number, policy);
     }
     if (cleanupFirst) {
       const cleanup = await archiveAndStop(session.threadId);
@@ -1830,7 +1839,7 @@ export default async function plugin(bb: BbPluginApi) {
       input: [
         {
           type: "text",
-          text: `${await babysitterPrompt(repo, number, text(pull.title), policy)}\n\nContinue from the preserved transcript and current Gitea state.`,
+          text: `${await autoFixerPrompt(repo, number, text(pull.title), policy)}\n\nContinue from the preserved transcript and current Gitea state.`,
           mentions: [],
         },
       ],
@@ -1843,13 +1852,13 @@ export default async function plugin(bb: BbPluginApi) {
     return result;
   }
 
-  async function updateLiveBabysitter(
-    session: Extract<BabysitSession, { status: "watching" }>,
-    policy: BabysitPolicy,
+  async function updateLiveAutoFixer(
+    session: Extract<AutoFixerSession, { status: "watching" }>,
+    policy: AutoFixerPolicy,
   ): Promise<void> {
     const { repo, number } = session;
     const pull = record(await api(repoPath(repo, `pulls/${number}`)));
-    const prompt = await babysitterPrompt(
+    const prompt = await autoFixerPrompt(
       repo,
       number,
       text(pull.title),
@@ -1874,29 +1883,29 @@ export default async function plugin(bb: BbPluginApi) {
       });
     };
     const delivery = await steer().catch(async (error: unknown) => {
-      await stopBabysitter(repo, number);
+      await stopAutoFixer(repo, number);
       throw new Error(
         `Could not deliver the automation change, so the auto-fixer was stopped: ${message(error)}`,
       );
     });
     if (delivery.delivery === "sent") return;
-    await stopBabysitter(repo, number);
+    await stopAutoFixer(repo, number);
     throw new Error(
       `The auto-fixer for ${repo}#${number} could not take the automation change immediately, so it was stopped; turn Auto-fix or Auto-merge on again to restart it.`,
     );
   }
 
-  function retryBabysitter(repo: string, number: number) {
+  function retryAutoFixer(repo: string, number: number) {
     return serialized(repo, number, async () => {
       const decision = decideRetry(await getSession(repo, number));
       if (decision.kind === "reject")
         throw new Error(
           decision.reason === "inactive"
-            ? `${repo}#${number} has no babysitter to retry; turn on Auto-fix or Auto-merge.`
+            ? `${repo}#${number} has no auto-fixer to retry; turn on Auto-fix or Auto-merge.`
             : startError(`${repo}#${number}`, decision.reason),
         );
       if (decision.kind === "existing") return { threadId: decision.threadId };
-      return await resumeBabysitter(
+      return await resumeAutoFixer(
         decision.session,
         decision.session.policy,
         decision.cleanupFirst,
@@ -1909,22 +1918,22 @@ export default async function plugin(bb: BbPluginApi) {
       const decision = decideAutomation(await getSession(repo, number), patch);
       if (decision.kind === "reject")
         throw new Error(startError(`${repo}#${number}`, decision.reason));
-      if (decision.kind === "stop") await stopBabysitter(repo, number);
+      if (decision.kind === "stop") await stopAutoFixer(repo, number);
       if (decision.kind === "start")
-        await spawnBabysitter(repo, number, decision.policy);
+        await spawnAutoFixer(repo, number, decision.policy);
       if (decision.kind === "update")
-        await updateLiveBabysitter(decision.session, decision.policy);
+        await updateLiveAutoFixer(decision.session, decision.policy);
       if (decision.kind === "resume")
-        await resumeBabysitter(
+        await resumeAutoFixer(
           decision.session,
           decision.policy,
           decision.cleanupFirst,
         );
-      return await babysitStatus(repo, number);
+      return await autoFixerStatus(repo, number);
     });
   }
 
-  async function stopBabysitter(repo: string, number: number) {
+  async function stopAutoFixer(repo: string, number: number) {
     for (;;) {
       const target = decideStop(await getSession(repo, number));
       if (!target) return { ok: true as const };
@@ -1937,7 +1946,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function finishStop(
-    session: Extract<BabysitSession, { status: "stopped" }>,
+    session: Extract<AutoFixerSession, { status: "stopped" }>,
   ) {
     const cleanup = await archiveAndStop(session.threadId);
     await writeIfCurrent(
@@ -1949,15 +1958,15 @@ export default async function plugin(bb: BbPluginApi) {
     return cleanup;
   }
 
-  async function babysitStatus(repo: string, number: number) {
+  async function autoFixerStatus(repo: string, number: number) {
     const session = await getSession(repo, number);
     if (session !== null && session.status !== "closed")
-      return babysitView(session, null);
+      return autoFixerView(session, null);
     const [lifecycle, projectId] = await Promise.all([
       readLifecycle(repo, number),
       projectFor(repo),
     ]);
-    return babysitView(session, { lifecycle, projectId });
+    return autoFixerView(session, { lifecycle, projectId });
   }
 
   async function currentLogin(signal?: AbortSignal): Promise<string> {
@@ -1983,7 +1992,7 @@ export default async function plugin(bb: BbPluginApi) {
     return result;
   }
 
-  async function reconcileAutoBabysit(signal?: AbortSignal) {
+  async function reconcileAutoAutoFixer(signal?: AbortSignal) {
     if ((await defaultPolicy()) === null) return;
     const [login, tracked, pulls, sessions] = await Promise.all([
       currentLogin(signal),
@@ -2009,12 +2018,12 @@ export default async function plugin(bb: BbPluginApi) {
           serialized(target.repo, target.number, async () => {
             const policy = await defaultPolicy();
             if (policy !== null)
-              await spawnBabysitter(target.repo, target.number, policy);
+              await spawnAutoFixer(target.repo, target.number, policy);
           }),
         );
       } catch (error) {
         bb.log.warn(
-          `Automatic Gitea babysitter failed for ${target.repo}#${target.number}: ${message(error)}`,
+          `Automatic Gitean auto-fixer failed for ${target.repo}#${target.number}: ${message(error)}`,
         );
       }
     }
@@ -2049,12 +2058,12 @@ export default async function plugin(bb: BbPluginApi) {
         else if (thread.status === "error")
           await handleFailed(
             session.threadId,
-            "The babysitter thread ended in error while the Gitea plugin was not observing it.",
+            "The auto-fixer thread ended in error while the Gitea plugin was not observing it.",
             session,
           );
       } catch (error) {
         bb.log.warn(
-          `Could not reconcile Gitea babysitter ${session.threadId}: ${message(error)}`,
+          `Could not reconcile Gitean auto-fixer ${session.threadId}: ${message(error)}`,
         );
       }
     }
@@ -2070,20 +2079,20 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.deleted", ({ thread }) =>
     forgetDeletedThread(thread.id),
   );
-  bb.background.service("babysitters", {
+  bb.background.service("auto-fixers", {
     async start(signal) {
       while (!signal.aborted) {
         try {
           await reconcileSessions(signal);
-          await reconcileAutoBabysit(signal);
+          await reconcileAutoAutoFixer(signal);
         } catch (error) {
           if (signal.aborted) break;
           bb.log.warn(
-            `Gitea babysitter reconciliation failed: ${message(error)}`,
+            `Gitean auto-fixer reconciliation failed: ${message(error)}`,
           );
         }
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(done, babysitIntervalMs);
+          const timer = setTimeout(done, autoFixerIntervalMs);
           function done() {
             clearTimeout(timer);
             signal.removeEventListener("abort", done);
@@ -2513,7 +2522,7 @@ export default async function plugin(bb: BbPluginApi) {
       const items = await Promise.all(
         list.items.map(async (item) => ({
           ...item,
-          babysit: babysitView(
+          autoFixer: autoFixerView(
             await getSession(item.repo, item.number),
             item.state === "open"
               ? {
@@ -2535,16 +2544,16 @@ export default async function plugin(bb: BbPluginApi) {
     },
     setAutomation: ({ repo, number, fix, merge }) =>
       setAutomation(repo, number, { fix, merge }),
-    retryBabysit: ({ repo, number }) => retryBabysitter(repo, number),
-    getBabysitStatus: ({ repo, number }) => babysitStatus(repo, number),
-    babysitThread: async ({ threadId }) => {
+    retryAutoFixer: ({ repo, number }) => retryAutoFixer(repo, number),
+    getAutoFixerStatus: ({ repo, number }) => autoFixerStatus(repo, number),
+    autoFixerThread: async ({ threadId }) => {
       const session = await getSessionByThread(threadId);
       return session && sessionView(session);
     },
-    listBabysitSessions: async () => ({
+    listAutoFixerSessions: async () => ({
       sessions: (await listSessions()).map(sessionView),
     }),
-    getBabysitPreferences: () => getPreferences(),
+    getAutoFixerPreferences: () => getPreferences(),
     setAutoAutomation: async (patch) => {
       const preferences = await withDefaults(() =>
         updatePreferences((current) => {
@@ -2556,12 +2565,12 @@ export default async function plugin(bb: BbPluginApi) {
         }),
       );
       if (preferences.autoFix || preferences.autoMerge)
-        await reconcileAutoBabysit().catch((error: unknown) =>
-          bb.log.warn(`Automatic Gitea babysitting failed: ${message(error)}`),
+        await reconcileAutoAutoFixer().catch((error: unknown) =>
+          bb.log.warn(`Automatic Gitea auto-fixing failed: ${message(error)}`),
         );
       return preferences;
     },
-    setBabysitExecution: (execution) =>
+    setAutoFixerExecution: (execution) =>
       updatePreferences((current) => ({ ...current, execution })),
   } satisfies PluginRpcHandlers<typeof giteaRpcContract>;
   bb.rpc.register(giteaRpcContract, handlers);
@@ -2747,25 +2756,25 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb gitea auto-merge <owner/repo> <number> on|off [--json]",
       },
       {
-        name: "babysit-status",
+        name: "auto-fixer-status",
         summary:
-          "Show a pull request's Auto-fix, Auto-merge, and babysitter state",
-        usage: "bb gitea babysit-status <owner/repo> <number> [--json]",
+          "Show a pull request's Auto-fix, Auto-merge, and auto-fixer state",
+        usage: "bb gitea auto-fixer-status <owner/repo> <number> [--json]",
       },
       {
-        name: "babysit-retry",
-        summary: "Resume a failed or waiting babysitter",
-        usage: "bb gitea babysit-retry <owner/repo> <number> [--json]",
+        name: "auto-fixer-retry",
+        summary: "Resume a failed or waiting auto-fixer",
+        usage: "bb gitea auto-fixer-retry <owner/repo> <number> [--json]",
       },
       {
-        name: "babysit-thread",
-        summary: "Show the babysitter session owned by a BB thread",
-        usage: "bb gitea babysit-thread <thread-id> [--json]",
+        name: "auto-fixer-thread",
+        summary: "Show the auto-fixer session owned by a BB thread",
+        usage: "bb gitea auto-fixer-thread <thread-id> [--json]",
       },
       {
-        name: "babysit-sessions",
-        summary: "List retained babysitter sessions",
-        usage: "bb gitea babysit-sessions [--json]",
+        name: "auto-fixers",
+        summary: "List retained auto-fixer sessions",
+        usage: "bb gitea auto-fixers [--json]",
       },
       {
         name: "automation-defaults",
@@ -2774,11 +2783,11 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb gitea automation-defaults [fix|merge on|off] [--json]",
       },
       {
-        name: "babysit-execution",
+        name: "auto-fixer-execution",
         summary:
-          "Set the provider, model, reasoning, and tier for new babysitters",
+          "Set the provider, model, reasoning, and tier for new auto-fixers",
         usage:
-          "bb gitea babysit-execution <provider> <model> <reasoning> [fast|default] [--json]",
+          "bb gitea auto-fixer-execution <provider> <model> <reasoning> [fast|default] [--json]",
       },
     ],
     async run(argv) {
@@ -3016,13 +3025,13 @@ export default async function plugin(bb: BbPluginApi) {
         const switchValue = (value: string | undefined) =>
           z.enum(["on", "off"]).parse(value) === "on";
         const describe = (
-          view: z.infer<typeof babysitViewSchema>,
+          view: z.infer<typeof autoFixerViewSchema>,
           ref: string,
         ) =>
           `${ref} ${view.status} · Auto-fix ${onOff(view.automation.fix)} · Auto-merge ${onOff(view.automation.merge)}${"threadId" in view ? ` thread ${view.threadId}` : ""}${view.status === "failed" ? `\n${view.error}` : ""}${view.status === "needs_you" && view.note ? `\n${view.note}` : ""}`;
         const pullRef = () =>
           pullRefSchema.parse({ repo: values[0], number: Number(values[1]) });
-        const describePreferences = (value: BabysitPreferences) =>
+        const describePreferences = (value: AutoFixerPreferences) =>
           `Turn on Auto-fix for my PRs: ${onOff(value.autoFix)}\nTurn on Auto-merge for my PRs: ${onOff(value.autoMerge)}\nExecution: ${value.execution.providerId} ${value.execution.model} ${value.execution.reasoningLevel} ${value.execution.serviceTier}`;
         if (command === "my-prs") {
           const input = giteaRpcContract.listMyPullRequests.input.parse({
@@ -3034,7 +3043,7 @@ export default async function plugin(bb: BbPluginApi) {
           const value = await handlers.listMyPullRequests(input);
           return succeed(
             value,
-            `${value.items.map((entry) => `${entry.repo}#${entry.number} ${entry.state} fix:${onOff(entry.babysit.automation.fix)} merge:${onOff(entry.babysit.automation.merge)} babysit:${entry.babysit.status} ${entry.title}`).join("\n") || "No pull requests authored by you."}${value.truncated ? "\nResults are capped; narrow the repository or query." : ""}${value.errors.map((entry) => `\n${entry.repo}: ${entry.message}`).join("")}`,
+            `${value.items.map((entry) => `${entry.repo}#${entry.number} ${entry.state} fix:${onOff(entry.autoFixer.automation.fix)} merge:${onOff(entry.autoFixer.automation.merge)} auto-fixer:${entry.autoFixer.status} ${entry.title}`).join("\n") || "No pull requests authored by you."}${value.truncated ? "\nResults are capped; narrow the repository or query." : ""}${value.errors.map((entry) => `\n${entry.repo}: ${entry.message}`).join("")}`,
           );
         }
         if (command === "auto-fix" || command === "auto-merge") {
@@ -3049,48 +3058,48 @@ export default async function plugin(bb: BbPluginApi) {
             describe(value, `${input.repo}#${input.number}`),
           );
         }
-        if (command === "babysit-retry") {
+        if (command === "auto-fixer-retry") {
           const input = pullRef();
-          const value = await handlers.retryBabysit(input);
+          const value = await handlers.retryAutoFixer(input);
           return succeed(
             value,
-            `Babysitter for ${input.repo}#${input.number} is thread ${value.threadId}`,
+            `Auto-fixer for ${input.repo}#${input.number} is thread ${value.threadId}`,
           );
         }
-        if (command === "babysit-status") {
+        if (command === "auto-fixer-status") {
           const input = pullRef();
-          const value = await handlers.getBabysitStatus(input);
+          const value = await handlers.getAutoFixerStatus(input);
           return succeed(
             value,
             describe(value, `${input.repo}#${input.number}`),
           );
         }
-        if (command === "babysit-thread") {
-          const value = await handlers.babysitThread(
+        if (command === "auto-fixer-thread") {
+          const value = await handlers.autoFixerThread(
             threadIdSchema.parse({ threadId: values[0] }),
           );
           return succeed(
             value,
             value
               ? describe(value, `${value.repo}#${value.number}`)
-              : "No Gitea babysitter owns this thread.",
+              : "No Gitean auto-fixer owns this thread.",
           );
         }
-        if (command === "babysit-sessions") {
-          const value = await handlers.listBabysitSessions();
+        if (command === "auto-fixers") {
+          const value = await handlers.listAutoFixerSessions();
           return succeed(
             value,
             value.sessions
               .map((session) =>
                 describe(session, `${session.repo}#${session.number}`),
               )
-              .join("\n") || "No babysitter sessions.",
+              .join("\n") || "No auto-fixer sessions.",
           );
         }
         if (command === "automation-defaults") {
           const value =
             values[0] === undefined
-              ? await handlers.getBabysitPreferences()
+              ? await handlers.getAutoFixerPreferences()
               : await handlers.setAutoAutomation(
                   giteaRpcContract.setAutoAutomation.input.parse({
                     [z.enum(["fix", "merge"]).parse(values[0])]: switchValue(
@@ -3100,15 +3109,15 @@ export default async function plugin(bb: BbPluginApi) {
                 );
           return succeed(value, describePreferences(value));
         }
-        if (command === "babysit-execution") {
+        if (command === "auto-fixer-execution") {
           if (values.length < 3 || values.length > 4)
             return {
               exitCode: 1,
               stderr:
-                "babysit-execution requires: provider model reasoning [fast|default]",
+                "auto-fixer-execution requires: provider model reasoning [fast|default]",
             };
-          const value = await handlers.setBabysitExecution(
-            babysitExecutionSchema.parse({
+          const value = await handlers.setAutoFixerExecution(
+            autoFixerExecutionSchema.parse({
               providerId: values[0],
               model: values[1],
               reasoningLevel: values[2],
