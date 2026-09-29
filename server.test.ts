@@ -262,6 +262,7 @@ it("paginates pull request comments, files, and reviews and stops on a short pag
     });
     if (path.endsWith("/comments"))
       return rows((index) => ({
+        id: page(endpoint) * 100 + index,
         user: { login: "reviewer" },
         body: `Comment ${index}`,
         created_at: "2026-09-01T00:00:00Z",
@@ -358,6 +359,64 @@ it("reads a large pull request's files in concurrent page batches after a full f
   expect(
     calls.filter((call) => call.endpoint.includes("/pulls/9/files")).length,
   ).toBe(9);
+});
+
+it("edits and deletes a conversation comment by id", async () => {
+  const { host, calls } = await start(({ method }) =>
+    method === "DELETE" ? { status: 204, raw: "" } : { json: {} },
+  );
+  await host.harness.behavior.callRpc("editComment", {
+    repo: "acme/widgets",
+    number: 4,
+    id: 77,
+    body: "Fixed typo",
+  });
+  await host.harness.behavior.callRpc("deleteComment", {
+    repo: "acme/widgets",
+    number: 4,
+    id: 77,
+  });
+  expect(
+    calls.map(({ method, endpoint, body }) => ({ method, endpoint, body })),
+  ).toEqual([
+    {
+      method: "PATCH",
+      endpoint: "/api/v1/repos/acme/widgets/issues/comments/77",
+      body: { body: "Fixed typo" },
+    },
+    {
+      method: "DELETE",
+      endpoint: "/api/v1/repos/acme/widgets/issues/comments/77",
+      body: null,
+    },
+  ]);
+});
+
+it("lists repository labels across pages and assignable users", async () => {
+  const { host } = await start(({ endpoint }) => {
+    const path = endpoint.split("?")[0]!;
+    if (path.endsWith("/labels"))
+      return {
+        json:
+          page(endpoint) === 1
+            ? Array.from({ length: 50 }, (_, index) => ({
+                name: `label-${index}`,
+                color: "e11d21",
+              }))
+            : [{ name: "last", color: "#00ff00" }],
+      };
+    if (path.endsWith("/assignees"))
+      return { json: [{ login: "ann" }, { login: "" }, { login: "bo" }] };
+    return { json: [] };
+  });
+  const result = giteaRpcContract.repoOptions.output.parse(
+    await host.harness.behavior.callRpc("repoOptions", {
+      repo: "acme/widgets",
+    }),
+  );
+  expect(result.labels).toHaveLength(51);
+  expect(result.labels.at(-1)).toEqual({ name: "last", color: "#00ff00" });
+  expect(result.assignees).toEqual(["ann", "bo"]);
 });
 
 it("marks a full bounded issue result window as potentially truncated", async () => {

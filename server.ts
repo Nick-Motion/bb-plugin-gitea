@@ -85,6 +85,7 @@ const listOutputSchema = z.object({
 type ListItem = z.infer<typeof itemSchema>;
 type ItemPage = z.infer<typeof listOutputSchema> & { reachable: number };
 const commentSchema = z.object({
+  id: z.number().int().positive(),
   author: z.string(),
   body: z.string(),
   createdAt: z.string(),
@@ -251,6 +252,30 @@ export const giteaRpcContract = defineRpcContract({
     }),
     output: okSchema,
   },
+  editComment: {
+    input: z.object({
+      repo: repositorySchema,
+      number: z.number().int().positive(),
+      id: z.number().int().positive(),
+      body: z.string().trim().min(1).max(100000),
+    }),
+    output: okSchema,
+  },
+  deleteComment: {
+    input: z.object({
+      repo: repositorySchema,
+      number: z.number().int().positive(),
+      id: z.number().int().positive(),
+    }),
+    output: okSchema,
+  },
+  repoOptions: {
+    input: z.object({ repo: repositorySchema }),
+    output: z.object({
+      labels: z.array(z.object({ name: z.string(), color: z.string() })),
+      assignees: z.array(z.string()),
+    }),
+  },
   reviewComment: {
     input: z.object({
       repo: repositorySchema,
@@ -361,7 +386,7 @@ type Repo = { repo: string; projectId: string | null };
 type TeaLogin = { name: string; user: string };
 type RpcContext = { experimental_signal?: AbortSignal };
 type ApiRequest = {
-  method?: "GET" | "POST" | "PATCH" | "PUT";
+  method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
   body?: unknown;
   signal?: AbortSignal;
 };
@@ -1011,6 +1036,7 @@ export default async function plugin(bb: BbPluginApi) {
       comments: page.values.map((raw) => {
         const value = record(raw);
         return commentSchema.parse({
+          id: value.id,
           author: actor(value),
           body: text(value.body),
           createdAt: text(value.created_at),
@@ -2311,6 +2337,55 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return { ok: true as const };
     },
+    editComment: async (
+      { repo, number, id, body },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      try {
+        await api(repoPath(repo, `issues/comments/${id}`), {
+          method: "PATCH",
+          body: { body },
+          signal,
+        });
+      } finally {
+        forgetDisplayItem(repo, number);
+      }
+      return { ok: true as const };
+    },
+    deleteComment: async (
+      { repo, number, id },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      try {
+        await api(repoPath(repo, `issues/comments/${id}`), {
+          method: "DELETE",
+          signal,
+        });
+      } finally {
+        forgetDisplayItem(repo, number);
+      }
+      return { ok: true as const };
+    },
+    repoOptions: async (
+      { repo },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      const [labels, assignees] = await Promise.all([
+        paginated(repoPath(repo, "labels"), signal),
+        api(repoPath(repo, "assignees"), { signal }),
+      ]);
+      return {
+        labels: labels.values
+          .map((raw) => {
+            const label = record(raw);
+            return { name: text(label.name), color: text(label.color) };
+          })
+          .filter((label) => label.name),
+        assignees: (Array.isArray(assignees) ? assignees : [])
+          .map((user) => text(record(user).login))
+          .filter(Boolean),
+      };
+    },
     reviewComment: async (
       { repo, number, commitId, path, line, side, body },
       { experimental_signal: signal }: RpcContext = {},
@@ -2606,6 +2681,22 @@ export default async function plugin(bb: BbPluginApi) {
           "bb gitea line-comment <owner/repo> <number> <path> <line> [--old] <body>",
       },
       {
+        name: "comment-edit",
+        summary: "Replace the body of a conversation comment",
+        usage:
+          "bb gitea comment-edit <owner/repo> <number> <comment-id> <body>",
+      },
+      {
+        name: "comment-delete",
+        summary: "Delete a conversation comment",
+        usage: "bb gitea comment-delete <owner/repo> <number> <comment-id>",
+      },
+      {
+        name: "options",
+        summary: "List a repository's labels and assignable users",
+        usage: "bb gitea options <owner/repo> [--json]",
+      },
+      {
         name: "set-state",
         summary: "Open or close an issue or pull request",
         usage: "bb gitea set-state <owner/repo> <number> <open|closed>",
@@ -2825,6 +2916,41 @@ export default async function plugin(bb: BbPluginApi) {
           return succeed(
             value,
             `Commented on ${input.path}:${input.line} in ${input.repo}#${input.number}`,
+          );
+        }
+        if (command === "comment-edit") {
+          const input = giteaRpcContract.editComment.input.parse({
+            repo: values[0],
+            number: Number(values[1]),
+            id: Number(values[2]),
+            body: values.slice(3).join(" "),
+          });
+          const value = await handlers.editComment(input);
+          return succeed(
+            value,
+            `Edited comment ${input.id} on ${input.repo}#${input.number}`,
+          );
+        }
+        if (command === "comment-delete") {
+          const input = giteaRpcContract.deleteComment.input.parse({
+            repo: values[0],
+            number: Number(values[1]),
+            id: Number(values[2]),
+          });
+          const value = await handlers.deleteComment(input);
+          return succeed(
+            value,
+            `Deleted comment ${input.id} on ${input.repo}#${input.number}`,
+          );
+        }
+        if (command === "options") {
+          const input = giteaRpcContract.repoOptions.input.parse({
+            repo: values[0],
+          });
+          const value = await handlers.repoOptions(input);
+          return succeed(
+            value,
+            `Labels: ${value.labels.map((label) => label.name).join(", ") || "none"}\nAssignees: ${value.assignees.join(", ") || "none"}`,
           );
         }
         if (command === "set-state") {

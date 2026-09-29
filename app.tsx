@@ -360,6 +360,8 @@ type PullConversation = Extract<
 >;
 type Check = PullConversation["checks"][number];
 type ReviewComment = PullConversation["reviewComments"][number];
+type ConversationComment = ConversationView["conversation"]["comments"][number];
+type RepoOptions = PluginRpcResult<(typeof giteaRpcContract)["repoOptions"]>;
 type LineTarget = Pick<ReviewComment, "line" | "side">;
 type FileReview = {
   comments: ReviewComment[];
@@ -1706,12 +1708,21 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     [shown],
   );
   const detailError = shown.state === "error" ? shown.message : null;
-  const [labelsDraft, setLabelsDraft] = useState("");
-  const [assigneesDraft, setAssigneesDraft] = useState("");
+  const [labelsDraft, setLabelsDraft] = useState<string[]>([]);
+  const [assigneesDraft, setAssigneesDraft] = useState<string[]>([]);
+  const [savingMetadata, setSavingMetadata] = useState(false);
   useEffect(() => {
-    setLabelsDraft(detail?.labels.join(", ") ?? "");
-    setAssigneesDraft(detail?.assignees.join(", ") ?? "");
+    setLabelsDraft(detail?.labels ?? []);
+    setAssigneesDraft(detail?.assignees ?? []);
   }, [detail]);
+  const pickerOptions = useRepoOptions(detail?.repo ?? null);
+  const labelColors = useMemo(
+    () =>
+      new Map(
+        (pickerOptions?.labels ?? []).map((label) => [label.name, label.color]),
+      ),
+    [pickerOptions],
+  );
 
   const loadItems = useCallback(() => loadList(false), [loadList]);
   const { epoch } = memory;
@@ -1799,29 +1810,30 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
       );
     }
   }, [detail, navigate, openItem, refreshDetail, rpc]);
-  const saveMetadata = useCallback(async () => {
-    if (!detail) return;
-    try {
-      await rpc.call("updateMetadata", {
-        repo: detail.repo,
-        number: detail.number,
-        labels: labelsDraft
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-        assignees: assigneesDraft
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      });
-      await refreshDetail();
-      toast.success("Labels and assignees updated");
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Metadata update failed",
-      );
-    }
-  }, [assigneesDraft, detail, labelsDraft, refreshDetail, rpc]);
+  const saveMetadata = useCallback(
+    async (labels: string[], assignees: string[]) => {
+      if (!detail) return;
+      setLabelsDraft(labels);
+      setAssigneesDraft(assignees);
+      setSavingMetadata(true);
+      try {
+        await rpc.call("updateMetadata", {
+          repo: detail.repo,
+          number: detail.number,
+          labels,
+          assignees,
+        });
+        await refreshDetail();
+      } catch (error) {
+        setLabelsDraft(detail.labels);
+        setAssigneesDraft(detail.assignees);
+        toast.error(errorText(error, "Metadata update failed"));
+      } finally {
+        setSavingMetadata(false);
+      }
+    },
+    [detail, refreshDetail, rpc],
+  );
   const repoOptions = useMemo(() => status?.repos ?? [], [status]);
   const create = useCallback(async () => {
     if (repo === "all") return toast.error("Choose a repository first");
@@ -2059,16 +2071,15 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   incomplete.
                 </p>
               )}
-              {detail.comments.map((comment, index) => (
-                <article
-                  key={`${comment.author}-${index}`}
+              {detail.comments.map((comment) => (
+                <CommentCard
+                  key={comment.id}
+                  item={detail}
+                  comment={comment}
+                  mine={sameLogin(comment.author, status?.login)}
+                  onChanged={refreshDetail}
                   className="rounded-md border border-border p-3"
-                >
-                  <div className="mb-1 text-xs text-muted-foreground">
-                    {comment.author} · {comment.createdAt}
-                  </div>
-                  <div className="whitespace-pre-wrap">{comment.body}</div>
-                </article>
+                />
               ))}
               {detail.kind === "pr" && (
                 <LineCommentList comments={detail.reviewComments} />
@@ -2082,47 +2093,25 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           </main>
           <aside className="space-y-3">
             <section className="space-y-3 rounded-lg border border-border bg-card p-3">
-              <div>
-                <h3 className="mb-2 text-xs font-semibold text-muted-foreground">
-                  Labels
-                </h3>
-                <div className="flex flex-wrap gap-1">
-                  {detail.labels.map((label) => (
-                    <Badge
-                      key={label}
-                      variant="secondary"
-                      className="font-normal"
-                    >
-                      {label}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-              <Input
-                aria-label="Labels, comma separated"
-                value={labelsDraft}
-                onChange={(event) => setLabelsDraft(event.target.value)}
-                placeholder="Labels, comma separated"
+              <ChipPicker
+                label="Labels"
+                options={
+                  pickerOptions?.labels.map((label) => label.name) ?? null
+                }
+                colors={labelColors}
+                selected={labelsDraft}
+                disabled={savingMetadata}
+                onChange={(labels) => void saveMetadata(labels, assigneesDraft)}
               />
-              <div>
-                <h3 className="mb-2 text-xs font-semibold text-muted-foreground">
-                  Assignees
-                </h3>
-                <Input
-                  aria-label="Assignees, comma separated"
-                  value={assigneesDraft}
-                  onChange={(event) => setAssigneesDraft(event.target.value)}
-                  placeholder="Assignees, comma separated"
-                />
-              </div>
-              <Button
-                size="sm"
-                variant="outline"
-                className="w-full"
-                onClick={() => void saveMetadata()}
-              >
-                Save labels and assignees
-              </Button>
+              <ChipPicker
+                label="Assignees"
+                options={pickerOptions?.assignees ?? null}
+                selected={assigneesDraft}
+                disabled={savingMetadata}
+                onChange={(assignees) =>
+                  void saveMetadata(labelsDraft, assignees)
+                }
+              />
             </section>
             {detail.kind === "pr" && (
               <>
@@ -2448,6 +2437,323 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   );
 }
 
+function sameLogin(author: string, login: string | null | undefined) {
+  return !!login && author.toLowerCase() === login.toLowerCase();
+}
+
+function useViewerLogin() {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const [login, setLogin] = useState<string | null>(null);
+  useEffect(() => {
+    let current = true;
+    void rpc
+      .call("status", null)
+      .then((value) => {
+        if (current) setLogin(value.login);
+      })
+      .catch(() => {});
+    return () => {
+      current = false;
+    };
+  }, [rpc]);
+  return login;
+}
+
+function useRepoOptions(repo: string | null) {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const [options, setOptions] = useState<RepoOptions | null>(null);
+  useEffect(() => {
+    setOptions(null);
+    if (!repo) return;
+    let current = true;
+    void rpc
+      .call("repoOptions", { repo })
+      .then((value) => {
+        if (current) setOptions(value);
+      })
+      .catch((error: unknown) => {
+        if (current)
+          toast.error(errorText(error, "Could not load labels and assignees"));
+      });
+    return () => {
+      current = false;
+    };
+  }, [repo, rpc]);
+  return options;
+}
+
+function labelColor(color: string | undefined) {
+  return color ? `#${color.replace(/^#/, "")}` : undefined;
+}
+
+function ChipPicker({
+  label,
+  options,
+  selected,
+  colors,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  options: string[] | null;
+  selected: string[];
+  colors?: Map<string, string>;
+  disabled: boolean;
+  onChange: (next: string[]) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const chosen = new Set(selected.map((value) => value.toLowerCase()));
+  const needle = query.trim().toLowerCase();
+  const matches = (options ?? [])
+    .filter(
+      (option) =>
+        !chosen.has(option.toLowerCase()) &&
+        option.toLowerCase().includes(needle),
+    )
+    .slice(0, 8);
+  const pick = (value: string) => {
+    setQuery("");
+    onChange([...selected, value]);
+  };
+  const dot = (value: string) => {
+    const color = labelColor(colors?.get(value));
+    return color ? (
+      <span
+        className="size-2 shrink-0 rounded-full"
+        style={{ backgroundColor: color }}
+      />
+    ) : null;
+  };
+  return (
+    <div>
+      <h3 className="mb-2 text-xs font-semibold text-muted-foreground">
+        {label}
+      </h3>
+      {selected.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-1">
+          {selected.map((value) => (
+            <Badge
+              key={value}
+              variant="secondary"
+              className="gap-1 pr-1 font-normal"
+            >
+              {dot(value)}
+              {value}
+              <button
+                type="button"
+                aria-label={`Remove ${value}`}
+                disabled={disabled}
+                className="rounded-sm text-muted-foreground hover:text-foreground"
+                onClick={() =>
+                  onChange(selected.filter((entry) => entry !== value))
+                }
+              >
+                <Icon name="X" className="size-3" />
+              </button>
+            </Badge>
+          ))}
+        </div>
+      )}
+      <div className="relative">
+        <Input
+          aria-label={`Add ${label.toLowerCase()}`}
+          placeholder={options ? `Add ${label.toLowerCase()}…` : "Loading…"}
+          value={query}
+          disabled={disabled || !options}
+          onFocus={() => setOpen(true)}
+          onBlur={() => setOpen(false)}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setOpen(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && matches[0]) {
+              event.preventDefault();
+              pick(matches[0]);
+            }
+            if (event.key === "Escape") setOpen(false);
+          }}
+        />
+        {open && matches.length > 0 && (
+          <div
+            role="listbox"
+            aria-label={label}
+            className="absolute z-10 mt-1 w-full rounded-md border border-border bg-popover p-1 shadow-md"
+          >
+            {matches.map((option) => (
+              <button
+                key={option}
+                type="button"
+                role="option"
+                aria-selected={false}
+                className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-sm hover:bg-muted"
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  pick(option);
+                }}
+              >
+                {dot(option)}
+                {option}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CommentCard({
+  item,
+  comment,
+  mine,
+  onChanged,
+  className,
+}: {
+  item: Pick<Item, "repo" | "number">;
+  comment: ConversationComment;
+  mine: boolean;
+  onChanged: () => Promise<unknown>;
+  className: string;
+}) {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const [mode, setMode] = useState<"view" | "edit" | "delete">("view");
+  const [draft, setDraft] = useState(comment.body);
+  const [busy, setBusy] = useState(false);
+  const act = async (
+    action: () => Promise<unknown>,
+    done: string,
+    failed: string,
+  ) => {
+    setBusy(true);
+    try {
+      await action();
+      setMode("view");
+      await onChanged();
+      toast.success(done);
+    } catch (error) {
+      toast.error(errorText(error, failed));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const save = () =>
+    act(
+      () =>
+        rpc.call("editComment", {
+          repo: item.repo,
+          number: item.number,
+          id: comment.id,
+          body: draft,
+        }),
+      "Comment updated",
+      "Could not update the comment",
+    );
+  return (
+    <article className={className}>
+      <div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
+        <span className="flex-1">
+          {comment.author} · {comment.createdAt}
+        </span>
+        {mine && mode === "view" && (
+          <>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-xs"
+              onClick={() => {
+                setDraft(comment.body);
+                setMode("edit");
+              }}
+            >
+              Edit
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-xs"
+              onClick={() => setMode("delete")}
+            >
+              Delete
+            </Button>
+          </>
+        )}
+      </div>
+      {mode === "edit" ? (
+        <div className="space-y-2">
+          <Textarea
+            aria-label="Edit comment"
+            value={draft}
+            autoFocus
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setMode("view");
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                if (draft.trim()) void save();
+              }
+            }}
+          />
+          <div className="flex justify-end gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => setMode("view")}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              disabled={busy || !draft.trim() || draft === comment.body}
+              onClick={() => void save()}
+            >
+              Save
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="whitespace-pre-wrap">{comment.body}</div>
+      )}
+      {mode === "delete" && (
+        <div className="mt-2 flex items-center justify-end gap-2 text-xs">
+          <span className="flex-1 text-muted-foreground">
+            Delete this comment on Gitea?
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => setMode("view")}
+          >
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            disabled={busy}
+            onClick={() =>
+              void act(
+                () =>
+                  rpc.call("deleteComment", {
+                    repo: item.repo,
+                    number: item.number,
+                    id: comment.id,
+                  }),
+                "Comment deleted",
+                "Could not delete the comment",
+              )
+            }
+          >
+            Delete
+          </Button>
+        </div>
+      )}
+    </article>
+  );
+}
+
 function LineCommentList({ comments }: { comments: ReviewComment[] }) {
   if (!comments.length) return null;
   return (
@@ -2556,6 +2862,7 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
   }, [rpc, threadId]);
   const [section, setSection] = useState<DetailSection>("conversation");
   useEffect(() => setSection("conversation"), [threadId]);
+  const viewer = useViewerLogin();
   const display = useItemDisplay(
     item,
     item?.kind === "pr" && section === "files",
@@ -2612,16 +2919,15 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
             incomplete.
           </div>
         )}
-        {detail.comments.map((comment, index) => (
-          <article
-            key={`${comment.author}-${index}`}
+        {detail.comments.map((comment) => (
+          <CommentCard
+            key={comment.id}
+            item={detail}
+            comment={comment}
+            mine={sameLogin(comment.author, viewer)}
+            onChanged={display.reload}
             className="mb-3 rounded border p-3"
-          >
-            <div className="mb-1 text-xs text-muted-foreground">
-              {comment.author} · {comment.createdAt}
-            </div>
-            <div className="whitespace-pre-wrap">{comment.body}</div>
-          </article>
+          />
         ))}
         {detail.kind === "pr" && (
           <LineCommentList comments={detail.reviewComments} />
