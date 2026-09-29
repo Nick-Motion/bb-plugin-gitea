@@ -2622,3 +2622,42 @@ it("commits a manual stop before the stopped thread reports idle", async () => {
   expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(1);
   expect(host.harness.sdk.callsTo("plugins.callRpc")).toHaveLength(0);
 });
+
+it("toggles draft by rewriting the pull request title prefix", async () => {
+  const { host, calls } = await startAutoFixers();
+  await rpc(host, "setDraft", { ...pr42, draft: true });
+  const patches = () =>
+    calls.filter(
+      ({ method, endpoint }) =>
+        method === "PATCH" &&
+        endpoint === "/api/v1/repos/acme/widgets/pulls/42",
+    );
+  expect(patches().map(({ body }) => body)).toEqual([
+    { title: "WIP: Change 42" },
+  ]);
+  await rpc(host, "setDraft", { ...pr42, draft: false });
+  expect(patches()).toHaveLength(1);
+});
+
+it("starts send-agent threads with the chosen model or the project default", async () => {
+  const { host } = await startAutoFixers();
+  const send = () => rpc(host, "sendAgent", { ...pr42, kind: "pr" });
+  await send();
+  const execution = {
+    providerId: "claude-code",
+    model: "claude-opus-5-5",
+    reasoningLevel: "medium",
+    serviceTier: "default",
+  };
+  await rpc(host, "setAgentExecution", { execution });
+  await expect(rpc(host, "getAgentExecution")).resolves.toEqual({ execution });
+  await send();
+  const spawns = host.harness.sdk
+    .callsTo("threads.spawn")
+    .map((call) => call[0]);
+  expect(spawns[0]).not.toHaveProperty("model");
+  expect(spawns[1]).toMatchObject({
+    ...execution,
+    executionInputSources: { model: "explicit" },
+  });
+});

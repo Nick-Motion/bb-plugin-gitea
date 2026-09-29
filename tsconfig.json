@@ -23,6 +23,7 @@
   "include": [
     "server.ts",
     "auto-fixer.ts",
+    "draft-title.ts",
     "pull-diff.ts",
     "display-cache.ts",
     "pull-files-view.ts",

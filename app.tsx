@@ -53,6 +53,7 @@ import {
   fileCounts,
   fileLabel,
 } from "./pull-files-view.js";
+import { isDraftTitle } from "./draft-title.js";
 
 type Item = PluginRpcResult<
   (typeof giteaRpcContract)["listItems"]
@@ -1475,6 +1476,76 @@ function AutoFixerControls({
   );
 }
 
+function AgentExecutionControl() {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const [execution, setExecution] = useState<
+    ExperimentalProviderModelPickerValue | null | undefined
+  >(undefined);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    void rpc
+      .call("getAgentExecution", null)
+      .then((value) => setExecution(value.execution))
+      .catch(() => setExecution(null));
+  }, [rpc]);
+  const save = async (next: ExperimentalProviderModelPickerValue | null) => {
+    const previous = execution;
+    const stored = next && {
+      ...next,
+      serviceTier: next.serviceTier ?? "default",
+    };
+    setExecution(stored);
+    setSaving(true);
+    try {
+      await rpc.call("setAgentExecution", { execution: stored });
+    } catch (error) {
+      setExecution(previous);
+      toast.error(
+        error instanceof Error ? error.message : "Could not save agent model",
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+  if (execution === undefined) return null;
+  if (execution === null)
+    return (
+      <Button
+        size="sm"
+        variant="ghost"
+        className="text-muted-foreground"
+        disabled={saving}
+        onClick={() =>
+          void rpc
+            .call("getAutoFixerPreferences", null)
+            .then((preferences) => save(preferences.execution))
+        }
+      >
+        Agent: project default
+      </Button>
+    );
+  return (
+    <div className="flex items-center gap-1">
+      <ProviderModelPicker
+        value={execution}
+        disabled={saving}
+        align="end"
+        onChange={(value) => void save(value)}
+      />
+      <Button
+        size="icon"
+        variant="ghost"
+        className="size-7"
+        disabled={saving}
+        aria-label="Use the project default model"
+        onClick={() => void save(null)}
+      >
+        <Icon name="X" className="size-3" />
+      </Button>
+    </div>
+  );
+}
+
 function AutoFixerPreferencesControl() {
   const rpc = useRpc<typeof giteaRpcContract>();
   const [loaded, setLoaded] = useState<
@@ -1780,6 +1851,24 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     },
     [detail, loadItems, refreshDetail, rpc],
   );
+  const setDraft = useCallback(
+    async (draft: boolean) => {
+      if (!detail || detail.kind !== "pr") return;
+      try {
+        await rpc.call("setDraft", {
+          repo: detail.repo,
+          number: detail.number,
+          draft,
+        });
+        await refreshDetail();
+        await loadItems();
+        toast.success(draft ? "Marked as draft" : "Ready for review");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Update failed");
+      }
+    },
+    [detail, loadItems, refreshDetail, rpc],
+  );
   const submitReview = useCallback(
     async (event: "APPROVED" | "REQUEST_CHANGES" | "COMMENT") => {
       if (!detail || detail.kind !== "pr") return;
@@ -2021,6 +2110,16 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
             >
               {detail.state === "closed" ? "Reopen" : "Close"}
             </Button>
+            {detail.kind === "pr" && detail.state === "open" && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void setDraft(!isDraftTitle(detail.title))}
+              >
+                {isDraftTitle(detail.title) ? "Mark ready" : "Convert to draft"}
+              </Button>
+            )}
+            <AgentExecutionControl />
             <Button size="sm" onClick={() => void sendAgent()}>
               {detail.kind === "pr" ? "Review with agent" : "Send agent"}
             </Button>
@@ -2032,6 +2131,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               />
               {detail.state.toLowerCase()}
             </Badge>
+            {detail.kind === "pr" && isDraftTitle(detail.title) && (
+              <Badge variant="outline" className="font-normal">
+                draft
+              </Badge>
+            )}
             <span>
               {detail.repo} · {detail.author}
             </span>

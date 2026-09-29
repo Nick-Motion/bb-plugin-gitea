@@ -22,6 +22,7 @@ import {
   type PullRevision,
   type RawPullDiff,
 } from "./pull-diff.js";
+import { draftTitle } from "./draft-title.js";
 import {
   activePolicy,
   applyAutomationPatch,
@@ -322,6 +323,22 @@ export const giteaRpcContract = defineRpcContract({
     }),
     output: z.object({ threadId: z.string().min(1) }),
   },
+  getAgentExecution: {
+    input: z.null(),
+    output: z.object({ execution: autoFixerExecutionSchema.nullable() }),
+  },
+  setAgentExecution: {
+    input: z.object({ execution: autoFixerExecutionSchema.nullable() }),
+    output: okSchema,
+  },
+  setDraft: {
+    input: z.object({
+      repo: repositorySchema,
+      number: z.number().int().positive(),
+      draft: z.boolean(),
+    }),
+    output: okSchema,
+  },
   threadItem: {
     input: z.object({ threadId: z.string().min(1) }),
     output: z
@@ -393,6 +410,7 @@ type ApiRequest = {
   body?: unknown;
   signal?: AbortSignal;
 };
+const agentExecutionKey = "agent-execution";
 const teaHint = "Install tea 0.15.1 or newer and sign in with `tea login add`.";
 const teaCandidates = ["tea", "/usr/local/bin/tea", "/opt/homebrew/bin/tea"];
 const teaTimeoutMs = 15_000;
@@ -1510,6 +1528,13 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
+  async function agentExecution() {
+    const parsed = autoFixerExecutionSchema.safeParse(
+      await bb.storage.kv.get<unknown>(agentExecutionKey),
+    );
+    return parsed.success ? parsed.data : null;
+  }
+
   async function getPreferences(): Promise<AutoFixerPreferences> {
     return parseStoredPreferences(
       await bb.storage.kv.get<unknown>("auto-fixer-preferences"),
@@ -2470,11 +2495,24 @@ export default async function plugin(bb: BbPluginApi) {
       ]
         .join("\n")
         .slice(0, 60000);
+      const execution = await agentExecution();
       const thread = await bb.sdk.threads.spawn({
         projectId: known.projectId,
         environment: { type: "project-default" },
         title: `${ref}: ${item.title}`.slice(0, 120),
         prompt: context,
+        ...(execution && {
+          providerId: execution.providerId,
+          model: execution.model,
+          reasoningLevel: execution.reasoningLevel,
+          serviceTier: execution.serviceTier,
+          executionInputSources: {
+            providerId: "explicit",
+            model: "explicit",
+            reasoningLevel: "explicit",
+            serviceTier: "explicit",
+          },
+        }),
       });
       await bb.storage.kv.set(`thread:${repo}:${number}`, thread.id);
       await bb.storage.kv.set(`thread-link:${thread.id}`, {
@@ -2483,6 +2521,28 @@ export default async function plugin(bb: BbPluginApi) {
         kind,
       });
       return { threadId: thread.id };
+    },
+    getAgentExecution: async () => ({ execution: await agentExecution() }),
+    setAgentExecution: async ({ execution }) => {
+      if (execution) await bb.storage.kv.set(agentExecutionKey, execution);
+      else await bb.storage.kv.delete(agentExecutionKey);
+      return { ok: true as const };
+    },
+    setDraft: async (
+      { repo, number, draft },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      try {
+        const path = repoPath(repo, `pulls/${number}`);
+        const title = text(record(await api(path, { signal })).title);
+        const next = draftTitle(title, draft);
+        if (next !== title)
+          await api(path, { method: "PATCH", body: { title: next }, signal });
+      } finally {
+        forgetDisplayItem(repo, number);
+        forgetLists();
+      }
+      return { ok: true as const };
     },
     threadItem: async ({ threadId }) =>
       (await bb.storage.kv.get(`thread-link:${threadId}`)) ?? null,
@@ -2726,6 +2786,17 @@ export default async function plugin(bb: BbPluginApi) {
         name: "send-agent",
         summary: "Start a BB agent thread for an item",
         usage: "bb gitea send-agent <issue|pr> <owner/repo> <number>",
+      },
+      {
+        name: "draft",
+        summary: "Mark a pull request as a draft or ready for review",
+        usage: "bb gitea draft <owner/repo> <number> on|off",
+      },
+      {
+        name: "agent-execution",
+        summary: "Show or set the model for send-agent threads",
+        usage:
+          "bb gitea agent-execution [<provider> <model> <reasoning> [fast|default] | default] [--json]",
       },
       {
         name: "thread",
@@ -3108,6 +3179,45 @@ export default async function plugin(bb: BbPluginApi) {
                   }),
                 );
           return succeed(value, describePreferences(value));
+        }
+        if (command === "draft") {
+          const input = giteaRpcContract.setDraft.input.parse({
+            repo: values[0],
+            number: Number(values[1]),
+            draft: switchValue(values[2]),
+          });
+          const value = await handlers.setDraft(input);
+          return succeed(
+            value,
+            `${input.repo}#${input.number} is ${input.draft ? "a draft" : "ready for review"}`,
+          );
+        }
+        if (command === "agent-execution") {
+          if (values.length === 1 && values[0] === "default") {
+            await handlers.setAgentExecution({ execution: null });
+          } else if (values.length >= 3 && values.length <= 4) {
+            await handlers.setAgentExecution({
+              execution: autoFixerExecutionSchema.parse({
+                providerId: values[0],
+                model: values[1],
+                reasoningLevel: values[2],
+                serviceTier: values[3] ?? "default",
+              }),
+            });
+          } else if (values.length !== 0) {
+            return {
+              exitCode: 1,
+              stderr:
+                "agent-execution takes: [provider model reasoning [fast|default] | default]",
+            };
+          }
+          const value = await handlers.getAgentExecution();
+          return succeed(
+            value,
+            value.execution
+              ? `Agent threads use ${value.execution.providerId} ${value.execution.model} ${value.execution.reasoningLevel} ${value.execution.serviceTier}`
+              : "Agent threads use the project default model",
+          );
         }
         if (command === "auto-fixer-execution") {
           if (values.length < 3 || values.length > 4)

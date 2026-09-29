@@ -39,10 +39,10 @@ An issue or pull request opens on **Conversation**, where you can:
 
 - comment, and edit or delete your own comments;
 - add or remove labels and assignees from the repository's options;
-- close or reopen;
+- close or reopen, and mark a pull request as a draft or ready;
 - review (comment, request changes, approve);
 - see checks (click one to open its run) and reviews;
-- hand the item to an agent thread.
+- hand the item to an agent thread (**Review with agent** or **Send agent**). The model picker beside it sets the model for these threads; clear it to use the project default.
 
 **Files changed** shows a file tree and diffs, unified or split. Click the `+` beside a line to leave a line comment; existing line comments appear under their line and in the conversation.
 
@@ -79,8 +79,10 @@ bb gitea line-comment <owner/repo> <number> <path> <line> [--old] <body>
 bb gitea options <owner/repo>                              # labels and assignees
 bb gitea metadata <owner/repo> <number> <labels-csv> <assignees-csv>
 bb gitea set-state <owner/repo> <number> <open|closed>
+bb gitea draft <owner/repo> <number> on|off
 bb gitea review <owner/repo> <number> <APPROVED|REQUEST_CHANGES|COMMENT> [body]
 bb gitea send-agent <issue|pr> <owner/repo> <number>
+bb gitea agent-execution [<provider> <model> <reasoning> [fast|default] | default]
 bb gitea thread <thread-id>
 bb gitea auto-fix|auto-merge <owner/repo> <number> on|off
 bb gitea auto-fixer-status|auto-fixer-retry <owner/repo> <number>
@@ -97,6 +99,7 @@ Comment ids come from `bb gitea conversation ... --json`. `--old` puts a line co
 - `conversation`, `files`, and the panel read through a short in-memory cache (about 15 seconds for conversations and lists, 5 minutes for diffs) and refresh in the background. Any write through the plugin clears the affected entries. `show`, `issues`, `prs`, `my-prs`, auto-fixers, and merges always read Gitea directly.
 - Lists cover at most 50 repositories and 200 items. Comments and reviews stop at 500, files at 500, checks at 100. Results that hit a cap say so.
 - Checks come from commit statuses.
+- Gitea marks a draft by title prefix. `draft on` adds `WIP: `; `draft off` removes `WIP:` or `[WIP]`.
 - Agent threads started with **send-agent** are told not to write to Gitea unless asked. Auto-fixers are the exception, within their switches.
 
 ## Development

@@ -25,8 +25,10 @@ Write to Gitea only when the user asks. Read commands accept `--json`. List comm
 - `bb gitea line-comment <owner/repo> <number> <path> <line> [--old] <body>` comments on a line of the head diff. `--old` targets the removed side.
 - `bb gitea metadata <owner/repo> <number> <labels-csv> <assignees-csv>` replaces labels and assignees. An empty string clears a field.
 - `bb gitea set-state <owner/repo> <number> <open|closed>`
+- `bb gitea draft <owner/repo> <number> on|off` adds or removes the `WIP: ` title prefix that marks a Gitea draft. `off` also strips `[WIP]`.
 - `bb gitea review <owner/repo> <number> <APPROVED|REQUEST_CHANGES|COMMENT> [body]`
 - `bb gitea send-agent <issue|pr> <owner/repo> <number>` starts a BB thread on the item. The item's repository needs a BB project checkout. The thread is told not to write to Gitea unless asked.
+- `bb gitea agent-execution [<provider> <model> <reasoning> [fast|default] | default]` shows or sets the model for send-agent threads. `default` uses the project default.
 
 ## Auto-fix and Auto-merge
 
@@ -49,7 +51,7 @@ Turning either on starts an auto-fixer: a hidden BB thread in the repository's p
 
 Reads: `status`, `refresh`, `listItems`, `listMyPullRequests`, `detail`, `conversation`, `pullFiles` (pass the conversation `revision`; the current one is returned if the pull request moved), `repoOptions`, `threadItem`.
 
-Writes: `createIssue`, `comment`, `editComment`, `deleteComment`, `reviewComment` (line comments), `updateMetadata`, `setState`, `review`, `sendAgent`.
+Writes: `createIssue`, `comment`, `editComment`, `deleteComment`, `reviewComment` (line comments), `updateMetadata`, `setState`, `setDraft`, `review`, `sendAgent`, `getAgentExecution`, `setAgentExecution` (`execution`, or null for the project default).
 
 Auto-fixers: `setAutomation` (`repo`, `number`, and `fix`, `merge`, or both), `retryAutoFixer`, `getAutoFixerStatus`, `autoFixerThread`, `listAutoFixerSessions`, `getAutoFixerPreferences`, `setAutoAutomation` (`fix`, `merge`, or both), `setAutoFixerExecution`.
 
