@@ -352,6 +352,35 @@ const unavailableText = {
   "diff-failed": "Gitea did not return the raw diff for this pull request.",
 } as const;
 
+type Check = Extract<
+  ConversationView["conversation"],
+  { kind: "pr" }
+>["checks"][number];
+
+function CheckRow({ check }: { check: Check }) {
+  const content = (
+    <>
+      <span
+        className={`size-2 shrink-0 rounded-full ${check.status === "success" ? "bg-green-500" : check.status === "failure" ? "bg-red-500" : "bg-muted-foreground"}`}
+      />
+      <span className="min-w-0 flex-1 truncate">{check.name}</span>
+      <Badge variant="secondary">{check.status}</Badge>
+    </>
+  );
+  const className =
+    "flex items-center gap-2 border-b border-border px-3 py-2 text-xs";
+  if (!check.url) return <div className={className}>{content}</div>;
+  return (
+    <UrlLink
+      href={check.url}
+      title={`Open ${check.name}`}
+      className={`${className} hover:bg-muted/50`}
+    >
+      {content}
+    </UrlLink>
+  );
+}
+
 function DiffNotice({
   children,
   filesUrl,
@@ -370,6 +399,56 @@ function DiffNotice({
           View on Gitea ↗
         </UrlLink>
       )}
+    </div>
+  );
+}
+
+type DiffStyle = "unified" | "split";
+
+const diffStyleKey = "gitea.diffStyle";
+const diffStyleListeners = new Set<() => void>();
+
+function readDiffStyle(): DiffStyle {
+  try {
+    return localStorage.getItem(diffStyleKey) === "split" ? "split" : "unified";
+  } catch {
+    return "unified";
+  }
+}
+
+function writeDiffStyle(style: DiffStyle) {
+  try {
+    localStorage.setItem(diffStyleKey, style);
+  } catch {}
+  for (const listener of diffStyleListeners) listener();
+}
+
+function useDiffStyle() {
+  return useSyncExternalStore((listener) => {
+    diffStyleListeners.add(listener);
+    return () => diffStyleListeners.delete(listener);
+  }, readDiffStyle);
+}
+
+function DiffStyleToggle() {
+  const style = useDiffStyle();
+  return (
+    <div
+      role="group"
+      aria-label="Diff layout"
+      className="flex overflow-hidden rounded-md border border-border"
+    >
+      {(["unified", "split"] as const).map((option) => (
+        <button
+          key={option}
+          type="button"
+          aria-pressed={style === option}
+          onClick={() => writeDiffStyle(option)}
+          className={`px-2 py-0.5 text-xs capitalize ${style === option ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+        >
+          {option}
+        </button>
+      ))}
     </div>
   );
 }
@@ -405,6 +484,7 @@ function GiteaDiff({
 
 function PatchView({ path, patch }: { path: string; patch: string }) {
   const dark = useIsDarkTheme();
+  const diffStyle = useDiffStyle();
   const fileDiff = useMemo<FileDiffMetadata | null>(() => {
     const normalized = patch.replace(/\r\n/g, "\n").trimEnd();
     const text = normalized.startsWith("diff --git")
@@ -418,12 +498,12 @@ function PatchView({ path, patch }: { path: string; patch: string }) {
   }, [path, patch]);
   const options = useMemo<FileDiffOptions<undefined>>(
     () => ({
-      diffStyle: "unified",
+      diffStyle,
       overflow: "scroll",
       disableFileHeader: true,
       themeType: dark ? "dark" : "light",
     }),
-    [dark],
+    [dark, diffStyle],
   );
   if (!fileDiff)
     return (
@@ -922,11 +1002,14 @@ function ChangedFiles({ view, url }: { view: FilesView; url: string }) {
             aria-label="Changed files"
             className="block h-full min-h-0"
             header={
-              <div className="border-b border-border px-3 py-2 text-xs font-semibold text-foreground">
-                {view.files.length} file{view.files.length === 1 ? "" : "s"}{" "}
-                <span className="font-normal text-muted-foreground">
-                  {fileCounts(totals)}
+              <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs font-semibold text-foreground">
+                <span className="min-w-0 flex-1 truncate">
+                  {view.files.length} file{view.files.length === 1 ? "" : "s"}{" "}
+                  <span className="font-normal text-muted-foreground">
+                    {fileCounts(totals)}
+                  </span>
                 </span>
+                <DiffStyleToggle />
               </div>
             }
             model={model}
@@ -1004,8 +1087,8 @@ function parseSubPath(
 }
 
 const babysitLabels = {
-  idle: "not babysat",
-  watching: "babysitting",
+  idle: "off",
+  watching: "running",
   needs_you: "needs you",
   failed: "failed",
   merged: "merged",
@@ -1024,7 +1107,7 @@ const automationToggles = [
     option: "merge",
     label: "Auto-merge",
     description:
-      "Gitea has no native auto-merge, so the babysitter merges with your tea login once checks, approvals and branch rules allow it. Auto-merge never changes code.",
+      "Merge with your tea login once checks, approvals and branch rules allow it. Auto-merge never changes code.",
   },
 ] as const;
 
@@ -1032,7 +1115,7 @@ function babysitDetail(view: BabysitView) {
   if (view.status === "failed") return view.error;
   if (view.status === "needs_you") return view.note;
   if (view.status === "stopped" && view.cleanupPending)
-    return "The babysitter thread has not been archived yet; BB keeps retrying.";
+    return "The auto-fixer thread has not been archived yet; BB keeps retrying.";
   return "";
 }
 
@@ -1120,7 +1203,7 @@ function BabysitControls({
           onClick={() =>
             void run(
               () => rpc.call("retryBabysit", { repo, number }),
-              "Babysitter resumed",
+              "Auto-fixer resumed",
             )
           }
         >
@@ -1206,13 +1289,15 @@ function BabysitPreferencesControl() {
   const execution: ExperimentalProviderModelPickerValue = preferences.execution;
   const fields = { fix: "autoFix", merge: "autoMerge" } as const;
   return (
-    <div className="space-y-1 text-xs text-muted-foreground">
-      <div className="flex flex-wrap items-center gap-3">
-        <span>For my PRs in BB projects:</span>
-        {automationToggles.map(({ option, label }) => {
+    <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+        {automationToggles.map(({ option, label, description }) => {
           const field = fields[option];
           return (
-            <label key={option} className="flex items-center gap-2">
+            <label
+              key={option}
+              title={description}
+              className="flex items-center gap-2"
+            >
               <input
                 type="checkbox"
                 checked={preferences[field]}
@@ -1225,7 +1310,7 @@ function BabysitPreferencesControl() {
                   );
                 }}
               />
-              Turn on {label}
+              {label}
             </label>
           );
         })}
@@ -1244,12 +1329,6 @@ function BabysitPreferencesControl() {
             });
           }}
         />
-      </div>
-      {automationToggles.map(({ option, label, description }) => (
-        <p key={option}>
-          {label}: {description}
-        </p>
-      ))}
     </div>
   );
 }
@@ -1270,7 +1349,7 @@ function BabysitterSessions() {
         setError(
           reason instanceof Error
             ? reason.message
-            : "Could not load babysitter sessions",
+            : "Could not load auto-fixers",
         ),
       );
   }, [rpc]);
@@ -1286,7 +1365,7 @@ function BabysitterSessions() {
   if (!sessions.length)
     return (
       <div className="rounded-lg border border-border bg-card p-8 text-center text-muted-foreground">
-        No babysitter sessions yet. Turn on Auto-fix or Auto-merge from My PRs.
+        No auto-fixers yet. Turn on Auto-fix or Auto-merge from My PRs.
       </div>
     );
   return (
@@ -1359,7 +1438,6 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     verify,
   );
   const { list, load: loadList } = itemList;
-  const [draft, setDraft] = useState("");
   const [newIssue, setNewIssue] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newBody, setNewBody] = useState("");
@@ -1414,21 +1492,6 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const refresh = useCallback(async () => {
     await Promise.all([loadStatus(), loadList(true)]);
   }, [loadList, loadStatus]);
-  const submitComment = useCallback(async () => {
-    if (!detail || !draft.trim()) return;
-    try {
-      await rpc.call("comment", {
-        repo: detail.repo,
-        number: detail.number,
-        body: draft,
-      });
-      setDraft("");
-      await refreshDetail();
-      toast.success("Comment added");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Comment failed");
-    }
-  }, [detail, draft, refreshDetail, rpc]);
   const setItemState = useCallback(
     async (next: "open" | "closed") => {
       if (!detail) return;
@@ -1756,19 +1819,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   <div className="whitespace-pre-wrap">{comment.body}</div>
                 </article>
               ))}
-              <Textarea
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder="Write a comment"
+              <CommentComposer
+                key={itemKey(detail)}
+                item={detail}
+                onPosted={refreshDetail}
               />
-              <div className="flex justify-end">
-                <Button
-                  disabled={!draft.trim()}
-                  onClick={() => void submitComment()}
-                >
-                  Comment
-                </Button>
-              </div>
             </section>
           </main>
           <aside className="space-y-3">
@@ -1828,18 +1883,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   )}
                   {detail.checks.length ? (
                     detail.checks.map((check, index) => (
-                      <div
-                        key={`${check.name}-${index}`}
-                        className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs"
-                      >
-                        <span
-                          className={`size-2 rounded-full ${check.status === "success" ? "bg-green-500" : check.status === "failure" ? "bg-red-500" : "bg-muted-foreground"}`}
-                        />
-                        <span className="min-w-0 flex-1 truncate">
-                          {check.name}
-                        </span>
-                        <Badge variant="secondary">{check.status}</Badge>
-                      </div>
+                      <CheckRow key={`${check.name}-${index}`} check={check} />
                     ))
                   ) : (
                     <p className="p-3 text-xs text-muted-foreground">
@@ -1956,7 +2000,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   {view === "my-prs" ? count : ""}
                 </Badge>
               </TabsTrigger>
-              <TabsTrigger value="babysitters">Babysitters</TabsTrigger>
+              <TabsTrigger value="babysitters">Auto-fixers</TabsTrigger>
               <TabsTrigger value="issues">Issues</TabsTrigger>
               <TabsTrigger value="pulls">Pull requests</TabsTrigger>
             </TabsList>
@@ -2151,6 +2195,59 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   );
 }
 
+function CommentComposer({
+  item,
+  onPosted,
+}: {
+  item: Pick<Item, "repo" | "number">;
+  onPosted: () => Promise<unknown>;
+}) {
+  const rpc = useRpc<typeof giteaRpcContract>();
+  const [draft, setDraft] = useState("");
+  const [posting, setPosting] = useState(false);
+  const submit = async () => {
+    if (!draft.trim()) return;
+    setPosting(true);
+    try {
+      await rpc.call("comment", {
+        repo: item.repo,
+        number: item.number,
+        body: draft,
+      });
+      setDraft("");
+      await onPosted();
+      toast.success("Comment added");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Comment failed");
+    } finally {
+      setPosting(false);
+    }
+  };
+  return (
+    <div className="space-y-2">
+      <Textarea
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            void submit();
+          }
+        }}
+        placeholder="Write a comment"
+      />
+      <div className="flex justify-end">
+        <Button
+          disabled={posting || !draft.trim()}
+          onClick={() => void submit()}
+        >
+          Comment
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
   const rpc = useRpc<typeof giteaRpcContract>();
   const [item, setItem] = useState<ItemRef | null>(null);
@@ -2246,6 +2343,11 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
             <div className="whitespace-pre-wrap">{comment.body}</div>
           </article>
         ))}
+        <CommentComposer
+          key={itemKey(detail)}
+          item={detail}
+          onPosted={display.reload}
+        />
       </section>
     </>
   );

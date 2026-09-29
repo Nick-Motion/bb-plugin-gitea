@@ -1756,7 +1756,7 @@ export default async function plugin(bb: BbPluginApi) {
     );
     if (!(await writeIfCurrent(session, watching(session, policy, now()))))
       throw new Error(
-        `The babysitter for ${repo}#${number} changed while its automation was updated; try again.`,
+        `The auto-fixer for ${repo}#${number} changed while its automation was updated; try again.`,
       );
     const steer = async () => {
       await withdrawQueued(session.threadId);
@@ -1775,13 +1775,13 @@ export default async function plugin(bb: BbPluginApi) {
     const delivery = await steer().catch(async (error: unknown) => {
       await stopBabysitter(repo, number);
       throw new Error(
-        `Could not deliver the automation change, so the babysitter was stopped: ${message(error)}`,
+        `Could not deliver the automation change, so the auto-fixer was stopped: ${message(error)}`,
       );
     });
     if (delivery.delivery === "sent") return;
     await stopBabysitter(repo, number);
     throw new Error(
-      `The babysitter for ${repo}#${number} could not take the automation change immediately, so it was stopped; turn Auto-fix or Auto-merge on again to restart it.`,
+      `The auto-fixer for ${repo}#${number} could not take the automation change immediately, so it was stopped; turn Auto-fix or Auto-merge on again to restart it.`,
     );
   }
 

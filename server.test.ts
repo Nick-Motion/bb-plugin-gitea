@@ -2037,7 +2037,7 @@ it("stops a running babysitter whose authority change cannot be delivered", asyn
   state.sendGate = Promise.reject(new Error("host offline"));
   state.sendGate.catch(() => undefined);
   await expect(setAutomation(host, pr42, { merge: false })).rejects.toThrow(
-    "Could not deliver the automation change, so the babysitter was stopped: host offline",
+    "Could not deliver the automation change, so the auto-fixer was stopped: host offline",
   );
   await expect(babysitStatus(host)).resolves.toMatchObject({
     status: "stopped",
