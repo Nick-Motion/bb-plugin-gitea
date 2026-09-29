@@ -18,13 +18,13 @@ The plugin id is `gitea` and it adds the `bb gitea` command.
 
 ## Configure
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `baseUrl` | `https://gitea.com` | Gitea root URL. HTTPS is required except on localhost. A path prefix such as `/gitea/` is kept. |
-| `teaProfile` | auto | `tea` login to use. Leave empty when one login matches `baseUrl`. |
-| `extraRepos` | empty | Extra `owner/repo` names, comma or space separated. |
-| `cacheEntryLimitMiB` | 16 | Largest Gitea response the plugin reads and caches, in MiB. Larger responses fail with an error. |
-| `cacheLimitMiB` | 64 | Memory for each display cache (conversations, diffs, lists), in MiB. |
+| Setting              | Default             | Meaning                                                                                          |
+| -------------------- | ------------------- | ------------------------------------------------------------------------------------------------ |
+| `baseUrl`            | `https://gitea.com` | Gitea root URL. HTTPS is required except on localhost. A path prefix such as `/gitea/` is kept.  |
+| `teaProfile`         | auto                | `tea` login to use. Leave empty when one login matches `baseUrl`.                                |
+| `extraRepos`         | empty               | Extra `owner/repo` names, comma or space separated.                                              |
+| `cacheEntryLimitMiB` | 16                  | Largest Gitea response the plugin reads and caches, in MiB. Larger responses fail with an error. |
+| `cacheLimitMiB`      | 64                  | Memory for each display cache (conversations, diffs, lists), in MiB.                             |
 
 ```sh
 bb plugin config gitea set baseUrl https://gitea.example.com
@@ -63,7 +63,7 @@ While idle, an auto-fixer waits with `bb gitea pr-watch`, which checks the pull 
 
 Gitea has no native auto-merge. The auto-fixer acts with your `tea` login's permissions, and the limits above are enforced by its instructions, not by Gitea. A reported merge or close counts only when Gitea confirms it.
 
-The top of **My PRs** has **Auto-fix all** and **Auto-merge all**. When on, the plugin checks every 30 seconds and starts auto-fixers for your open pull requests that have none. The same bar picks the model for new auto-fixers.
+The top of **My PRs** has **Auto-fix all** and **Auto-merge all**. When on, the plugin checks every five minutes, and immediately when switched on, and starts auto-fixers for your open pull requests that have none. The same bar picks the model for new auto-fixers.
 
 ## CLI
 

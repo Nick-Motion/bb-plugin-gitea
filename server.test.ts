@@ -2334,10 +2334,12 @@ it("keeps Auto-merge running when enabling Auto-fix queues the expanded authorit
   const { host, state } = await startAutoFixers();
   await setAutomation(host, pr42, { merge: true });
   state.queueSends = true;
-  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject({
-    status: "watching",
-    automation: { fix: true, merge: true },
-  });
+  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
+    {
+      status: "watching",
+      automation: { fix: true, merge: true },
+    },
+  );
   expect(state.queued.get("auto-fixer-1")?.[0]?.text).toContain(
     "Auto-fix is on. Fix failing CI checks",
   );
@@ -2803,4 +2805,54 @@ it("waits for cheap pull request change signals with pr-watch", async () => {
     (await cli(["pr-watch", "acme/widgets", "42", "--timeout", "601"]))
       .exitCode,
   ).not.toBe(0);
+});
+
+it("checks auto-fixer sessions every 30 seconds but refreshes the authored pull request list only every five minutes", async () => {
+  const { host, gitea } = await startAutoFixers();
+  await enable(host, pr42);
+  await rpc(host, "setAutoAutomation", { fix: true });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const reads = () => host.harness.sdk.callsTo("threads.get").length;
+  const service = host.harness.behavior.runService("auto-fixers");
+  const pass = async () => {
+    const before = reads();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(reads()).toBeGreaterThan(before));
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBeGreaterThan(0));
+  };
+  await vi.waitFor(() => expect(vi.getTimerCount()).toBeGreaterThan(0));
+  const lists = gitea.listRequests;
+  for (let tick = 0; tick < 9; tick += 1) await pass();
+  expect(gitea.listRequests).toBe(lists);
+  await pass();
+  expect(gitea.listRequests).toBeGreaterThan(lists);
+  service.controller.abort();
+  await service.done;
+  vi.useRealTimers();
+});
+
+it("reports a stopped auto-fixer as inactive even when the pull request changed", async () => {
+  const { host, gitea } = await startAutoFixers();
+  const cli = (argv: string[]) => host.harness.behavior.runCli(argv);
+  await enable(host, pr42);
+  const initial = JSON.parse(
+    (await cli(["pr-watch", "acme/widgets", "42", "--json"])).stdout,
+  ) as { token: string };
+  await disable(host, pr42);
+  gitea.pulls.set("acme/widgets#42", {
+    ...gitea.pulls.get("acme/widgets#42"),
+    comments: 1,
+  });
+  for (const since of [["--since", initial.token], []]) {
+    const watched = await cli([
+      "pr-watch",
+      "acme/widgets",
+      "42",
+      ...since,
+      "--timeout",
+      "0",
+    ]);
+    expect(watched.stdout).toMatch(/^inactive /);
+    expect(watched.stdout).toContain("auto-fixer stopped");
+  }
 });

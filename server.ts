@@ -210,7 +210,9 @@ export const giteaRpcContract = defineRpcContract({
       refresh: z.boolean().default(false),
     }),
     output: listOutputSchema.extend({
-      items: z.array(itemSchema.extend({ autoFixer: autoFixerViewSchema.optional() })),
+      items: z.array(
+        itemSchema.extend({ autoFixer: autoFixerViewSchema.optional() }),
+      ),
       account: z.string(),
       freshness: freshnessSchema,
     }),
@@ -1478,7 +1480,9 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
   const autoFixerPrefix = "auto-fixer:";
+  /** Session reconciliation is cheap; auto-start refreshes every authored pull request, so it runs less often. */
   const autoFixerIntervalMs = 30_000;
+  const autoStartIntervalMs = 5 * 60_000;
   const autoFixerKey = (repo: string, number: number) =>
     `${autoFixerPrefix}${pullKey(repo, number)}`;
   const autoFixerThreadKey = (threadId: string) =>
@@ -1668,12 +1672,12 @@ export default async function plugin(bb: BbPluginApi) {
         signal,
         session: session?.status ?? null,
       } as const;
+      if (session !== null && session.status !== "watching")
+        return { ...result, outcome: "inactive" as const };
       if (since === null || token !== since)
         return { ...result, outcome: "changed" as const };
       if (signal.merged || signal.state !== "open")
         return { ...result, outcome: "changed" as const };
-      if (session !== null && session.status !== "watching")
-        return { ...result, outcome: "inactive" as const };
       if (Date.now() + pullWatchIntervalMs > deadline)
         return { ...result, outcome: "unchanged" as const };
       await new Promise((resolve) => setTimeout(resolve, pullWatchIntervalMs));
@@ -2241,10 +2245,14 @@ export default async function plugin(bb: BbPluginApi) {
   );
   bb.background.service("auto-fixers", {
     async start(signal) {
+      let nextAutoStartAt = 0;
       while (!signal.aborted) {
         try {
           await reconcileSessions(signal);
-          await reconcileAutoAutoFixer(signal);
+          if (Date.now() >= nextAutoStartAt) {
+            nextAutoStartAt = Date.now() + autoStartIntervalMs;
+            await reconcileAutoAutoFixer(signal);
+          }
         } catch (error) {
           if (signal.aborted) break;
           bb.log.warn(
