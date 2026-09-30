@@ -557,6 +557,42 @@ it("accepts plain HTTP only for loopback instances", async () => {
   expect(calls).toEqual([]);
 });
 
+it("lists only issues assigned to the authenticated account and creates from My Issues with self-assignment", async () => {
+  const { host, calls } = await start(({ endpoint, method }) => {
+    if (endpoint.endsWith("/api/v1/user")) return { json: { login: "dev" } };
+    if (method === "POST" && endpoint.endsWith("/issues"))
+      return { status: 201, json: issue(9) };
+    if (endpoint.includes("/issues?"))
+      return { json: [
+        { ...issue(1), assignees: [{ login: "dev" }] },
+        { ...issue(2), assignees: [{ login: "other" }] },
+        { ...issue(3), assignees: [{ login: "dev" }], pull_request: {} },
+      ] };
+    return { json: [] };
+  });
+  const mine = giteaRpcContract.listMyIssues.output.parse(
+    await host.harness.behavior.callRpc("listMyIssues", {
+      repo: "acme/widgets", state: "open", query: "", refresh: true,
+    }),
+  );
+  expect(mine.items.map((item) => item.number)).toEqual([1]);
+  await expect(host.harness.behavior.runCli(["my-issues", "acme/widgets", "--json"]))
+    .resolves.toMatchObject({ exitCode: 0, stdout: expect.stringContaining('"login":"dev"') });
+  expect(calls.find(({ endpoint }) => endpoint.includes("/issues?"))?.endpoint)
+    .toContain("assigned_by=dev");
+  await host.harness.behavior.callRpc("createIssue", {
+    repo: "acme/widgets", title: "Mine", body: "", assignToMe: true,
+  });
+  await host.harness.behavior.callRpc("createIssue", {
+    repo: "acme/widgets", title: "Ordinary", body: "",
+  });
+  expect(calls.filter(({ method, endpoint }) => method === "POST" && endpoint.endsWith("/issues"))
+    .map(({ body }) => body)).toEqual([
+      { title: "Mine", body: "", assignee: "dev" },
+      { title: "Ordinary", body: "" },
+    ]);
+});
+
 it("sends mutation JSON on stdin to the matching REST endpoints and accepts empty responses", async () => {
   const { host, calls } = await start(({ method, endpoint }) => {
     if (method === "POST" && endpoint.endsWith("/issues"))

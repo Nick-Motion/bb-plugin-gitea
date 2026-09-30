@@ -77,7 +77,7 @@ type AutoFixerView = MyPulls["items"][number]["autoFixer"];
 type AutoFixerSessions = PluginRpcResult<
   (typeof giteaRpcContract)["listAutoFixerSessions"]
 >["sessions"];
-type View = "my-prs" | "auto-fixers" | "issues" | "pulls";
+type View = "my-prs" | "my-issues" | "auto-fixers" | "issues" | "pulls";
 type DetailSection = "conversation" | "files";
 type Status = PluginRpcResult<(typeof giteaRpcContract)["status"]>;
 type ItemState = "open" | "closed" | "all";
@@ -329,6 +329,13 @@ function useDebouncedValue<T>(value: T, delayMs: number) {
 
 const openMyPullRequests: ListFilters = {
   view: "my-prs",
+  state: "open",
+  repo: "all",
+  query: "",
+};
+
+const openMyIssues: ListFilters = {
+  view: "my-issues",
   state: "open",
   repo: "all",
   query: "",
@@ -813,6 +820,13 @@ async function readItemList(
   refresh: boolean,
 ): Promise<ItemList> {
   const input = { state, query, refresh, ...(repo === "all" ? {} : { repo }) };
+  if (view === "my-issues") {
+    const { account, items, truncated, errors, freshness } = await rpc.call(
+      "listMyIssues",
+      input,
+    );
+    return { account, items, truncated, errors, freshness, autoFixers: new Map() };
+  }
   if (view === "my-prs") {
     const { account, items, truncated, errors, freshness } = await rpc.call(
       "listMyPullRequests",
@@ -1564,6 +1578,17 @@ function AgentExecutionControl() {
       ...next,
       serviceTier: next.serviceTier ?? "default",
     };
+    // The host picker can emit its normalized value on render. Treat an
+    // omitted service tier as default so unchanged selections never save
+    // or trigger another render/normalization cycle.
+    if (
+      previous === stored ||
+      (previous && stored &&
+        previous.providerId === stored.providerId &&
+        previous.model === stored.model &&
+        previous.reasoningLevel === stored.reasoningLevel &&
+        (previous.serviceTier ?? "default") === stored.serviceTier)
+    ) return;
     setExecution(stored);
     setSaving(true);
     try {
@@ -1848,7 +1873,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   );
   const { list, load: loadList } = itemList;
   const openMine = useItemList(openMyPullRequests, memory, settings, verify);
+  const openIssues = useItemList(openMyIssues, memory, settings, verify);
   const [newIssue, setNewIssue] = useState(false);
+  const fromMyIssues = subPath === "my-issues/new";
   const [newTitle, setNewTitle] = useState("");
   const [newBody, setNewBody] = useState("");
   const [reviewBody, setReviewBody] = useState("");
@@ -1901,8 +1928,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const { reload: refreshDetail } = display;
   useEffect(() => {
     if (!route) {
-      setNewIssue(subPath === "new");
+      setNewIssue(subPath === "new" || subPath === "my-issues/new");
       if (subPath === "new") setView("issues");
+      if (subPath === "my-issues/new") setView("my-issues");
       return;
     }
     setView(route.kind === "pr" ? "pulls" : "issues");
@@ -2017,6 +2045,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
         repo,
         title: newTitle,
         body: newBody,
+        assignToMe: fromMyIssues,
       });
       setNewIssue(false);
       setNewTitle("");
@@ -2029,13 +2058,17 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
         error instanceof Error ? error.message : "Issue creation failed",
       );
     }
-  }, [loadItems, newBody, newTitle, openItem, repo, rpc]);
+  }, [fromMyIssues, loadItems, newBody, newTitle, openItem, repo, rpc]);
 
   const shownList = list.state === "ready" ? list.value : null;
   const visibleItems = shownList?.items ?? [];
   const count =
     openMine.list.state === "ready"
       ? `${openMine.list.value.items.length}${openMine.list.value.truncated ? "+" : ""}`
+      : undefined;
+  const issueCount =
+    openIssues.list.state === "ready"
+      ? `${openIssues.list.value.items.length}${openIssues.list.value.truncated ? "+" : ""}`
       : undefined;
   if (newIssue) {
     return (
@@ -2046,9 +2079,13 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               size="sm"
               variant="ghost"
               className="h-7 px-2"
-              onClick={() => navigate.toPluginPanel("gitea")}
+              onClick={() => {
+                navigate.toPluginPanel("gitea");
+                setNewIssue(false);
+                setView(fromMyIssues ? "my-issues" : "issues");
+              }}
             >
-              ← Issues
+              ← {fromMyIssues ? "My Issues" : "Issues"}
             </Button>
             <span>New issue</span>
           </div>
@@ -2445,6 +2482,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   <Badge variant="secondary">{count}</Badge>
                 )}
               </TabsTrigger>
+              <TabsTrigger value="my-issues" className="gap-1.5">
+                My Issues
+                {issueCount === undefined ? null : (
+                  <Badge variant="secondary">{issueCount}</Badge>
+                )}
+              </TabsTrigger>
               <TabsTrigger value="auto-fixers">Auto-fixers</TabsTrigger>
               <TabsTrigger value="issues">Issues</TabsTrigger>
               <TabsTrigger value="pulls">Pull requests</TabsTrigger>
@@ -2454,11 +2497,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           <Button size="sm" variant="outline" onClick={() => void refresh()}>
             Refresh
           </Button>
-          {view === "issues" && (
+          {(view === "issues" || view === "my-issues") && (
             <Button
               size="sm"
               onClick={() =>
-                navigate.toPluginPanel("gitea", { subPath: "new" })
+                navigate.toPluginPanel("gitea", { subPath: view === "my-issues" ? "my-issues/new" : "new" })
               }
             >
               New issue
@@ -2614,10 +2657,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                     ))
                   ) : (
                     <div className="p-8 text-center text-muted-foreground">
-                      {view === "my-prs" && !status?.login
+                      {(view === "my-prs" || view === "my-issues") && !status?.login
                         ? "Install tea and sign in with a matching Gitea login profile to see your pull requests."
                         : view === "my-prs"
                           ? "No pull requests authored by you in tracked repositories."
+                          : view === "my-issues"
+                            ? "No issues assigned to you in tracked repositories."
                           : repoOptions.length
                             ? "No matching items."
                             : "Add repositories in settings or attach a Gitea checkout to a BB project."}

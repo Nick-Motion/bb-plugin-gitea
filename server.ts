@@ -252,6 +252,7 @@ export const giteaRpcContract = defineRpcContract({
       repo: repositorySchema,
       title: z.string().trim().min(1).max(256),
       body: z.string().max(100000),
+      assignToMe: z.boolean().default(false),
     }),
     output: itemSchema,
   },
@@ -364,6 +365,19 @@ export const giteaRpcContract = defineRpcContract({
     output: z.object({
       repos: z.number().int().nonnegative(),
       items: z.number().int().nonnegative(),
+    }),
+  },
+  listMyIssues: {
+    input: z.object({
+      repo: repositorySchema.optional(),
+      state: z.enum(["open", "closed", "all"]).default("open"),
+      query: z.string().max(200).default(""),
+      refresh: z.boolean().default(false),
+    }),
+    output: listOutputSchema.extend({
+      account: z.string(),
+      freshness: freshnessSchema,
+      login: z.string(),
     }),
   },
   listMyPullRequests: {
@@ -712,14 +726,20 @@ export default async function plugin(bb: BbPluginApi) {
     classify: classifyDisplayFailure,
     onBackgroundSettled: publishDisplay,
   });
+  const myIssueLists = new DisplayCache<{ login: string; page: ItemPage }>({
+    bounds: cacheBounds(32),
+    now: Date.now,
+    classify: classifyDisplayFailure,
+    onBackgroundSettled: publishDisplay,
+  });
   const myPullLists = new DisplayCache<{ login: string; page: ItemPage }>({
     bounds: cacheBounds(32),
     now: Date.now,
     classify: classifyDisplayFailure,
     onBackgroundSettled: publishDisplay,
   });
-  const displays = [conversations, pullFiles, itemLists, myPullLists];
-  const displayEntries = [64, 16, 32, 32];
+  const displays = [conversations, pullFiles, itemLists, myPullLists, myIssueLists];
+  const displayEntries = [64, 16, 32, 32, 32];
   function forgetDisplay() {
     const removed = displays.map((cache) => cache.clear());
     if (removed.includes(true)) publishDisplay(null);
@@ -732,6 +752,7 @@ export default async function plugin(bb: BbPluginApi) {
   function forgetLists() {
     itemLists.invalidate(listTag);
     myPullLists.invalidate(listTag);
+    myIssueLists.invalidate(listTag);
     publishDisplay(listTag);
   }
   bb.onDispose(() => {
@@ -1367,6 +1388,7 @@ export default async function plugin(bb: BbPluginApi) {
     state: "open" | "closed" | "all",
     signal?: AbortSignal,
     author?: string,
+    assignee?: string,
   ): Promise<ItemPage> {
     const discovered = repo ? [{ repo, projectId: null }] : await repos();
     const candidates = discovered.slice(0, maxListRepositories);
@@ -1378,6 +1400,7 @@ export default async function plugin(bb: BbPluginApi) {
             state,
             type: kind === "pr" ? "pulls" : "issues",
             ...(author && { created_by: author }),
+            ...(assignee && { assigned_by: assignee }),
           })}`,
         );
         return { repo: name, page: await paginated(endpointPath, signal) };
@@ -1438,6 +1461,23 @@ export default async function plugin(bb: BbPluginApi) {
     if (page.reachable === 0 && page.errors.length > 0)
       throw new Error(page.errors[0]!.message);
     return page;
+  }
+  async function fetchMyIssues(
+    repo: string | undefined,
+    state: "open" | "closed" | "all",
+    signal: AbortSignal,
+  ) {
+    const login = await currentLogin(signal);
+    const page = await fetchItems("issue", repo, state, signal, undefined, login);
+    if (page.reachable === 0 && page.errors.length > 0)
+      throw new Error(page.errors[0]!.message);
+    return {
+      login,
+      page: {
+        ...page,
+        items: page.items.filter((item) => item.assignees.includes(login)),
+      },
+    };
   }
   async function fetchMyPulls(
     repo: string | undefined,
@@ -2486,12 +2526,13 @@ export default async function plugin(bb: BbPluginApi) {
       return { ...display.value, freshness: freshnessView(display.freshness) };
     },
     createIssue: async (
-      { repo, title, body },
+      { repo, title, body, assignToMe },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
+      const assignee = assignToMe ? await currentLogin(signal) : undefined;
       const created = await api(repoPath(repo, "issues"), {
         method: "POST",
-        body: { title, body },
+        body: { title, body, ...(assignee && { assignee }) },
         signal,
       });
       forgetLists();
@@ -2752,6 +2793,26 @@ export default async function plugin(bb: BbPluginApi) {
       repoOptionCache.clear();
       return { repos: (await repos()).length, items: 0 };
     },
+    listMyIssues: async (
+      { repo, state, query, refresh },
+      { experimental_signal: signal }: RpcContext = {},
+    ) => {
+      const mine = await readList(
+        myIssueLists,
+        "my-issues",
+        repo,
+        state,
+        refresh,
+        (loadSignal) => fetchMyIssues(repo, state, loadSignal),
+        signal,
+      );
+      return {
+        ...pickItems(mine.value.page, query),
+        account: mine.account,
+        freshness: mine.freshness,
+        login: mine.value.login,
+      };
+    },
     listMyPullRequests: async (
       { repo, state, query, refresh },
       { experimental_signal: signal }: RpcContext = {},
@@ -2985,6 +3046,11 @@ export default async function plugin(bb: BbPluginApi) {
         name: "refresh",
         summary: "Refresh repository availability",
         usage: "bb gitea refresh [--json]",
+      },
+      {
+        name: "my-issues",
+        summary: "List issues assigned to your Gitea account",
+        usage: "bb gitea my-issues [owner/repo] [--state open|closed|all] [--query text] [--json]",
       },
       {
         name: "my-prs",
@@ -3300,6 +3366,18 @@ export default async function plugin(bb: BbPluginApi) {
           pullRefSchema.parse({ repo: values[0], number: Number(values[1]) });
         const describePreferences = (value: AutoFixerPreferences) =>
           `Turn on Auto-fix for my PRs: ${onOff(value.autoFix)}\nTurn on Auto-merge for my PRs: ${onOff(value.autoMerge)}\nExecution: ${value.execution.providerId} ${value.execution.model} ${value.execution.reasoningLevel} ${value.execution.serviceTier}`;
+        if (command === "my-issues") {
+          const input = giteaRpcContract.listMyIssues.input.parse({
+            ...(values[0] ? { repo: values[0] } : {}),
+            state,
+            query,
+            refresh: true,
+          });
+          const value = await handlers.listMyIssues(input);
+          return succeed(value,
+            `${value.items.map((entry) => `${entry.repo}#${entry.number} ${entry.state} ${entry.title}`).join("\n") || "No issues assigned to you."}${value.truncated ? "\nResults are capped; narrow the repository or query." : ""}${value.errors.map((entry) => `\n${entry.repo}: ${entry.message}`).join("")}`,
+          );
+        }
         if (command === "my-prs") {
           const input = giteaRpcContract.listMyPullRequests.input.parse({
             ...(values[0] ? { repo: values[0] } : {}),
