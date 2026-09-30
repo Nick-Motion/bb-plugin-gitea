@@ -1578,6 +1578,17 @@ function AgentExecutionControl() {
       ...next,
       serviceTier: next.serviceTier ?? "default",
     };
+    // The host picker can emit its normalized value on render. Treat an
+    // omitted service tier as default so unchanged selections never save
+    // or trigger another render/normalization cycle.
+    if (
+      previous === stored ||
+      (previous && stored &&
+        previous.providerId === stored.providerId &&
+        previous.model === stored.model &&
+        previous.reasoningLevel === stored.reasoningLevel &&
+        (previous.serviceTier ?? "default") === stored.serviceTier)
+    ) return;
     setExecution(stored);
     setSaving(true);
     try {
