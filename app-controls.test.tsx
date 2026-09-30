@@ -35,14 +35,24 @@ const list = {
   freshness,
 };
 
-it("opens My Issues and requests assigned issues", async () => {
+it.each([false, true])("shows the My Issues badge and opens assigned issues (truncated: %s)", async (truncated) => {
   renderSlot(app.navPanels[0]!, { subPath: "" }, {
     rpc: {
       status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
-      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false }),
+      getAutoFixerPreferences: () => ({
+        autoFix: false,
+        autoMerge: false,
+        execution: {
+          providerId: "codex",
+          model: "gpt-5.6-luna",
+          reasoningLevel: "medium",
+          serviceTier: "default",
+        },
+      }),
       listMyPullRequests: () => ({ ...list, items: [], login: "dev" }),
       listMyIssues: () => ({
         ...list,
+        truncated,
         items: [{ ...item, number: 7, kind: "issue", title: "Assigned issue", assignees: ["dev"] }],
         login: "dev",
       }),
@@ -50,8 +60,10 @@ it("opens My Issues and requests assigned issues", async () => {
   });
   expect(screen.getByRole("tab", { name: /My PRs/ }).getAttribute("aria-selected"))
     .toBe("true");
-  fireEvent.mouseDown(screen.getByRole("tab", { name: "My Issues" }), { button: 0 });
+  const issuesTab = await screen.findByRole("tab", { name: `My Issues 1${truncated ? "+" : ""}` });
+  fireEvent.mouseDown(issuesTab, { button: 0 });
   expect(await screen.findByText("Assigned issue")).toBeTruthy();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: /My PRs/ }), { button: 0 });
 });
 
 it("shows Auto-fix and Auto-merge controls for a Pull requests row", async () => {

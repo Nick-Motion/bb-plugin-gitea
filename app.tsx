@@ -334,6 +334,13 @@ const openMyPullRequests: ListFilters = {
   query: "",
 };
 
+const openMyIssues: ListFilters = {
+  view: "my-issues",
+  state: "open",
+  repo: "all",
+  query: "",
+};
+
 function listKey({ view, state, repo, query }: ListFilters) {
   return view === "auto-fixers"
     ? null
@@ -1855,6 +1862,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   );
   const { list, load: loadList } = itemList;
   const openMine = useItemList(openMyPullRequests, memory, settings, verify);
+  const openIssues = useItemList(openMyIssues, memory, settings, verify);
   const [newIssue, setNewIssue] = useState(false);
   const fromMyIssues = subPath === "my-issues/new";
   const [newTitle, setNewTitle] = useState("");
@@ -2046,6 +2054,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const count =
     openMine.list.state === "ready"
       ? `${openMine.list.value.items.length}${openMine.list.value.truncated ? "+" : ""}`
+      : undefined;
+  const issueCount =
+    openIssues.list.state === "ready"
+      ? `${openIssues.list.value.items.length}${openIssues.list.value.truncated ? "+" : ""}`
       : undefined;
   if (newIssue) {
     return (
@@ -2459,7 +2471,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   <Badge variant="secondary">{count}</Badge>
                 )}
               </TabsTrigger>
-              <TabsTrigger value="my-issues">My Issues</TabsTrigger>
+              <TabsTrigger value="my-issues" className="gap-1.5">
+                My Issues
+                {issueCount === undefined ? null : (
+                  <Badge variant="secondary">{issueCount}</Badge>
+                )}
+              </TabsTrigger>
               <TabsTrigger value="auto-fixers">Auto-fixers</TabsTrigger>
               <TabsTrigger value="issues">Issues</TabsTrigger>
               <TabsTrigger value="pulls">Pull requests</TabsTrigger>
