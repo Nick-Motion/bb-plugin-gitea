@@ -4,6 +4,7 @@ Browse and act on Gitea issues and pull requests from BB, and let a BB agent fix
 
 ## Requirements
 
+- BB 0.44.0 or newer with bundled plugin SDK 0.5.29 or newer.
 - `tea` 0.15.1 or newer, signed in with `tea login add`.
 - A BB project whose `origin` remote points at the Gitea instance, or repositories listed in `extraRepos`. Agent features need a project checkout.
 
