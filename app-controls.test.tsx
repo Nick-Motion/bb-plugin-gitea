@@ -35,6 +35,25 @@ const list = {
   freshness,
 };
 
+it("opens My Issues and requests assigned issues", async () => {
+  renderSlot(app.navPanels[0]!, { subPath: "" }, {
+    rpc: {
+      status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
+      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false }),
+      listMyPullRequests: () => ({ ...list, items: [], login: "dev" }),
+      listMyIssues: () => ({
+        ...list,
+        items: [{ ...item, number: 7, kind: "issue", title: "Assigned issue", assignees: ["dev"] }],
+        login: "dev",
+      }),
+    },
+  });
+  expect(screen.getByRole("tab", { name: /My PRs/ }).getAttribute("aria-selected"))
+    .toBe("true");
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "My Issues" }), { button: 0 });
+  expect(await screen.findByText("Assigned issue")).toBeTruthy();
+});
+
 it("shows Auto-fix and Auto-merge controls for a Pull requests row", async () => {
   renderSlot(app.navPanels[0]!, { subPath: "" }, {
     rpc: {
