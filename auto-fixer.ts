@@ -89,6 +89,13 @@ const sessionBase = z.object({
   policy: autoFixerPolicySchema,
 });
 export const autoFixerSessionSchema = z.discriminatedUnion("status", [
+  sessionBase.extend({
+    status: z.literal("archived"),
+    outcome: z.enum(["merged", "closed"]),
+    archivedAt: z.string(),
+    mergedAt: z.string().optional(),
+    closedAt: z.string().optional(),
+  }),
   sessionBase.extend({ status: z.literal("watching") }),
   sessionBase.extend({ status: z.literal("needs_you"), note: z.string() }),
   sessionBase.extend({
@@ -208,6 +215,7 @@ export function sessionActions(session: AutoFixerSession): AutoFixerAction[] {
       return ["stop", "retry"];
     case "stopped":
       return ["start"];
+    case "archived":
     case "merged":
     case "closed":
       return [];
@@ -253,8 +261,10 @@ export function decideStart(input: {
   lifecycle: PullLifecycle;
 }): StartDecision {
   const { session, lifecycle } = input;
-  if (session?.status === "merged") return { kind: "reject", reason: "merged" };
-  if (session !== null && session.status !== "closed")
+  if (session?.status === "merged" ||
+      (session?.status === "archived" && session.outcome === "merged"))
+    return { kind: "reject", reason: "merged" };
+  if (session !== null && session.status !== "closed" && session.status !== "archived")
     return { kind: "existing", threadId: session.threadId };
   if (lifecycle.state !== "open")
     return { kind: "reject", reason: lifecycle.state };
@@ -317,8 +327,10 @@ export function decideAutomation(
   );
   if (policy === null)
     return decideStop(session) ? { kind: "stop" } : { kind: "unchanged" };
-  if (session?.status === "merged") return { kind: "reject", reason: "merged" };
-  if (session === null || session.status === "closed")
+  if (session?.status === "merged" ||
+      (session?.status === "archived" && session.outcome === "merged"))
+    return { kind: "reject", reason: "merged" };
+  if (session === null || session.status === "closed" || session.status === "archived")
     return { kind: "start", policy };
   if (session.status !== "stopped" && samePolicy(session.policy, policy))
     return { kind: "unchanged" };
@@ -352,6 +364,9 @@ export type ResumableSession = Extract<
 export function decideRetry(session: AutoFixerSession | null): RetryDecision {
   switch (session?.status) {
     case undefined:
+      return { kind: "reject", reason: "inactive" };
+    case "archived":
+      return { kind: "reject", reason: session.outcome === "merged" ? "merged" : "inactive" };
     case "closed":
     case "stopped":
       return { kind: "reject", reason: "inactive" };
@@ -372,7 +387,7 @@ export function decideRetry(session: AutoFixerSession | null): RetryDecision {
 
 export function decideStop(
   session: AutoFixerSession | null,
-): Exclude<AutoFixerSession, { status: "merged" | "closed" }> | null {
+): Exclude<AutoFixerSession, { status: "merged" | "closed" | "archived" }> | null {
   switch (session?.status) {
     case "watching":
     case "needs_you":
@@ -497,6 +512,7 @@ export function onCleanupFailed(
   detail: string,
   now: string,
 ): AutoFixerSession {
+  if (session.status === "merged" || session.status === "closed") return { ...session, updatedAt: now };
   if (session.status === "stopped")
     return { ...session, cleanupPending: true, updatedAt: now };
   const previous =
@@ -698,4 +714,19 @@ export function describeSignal(signal: PullSignal): string {
   const mergeable =
     signal.mergeable === null ? "unknown" : signal.mergeable ? "yes" : "no";
   return `state ${signal.lifecycle} · head ${signal.head.slice(0, 12) || "unknown"} · checks ${signal.checks || "none"} · mergeable ${mergeable} · updated ${signal.updatedAt || "unknown"}`;
+}
+
+export function archived(
+  session: Extract<AutoFixerSession, { status: "merged" | "closed" }>,
+  now: string,
+): AutoFixerSession {
+  return {
+    ...retained(session, now),
+    status: "archived",
+    outcome: session.status,
+    archivedAt: now,
+    ...(session.status === "merged"
+      ? { mergedAt: session.mergedAt }
+      : { closedAt: session.closedAt }),
+  };
 }

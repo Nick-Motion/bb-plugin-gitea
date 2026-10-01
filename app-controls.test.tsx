@@ -125,3 +125,20 @@ it("disables metadata suggestions while the save is pending", async () => {
   expect(slot.rpcCalls.filter(call => call.method === "updateMetadata")).toHaveLength(1);
   await act(async () => release());
 });
+
+it("hides archived auto-fixers until history is requested", async () => {
+  renderSlot(app.navPanels[0]!, { subPath: "" }, {
+    rpc: {
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
+      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution: { providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default" } }),
+      listMyPullRequests: () => ({ ...list, items: [], login: "dev" }),
+      listAutoFixerSessions: () => ({ sessions: [{ ...item.autoFixer, ...item, status: "archived", outcome: "merged", threadId: "archived-thread", archivedAt: item.updatedAt, policy: { fix: true, merge: false }, actions: [], automation: { fix: false, merge: false } }] }),
+    },
+  });
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Auto-fixers" }), { button: 0 });
+  const toggle = await screen.findByRole("checkbox", { name: "Show archived" });
+  expect(screen.queryByTestId("auto-fixer-session")).toBeNull();
+  fireEvent.click(toggle);
+  expect(screen.getByTestId("auto-fixer-session").textContent).toContain("archived");
+  expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+});

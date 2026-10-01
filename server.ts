@@ -25,6 +25,7 @@ import {
 } from "./pull-diff.js";
 import { draftTitle, isDraftTitle } from "./draft-title.js";
 import {
+  archived,
   activePolicy,
   applyAutomationPatch,
   automationOptions,
@@ -1810,6 +1811,13 @@ export default async function plugin(bb: BbPluginApi) {
     return { ok: false, error };
   }
 
+  async function finishTerminal(session: AutoFixerSession) {
+    const cleanup = await archiveAndStop(session.threadId);
+    if (cleanup.ok && (session.status === "merged" || session.status === "closed"))
+      await writeIfCurrent(session, archived(session, now()));
+    return cleanup;
+  }
+
   async function notifySupervisor(
     threadId: string,
     event: "idle" | "failed",
@@ -1840,7 +1848,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!sameSession(observed, current)) return null;
       const next = await decide(current);
       if (!(await writeIfCurrent(current, next))) return null;
-      const cleanup = await archiveAndStop(next.threadId);
+      const cleanup = await finishTerminal(next);
       if (!cleanup.ok)
         await writeIfCurrent(next, onCleanupFailed(next, cleanup.error, now()));
       return next;
@@ -2058,6 +2066,7 @@ export default async function plugin(bb: BbPluginApi) {
     const done = confirmedTerminal(session, lifecycle, now());
     if (done) {
       await writeIfCurrent(session, done);
+      await finishTerminal(done);
       return result;
     }
     try {
@@ -2211,7 +2220,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function autoFixerStatus(repo: string, number: number) {
     const session = await getSession(repo, number);
-    if (session !== null && session.status !== "closed")
+    if (session !== null && session.status !== "closed" && session.status !== "archived")
       return autoFixerView(session, null);
     const [lifecycle, project] = await Promise.all([
       readLifecycle(repo, number),
@@ -2313,6 +2322,19 @@ export default async function plugin(bb: BbPluginApi) {
     for (const session of await listSessions()) {
       if (signal.aborted) return;
       try {
+        if (session.status === "archived") continue;
+        const terminal = session.status === "merged" || session.status === "closed"
+          ? session
+          : confirmedTerminal(session, await readLifecycle(session.repo, session.number), now());
+        if (terminal) {
+          await serialized(session.repo, session.number, async () => {
+            const current = await getSession(session.repo, session.number);
+            if (!sameSession(session, current)) return;
+            if (!(await writeIfCurrent(current, terminal))) return;
+            await finishTerminal(terminal);
+          });
+          continue;
+        }
         const thread = await readThreadPresence(session.threadId);
         if (thread.state === "deleted")
           await forgetDeletedThread(session.threadId);

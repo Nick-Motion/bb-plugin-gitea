@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.5 - 2026-10-01
+
+### Fixed
+
+- Automatically archive auto-fixers when their PR closes or merges, including paused and failed sessions; stop threads, withdraw queued automation, and invoke BB resource cleanup.
+- Retry failed terminal cleanup while retaining the confirmed PR outcome.
+- Fix stale caches, duplicate mutations, and diff whitespace handling.
+
+### Changed
+
+- Add an archived auto-fixer state and a Show archived history toggle. Reopened closed PRs can start a replacement auto-fixer.
+- Model known states explicitly.
+
+### Tests
+
+- Cover external PR closure, cleanup retries, archived history visibility, and reopened PRs.
+
 ## 1.0.4 - 2026-10-01
 
 ### Fixed

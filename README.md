@@ -60,6 +60,8 @@ Pull request rows in **My PRs** and **Pull requests** have two independent switc
 
 Turning either on starts an auto-fixer: a hidden BB thread that watches the pull request until it is merged or closed, or until it needs you. Changing a switch updates the same thread. Turning both off stops it and archives the thread. **Retry** resumes a failed or needs-you auto-fixer.
 
+Closed or merged PRs automatically archive their auto-fixers, including paused and failed sessions. BB stops the thread, withdraws plugin-owned queued messages, and retires its terminals and managed environment through the thread archive lifecycle. Failed cleanup retries automatically. Archived sessions are hidden by default; select **Show archived** to view their history. A reopened closed PR can start a new auto-fixer.
+
 Auto-fixers run on the host of the repository checkout discovered by the plugin. Install `tea` and sign in on that host as well as the BB server host. If BB has retired a failed auto-fixer’s workspace, Retry starts a replacement thread and preserves the archived one.
 
 While idle, an auto-fixer waits with `bb gitea pr-watch`, which checks the pull request record and its combined CI status every 30 seconds and returns as soon as either changes. It rereads the full diff and conversation only after a change.

@@ -1449,6 +1449,7 @@ function routePath(route: Route): string {
 }
 
 const autoFixerLabels = {
+  archived: "archived",
   idle: "off",
   watching: "running",
   needs_you: "needs you",
@@ -1474,6 +1475,8 @@ const automationToggles = [
 ] as const;
 
 function autoFixerDetail(view: AutoFixerView) {
+  if (view.status === "archived") return `PR ${view.outcome}. Auto-fixer archived.`;
+  if (view.status === "merged" || view.status === "closed") return `PR ${view.status}. BB cleanup pending; retrying automatically.`;
   if (view.status === "failed") return view.error;
   if (view.status === "needs_you") return view.note;
   if (view.status === "stopped" && view.cleanupPending)
@@ -1788,6 +1791,7 @@ function AutoFixerList() {
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
   const [sessions, setSessions] = useState<Loadable<AutoFixerSessions>>(loading);
+  const [showArchived, setShowArchived] = useState(false);
   const load = useCallback(() => {
     void rpc
       .call("listAutoFixerSessions", null)
@@ -1818,7 +1822,8 @@ function AutoFixerList() {
     );
   return (
     <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
-      {sessions.value.map((session) => (
+      <label className="flex items-center gap-2 px-3 py-2 text-sm"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} />Show archived</label>
+      {sessions.value.filter((session) => showArchived || session.status !== "archived").map((session) => (
         <div
           key={`${session.repo}#${session.number}`}
           data-testid="auto-fixer-session"

@@ -2098,7 +2098,7 @@ it("confirms terminal state with Gitea, cleans up, and refuses to restart a merg
   settle("acme/widgets#42", true);
   await idle(host, "Merged.\nBB_GITEA_AUTO_FIX: MERGED");
   await expect(autoFixerStatus(host)).resolves.toMatchObject({
-    status: "merged",
+    status: "archived", outcome: "merged",
     mergedAt: "2026-09-28T01:00:00Z",
     threadId: "auto-fixer-1",
     actions: [],
@@ -2117,11 +2117,11 @@ it("confirms terminal state with Gitea, cleans up, and refuses to restart a merg
     "the pull request is merged",
   );
   await expect(disable(host, pr42)).resolves.toMatchObject({
-    status: "merged",
+    status: "archived", outcome: "merged",
   });
   await expect(
     rpc(host, "autoFixerThread", { threadId: "auto-fixer-1" }),
-  ).resolves.toMatchObject({ status: "merged", number: 42 });
+  ).resolves.toMatchObject({ status: "archived", outcome: "merged", number: 42 });
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
 });
 
@@ -2350,7 +2350,7 @@ it("retains sessions across a restart and reconciles threads that settled while 
   const service = restarted.harness.behavior.runService("auto-fixers");
   await vi.waitFor(async () => {
     await expect(autoFixerStatus(restarted)).resolves.toMatchObject({
-      status: "closed",
+      status: "archived", outcome: "closed",
       closedAt: "2026-09-28T01:00:00Z",
     });
     await expect(
@@ -2776,7 +2776,7 @@ it("replaces a closed auto-fixer once Gitea reports the pull request reopened", 
   await idle(host, "BB_GITEA_AUTO_FIX: CLOSED", "auto-fixer-1");
   await idle(host, "BB_GITEA_AUTO_FIX: CLOSED", "auto-fixer-2");
   await expect(autoFixerStatus(host)).resolves.toMatchObject({
-    status: "closed",
+    status: "archived", outcome: "closed",
     actions: [],
   });
   await expect(enable(host, pr42)).rejects.toThrow(
@@ -2789,7 +2789,7 @@ it("replaces a closed auto-fixer once Gitea reports the pull request reopened", 
   reopen("acme/widgets#42");
   reopen("acme/widgets#44");
   await expect(autoFixerStatus(host)).resolves.toMatchObject({
-    status: "closed",
+    status: "archived", outcome: "closed",
     threadId: "auto-fixer-1",
     actions: ["start"],
   });
@@ -3110,3 +3110,20 @@ it("reports a stopped auto-fixer as inactive even when the pull request changed"
     expect(watched.stdout).toContain("auto-fixer stopped");
   }
 });
+
+ it.each([true, false])("archives needs-you sessions after external PR closure (merged=%s), retrying failed cleanup", async (merged) => {
+  const { host, settle, state } = await startAutoFixers();
+  await enable(host, pr42);
+  await idle(host, "Blocked. BB_GITEA_AUTO_FIX: NEEDS_YOU");
+  settle("acme/widgets#42", merged);
+  state.archiveFailures = 1;
+  const service = host.harness.behavior.runService("auto-fixers");
+  try {
+    await vi.waitFor(async () => expect(await autoFixerStatus(host)).toMatchObject({ status: merged ? "merged" : "closed", automation: off, actions: [] }));
+  } finally { service.controller.abort(); await service.done; }
+  const retry = host.harness.behavior.runService("auto-fixers");
+  try {
+    await vi.waitFor(async () => expect(await autoFixerStatus(host)).toMatchObject({ status: "archived", outcome: merged ? "merged" : "closed", automation: off, actions: [] }));
+    expect(state.threads.get("auto-fixer-1")?.archivedAt).toBe(1);
+  } finally { retry.controller.abort(); await retry.done; }
+ });
