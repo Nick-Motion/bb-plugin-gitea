@@ -1841,10 +1841,38 @@ function AutoFixerList() {
   );
 }
 
+const viewLabels: Record<View, string> = {
+  "my-prs": "My PRs",
+  "my-issues": "My Issues",
+  "auto-fixers": "Auto-fixers",
+  issues: "Issues",
+  pulls: "Pull requests",
+};
+
+function listView(subPath: string): View | null {
+  switch (subPath) {
+    case "":
+    case "my-prs":
+      return "my-prs";
+    case "my-issues":
+    case "my-issues/new":
+      return "my-issues";
+    case "auto-fixers":
+      return "auto-fixers";
+    case "issues":
+    case "new":
+      return "issues";
+    case "pulls":
+      return "pulls";
+    default:
+      return null;
+  }
+}
+
 function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
-  const [view, setView] = useState(panelMemory.filters.view);
+  const [view, setView] = useState(listView(subPath) ?? panelMemory.filters.view);
   const [state, setState] = useState(panelMemory.filters.state);
   const [repo, setRepo] = useState(panelMemory.filters.repo);
   const [query, setQuery] = useState(panelMemory.filters.query);
@@ -1927,13 +1955,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   );
   const { reload: refreshDetail } = display;
   useEffect(() => {
+    setNewIssue(subPath === "new" || subPath === "my-issues/new");
     if (!route) {
-      setNewIssue(subPath === "new" || subPath === "my-issues/new");
-      if (subPath === "new") setView("issues");
-      if (subPath === "my-issues/new") setView("my-issues");
+      const nextView = listView(subPath);
+      if (nextView) setView(nextView);
       return;
     }
-    setView(route.kind === "pr" ? "pulls" : "issues");
     setDetailSection("conversation");
   }, [route, subPath]);
   const refresh = useCallback(async () => {
@@ -2080,9 +2107,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               variant="ghost"
               className="h-7 px-2"
               onClick={() => {
-                navigate.toPluginPanel("gitea");
-                setNewIssue(false);
-                setView(fromMyIssues ? "my-issues" : "issues");
+                navigate.toPluginPanel("gitea", {
+                  subPath: fromMyIssues ? "my-issues" : "issues",
+                });
               }}
             >
               ← {fromMyIssues ? "My Issues" : "Issues"}
@@ -2123,7 +2150,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
             <div className="flex justify-end gap-2">
               <Button
                 variant="outline"
-                onClick={() => navigate.toPluginPanel("gitea")}
+                onClick={() => navigate.toPluginPanel("gitea", { subPath: view })}
               >
                 Cancel
               </Button>
@@ -2150,7 +2177,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => navigate.toPluginPanel("gitea")}
+                onClick={() => navigate.toPluginPanel("gitea", { subPath: view })}
               >
                 Back to list
               </Button>
@@ -2175,9 +2202,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               size="sm"
               variant="ghost"
               className="h-7 px-2"
-              onClick={() => navigate.toPluginPanel("gitea")}
+              onClick={() => navigate.toPluginPanel("gitea", { subPath: view })}
             >
-              ← {detail.kind === "pr" ? "Pull requests" : "Issues"}
+              ← {viewLabels[view]}
             </Button>
             <span className="min-w-0 truncate">
               {detail.repo} · #{detail.number}
@@ -2470,7 +2497,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           <Tabs
             value={view}
             onValueChange={(value) => {
-              navigate.toPluginPanel("gitea");
+              navigate.toPluginPanel("gitea", { subPath: value });
               setNewIssue(false);
               setView(value as View);
             }}
@@ -3224,14 +3251,14 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "gitea",
     title: "Gitea",
-    icon: "GitPullRequest",
+    icon: "gitea/teacup",
     path: "gitea",
     component: GiteaPanel,
   });
   app.slots.threadPanelAction({
     id: "item",
     title: "Gitea issue or PR",
-    icon: "GitPullRequest",
+    icon: "gitea/teacup",
     component: GiteaThreadPanel,
   });
   app.slots.experimental_appOverlay({

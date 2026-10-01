@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-gitea",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Gitea issues and pull requests inside BB, backed by the Gitea tea CLI.",
   "license": "MIT",
   "repository": {
@@ -16,7 +16,8 @@
     "name": "Gitea",
     "description": "Gitea issues and pull requests inside BB, backed by the Gitea tea CLI.",
     "branding": {
-      "icon": "./icons/teacup.svg"
+      "icon": "./icons/teacup.svg",
+      "experimental_icons": { "teacup": "./icons/teacup.svg" }
     },
     "server": "./server.ts",
     "app": "./app.tsx"
@@ -41,6 +42,7 @@
     "icons",
     "skills",
     "README.md",
+    "CHANGELOG.md",
     "PLUGIN_OVERVIEW.md",
     "LICENSE"
   ],

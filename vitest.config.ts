@@ -5,7 +5,7 @@ export default defineConfig({
   test: {
     silent: "passed-only",
     name: "bb-plugin-gitea",
-    include: ["**/*.test.ts", "app-controls.test.tsx", "app-execution.test.tsx"],
+    include: ["**/*.test.ts", "app-controls.test.tsx", "app-execution.test.tsx", "app-history.test.tsx"],
     exclude: ["node_modules/**"],
   },
 });
