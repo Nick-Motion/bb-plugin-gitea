@@ -124,6 +124,22 @@ describe("parsePullDiff", () => {
   it("ignores text before the first section", () => {
     expect(parsePullDiff("warning: noise\n")).toEqual([]);
   });
+
+  it("preserves a trailing blank context line in a hunk", () => {
+    const raw = `diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n line\n `;
+
+    expect(parsePullDiff(raw)[0]?.text).toBe(
+      "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n line\n \n",
+    );
+  });
+
+  it("preserves trailing spaces and tabs on the final added line", () => {
+    const raw = `diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -0,0 +1 @@\n+added \t\n`;
+
+    expect(parsePullDiff(raw)[0]?.text).toBe(
+      "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -0,0 +1 @@\n+added \t\n",
+    );
+  });
 });
 
 describe("assignFileDiffs", () => {

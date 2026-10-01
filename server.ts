@@ -91,7 +91,10 @@ const listOutputSchema = z.object({
   errors: z.array(z.object({ repo: repositorySchema, message: z.string() })),
 });
 type ListItem = z.infer<typeof itemSchema>;
-type ItemPage = z.infer<typeof listOutputSchema> & { reachable: number };
+type ItemPage = z.infer<typeof listOutputSchema> & {
+  reachable: number;
+  failures: unknown[];
+};
 const commentSchema = z.object({
   id: z.number().int().positive(),
   author: z.string(),
@@ -1130,14 +1133,13 @@ export default async function plugin(bb: BbPluginApi) {
       signal,
     );
     const reviews = page.values.map(record);
-    const commented = reviews
-      .filter(
-        (review) =>
-          Number(review.comments_count) > 0 &&
-          text(review.state) !== "PENDING" &&
-          Number.isInteger(review.id),
-      )
-      .slice(0, maxReviewCommentReads);
+    const eligibleReviews = reviews.filter(
+      (review) =>
+        Number(review.comments_count) > 0 &&
+        text(review.state) !== "PENDING" &&
+        Number.isInteger(review.id),
+    );
+    const commented = eligibleReviews.slice(0, maxReviewCommentReads);
     const reviewComments: ReviewComment[] = [];
     for (let index = 0; index < commented.length; index += 4) {
       const batch = await Promise.all(
@@ -1155,7 +1157,7 @@ export default async function plugin(bb: BbPluginApi) {
           reviewComments.push(...response.flatMap(mapReviewComment));
     }
     return {
-      truncated: page.truncated,
+      truncated: page.truncated || eligibleReviews.length > maxReviewCommentReads,
       reviews: reviews.map((review) => ({
         author: actor(review),
         state: text(review.state),
@@ -1408,11 +1410,13 @@ export default async function plugin(bb: BbPluginApi) {
     );
     const result: ListItem[] = [];
     const errors: Array<{ repo: string; message: string }> = [];
+    const failures: unknown[] = [];
     let truncated = discovered.length > candidates.length;
     for (let index = 0; index < settled.length; index += 1) {
       const outcome = settled[index]!;
       const name = candidates[index]!.repo;
       if (outcome.status === "rejected") {
+        failures.push(outcome.reason);
         errors.push({
           repo: name,
           message:
@@ -1440,6 +1444,7 @@ export default async function plugin(bb: BbPluginApi) {
       truncated,
       errors,
       reachable: candidates.length - errors.length,
+      failures,
     };
   }
   async function listItems(
@@ -1458,8 +1463,13 @@ export default async function plugin(bb: BbPluginApi) {
     signal: AbortSignal,
   ): Promise<ItemPage> {
     const page = await fetchItems(kind, repo, state, signal);
-    if (page.reachable === 0 && page.errors.length > 0)
-      throw new Error(page.errors[0]!.message);
+    if (page.reachable === 0 && page.errors.length > 0) {
+      const accessError = page.failures.find(
+        (failure): failure is GiteaAccessError =>
+          failure instanceof GiteaAccessError,
+      );
+      throw accessError ?? new Error(page.errors[0]!.message);
+    }
     return page;
   }
   async function fetchMyIssues(
@@ -2574,7 +2584,7 @@ export default async function plugin(bb: BbPluginApi) {
       { experimental_signal: signal }: RpcContext = {},
     ) => {
       try {
-        await Promise.all([
+        const results = await Promise.allSettled([
           api(repoPath(repo, `issues/${number}/labels`), {
             method: "PUT",
             body: { labels },
@@ -2586,6 +2596,11 @@ export default async function plugin(bb: BbPluginApi) {
             signal,
           }),
         ]);
+        const rejected = results.find(
+          (result): result is PromiseRejectedResult =>
+            result.status === "rejected",
+        );
+        if (rejected) throw rejected.reason;
       } finally {
         forgetDisplayItem(repo, number);
         forgetLists();
@@ -2640,7 +2655,11 @@ export default async function plugin(bb: BbPluginApi) {
       { repo },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      const key = repo.toLowerCase();
+      const key = JSON.stringify([
+        cleanBaseUrl(config.baseUrl).href,
+        config.teaProfile.trim(),
+        repo.toLowerCase(),
+      ]);
       const cached = repoOptionCache.get(key);
       if (cached && Date.now() - cached.at < repoOptionTtlMs)
         return cached.value;
@@ -2874,7 +2893,16 @@ export default async function plugin(bb: BbPluginApi) {
   } satisfies PluginRpcHandlers<typeof giteaRpcContract>;
   bb.rpc.register(giteaRpcContract, handlers);
   async function mentionItems(kind: "issue" | "pr", query: string) {
-    return (await listItems(kind, undefined, "open", query)).items
+    const list = await readList(
+      itemLists,
+      kind,
+      undefined,
+      "open",
+      false,
+      (signal) => readItemPage(kind, undefined, "open", signal),
+      undefined,
+    );
+    return pickItems(list.value, query).items
       .slice(0, 8)
       .map((item) => ({
         id: `${item.repo}#${item.number}`,

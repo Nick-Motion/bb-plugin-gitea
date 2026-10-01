@@ -279,6 +279,8 @@ it("paginates pull request comments, files, and reviews and stops on a short pag
       }));
     if (path.endsWith("/reviews"))
       return rows((index) => ({
+        id: page(endpoint) * 100 + index,
+        comments_count: 1,
         user: { login: "reviewer" },
         state: "APPROVED",
         body: `Review ${index}`,
@@ -301,7 +303,7 @@ it("paginates pull request comments, files, and reviews and stops on a short pag
     baseRefName: "main",
     commentsTruncated: false,
     filesTruncated: false,
-    reviewsTruncated: false,
+    reviewsTruncated: true,
   });
   expect(calls.map((call) => call.endpoint)).toContain(
     "/api/v1/repos/acme/widgets/pulls/9/files?limit=50&page=2",
@@ -312,6 +314,107 @@ it("paginates pull request comments, files, and reviews and stops on a short pag
         !call.endpoint.includes("/files") && call.endpoint.includes("page=3"),
     ),
   ).toBe(false);
+});
+
+it("waits for both metadata writes before invalidating lists", async () => {
+  let releaseAssignees!: () => void;
+  const assigneesGate = new Promise<void>((resolve) => {
+    releaseAssignees = resolve;
+  });
+  const { host } = await start(async ({ endpoint, method }) => {
+    if (endpoint.endsWith("/issues/4") && method === "PATCH")
+      await assigneesGate;
+    if (endpoint.endsWith("/labels") && method === "PUT")
+      return { status: 500, json: {} };
+    return { json: [] };
+  });
+  let finished = false;
+  const update = host.harness.behavior
+    .callRpc("updateMetadata", {
+      repo: "acme/widgets",
+      number: 4,
+      labels: ["bug"],
+      assignees: ["dev"],
+    })
+    .finally(() => {
+      finished = true;
+    })
+    .catch((error: unknown) => error);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(finished).toBe(false);
+  releaseAssignees();
+  await expect(update).resolves.toBeInstanceOf(Error);
+});
+
+it("serves mention searches from the cached issue list", async () => {
+  const { host, calls } = await start(({ endpoint }) => {
+    if (endpoint.includes("/issues?"))
+      return { json: [issue(7, "Cached mention")] };
+    return { json: [] };
+  });
+  const provider = host.harness.inspection.registrations.mentionProviders.find(
+    ({ id }) => id === "issue",
+  )!;
+  const context = { query: "", trigger: "@" as const, projectId: null, threadId: null };
+  await provider.search(context);
+  const before = calls.length;
+  await expect(provider.search({ ...context, query: "Cached" })).resolves.toMatchObject([
+    { id: "acme/widgets#7", title: "#7 Cached mention" },
+  ]);
+  expect(calls).toHaveLength(before);
+});
+
+it("keeps late repository option results under their original profile key", async () => {
+  let releaseLabels!: () => void;
+  const labelsGate = new Promise<void>((resolve) => {
+    releaseLabels = resolve;
+  });
+  let held = false;
+  const { host, calls } = await start(async ({ endpoint, login }) => {
+    if (endpoint.endsWith("/labels") && !held) {
+      held = true;
+      await labelsGate;
+    }
+    return { json: endpoint.endsWith("/labels") ? [{ name: login, color: "" }] : [] };
+  }, {
+    profiles: [
+      ...defaultProfiles,
+      { name: "bot", url: "https://gitea.example/prefix", user: "bot" },
+    ],
+  });
+  const input = { repo: "acme/widgets" };
+  const oldRequest = host.harness.behavior.callRpc("repoOptions", input);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await host.harness.behavior.setSettings({ teaProfile: "bot" });
+  releaseLabels();
+  await oldRequest;
+  const before = calls.length;
+  await host.harness.behavior.callRpc("repoOptions", input);
+  expect(calls.length).toBeGreaterThan(before);
+});
+
+it("drops a cached list after every repository fails with an access error", async () => {
+  let denied = false;
+  const { host, calls } = await start(({ endpoint }) => {
+    if (endpoint.includes("/issues?"))
+      return denied ? { status: 403, json: {} } : { json: [issue(3)] };
+    return { json: [] };
+  });
+  await listItems(host, { repo: "acme/widgets" });
+  denied = true;
+  await expect(
+    host.harness.behavior.callRpc("listItems", {
+      kind: "issue",
+      state: "open",
+      query: "",
+      repo: "acme/widgets",
+      refresh: true,
+    }),
+  ).rejects.toThrow("HTTP 403");
+  const before = calls.length;
+  denied = false;
+  await listItems(host, { repo: "acme/widgets" });
+  expect(calls.length).toBeGreaterThan(before);
 });
 
 it("reads a large pull request's files in concurrent page batches after a full first page", async () => {

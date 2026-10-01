@@ -19,9 +19,7 @@ export const fileDiffSchema = z.discriminatedUnion("kind", [
 export type FileDiff = z.infer<typeof fileDiffSchema>;
 
 export type RawPullDiff =
-  | { kind: "text"; text: string }
-  | { kind: "too-large" }
-  | { kind: "failed" };
+  { kind: "text"; text: string } | { kind: "too-large" } | { kind: "failed" };
 
 export type PullFileMeta = {
   path: string;
@@ -167,7 +165,7 @@ function parseSection(lines: string[]): DiffSection {
           : (renameTo ?? header?.newPath ?? null),
     binary,
     hunks,
-    text: `${lines.join("\n").trimEnd()}\n`,
+    text: `${(lines.at(-1) === "" ? lines.slice(0, -1) : lines).join("\n")}\n`,
   };
 }
 

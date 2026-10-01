@@ -606,14 +606,20 @@ function LineDraft({
 }) {
   const [body, setBody] = useState("");
   const [posting, setPosting] = useState(false);
+  const pending = useRef(false);
   const submit = async () => {
-    if (!body.trim()) return;
+    if (pending.current || !body.trim()) return;
+    pending.current = true;
     setPosting(true);
     try {
       await onSubmit(body);
     } finally {
+      pending.current = false;
       setPosting(false);
     }
+  };
+  const cancel = () => {
+    if (!pending.current) onCancel();
   };
   return (
     <div className="mx-2 my-1.5 space-y-2 rounded-md border border-border bg-card p-2 font-sans">
@@ -623,16 +629,17 @@ function LineDraft({
         value={body}
         onChange={(event) => setBody(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Escape") onCancel();
+          if (event.key === "Escape") cancel();
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
             event.preventDefault();
             void submit();
           }
         }}
+        disabled={posting}
         placeholder="Comment on this line"
       />
       <div className="flex justify-end gap-2">
-        <Button size="sm" variant="outline" onClick={onCancel}>
+        <Button size="sm" variant="outline" disabled={posting} onClick={cancel}>
           Cancel
         </Button>
         <Button
@@ -1756,6 +1763,12 @@ function AutoFixerPreferencesControl() {
             ...value,
             serviceTier: value.serviceTier ?? "default",
           };
+          if (
+            execution.providerId === next.providerId &&
+            execution.model === next.model &&
+            execution.reasoningLevel === next.reasoningLevel &&
+            (execution.serviceTier ?? "default") === next.serviceTier
+          ) return;
           void save(() => rpc.call("setAutoFixerExecution", next), {
             ...preferences,
             execution: next,
@@ -1902,14 +1915,17 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const { list, load: loadList } = itemList;
   const openMine = useItemList(openMyPullRequests, memory, settings, verify);
   const openIssues = useItemList(openMyIssues, memory, settings, verify);
-  const [newIssue, setNewIssue] = useState(false);
   const fromMyIssues = subPath === "my-issues/new";
   const [newTitle, setNewTitle] = useState("");
   const [newBody, setNewBody] = useState("");
-  const [reviewBody, setReviewBody] = useState("");
+  const [creatingIssue, setCreatingIssue] = useState(false);
+  const creatingIssueRef = useRef(false);
+  const [reviewDraft, setReviewDraft] = useState<{ key: string; body: string } | null>(null);
+  const [reviewPending, setReviewPending] = useState(false);
   const [detailSection, setDetailSection] =
     useState<DetailSection>("conversation");
   const route = useMemo(() => parseSubPath(subPath), [subPath]);
+  const newIssue = subPath === "new" || fromMyIssues;
   const display = useItemDisplay(route, detailSection === "files");
   const shown = display.conversation;
   const detail = useMemo(
@@ -1954,8 +1970,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     [navigate],
   );
   const { reload: refreshDetail } = display;
+  const reviewKey = detail ? `${detail.repo}#${detail.number}` : null;
+  const reviewBody = reviewDraft?.key === reviewKey ? reviewDraft.body : "";
   useEffect(() => {
-    setNewIssue(subPath === "new" || subPath === "my-issues/new");
     if (!route) {
       const nextView = listView(subPath);
       if (nextView) setView(nextView);
@@ -2004,7 +2021,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   );
   const submitReview = useCallback(
     async (event: "APPROVED" | "REQUEST_CHANGES" | "COMMENT") => {
-      if (!detail || detail.kind !== "pr") return;
+      if (!detail || detail.kind !== "pr" || reviewPending) return;
+      const submittedKey = `${detail.repo}#${detail.number}`;
+      setReviewPending(true);
       try {
         await rpc.call("review", {
           repo: detail.repo,
@@ -2012,14 +2031,16 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           event,
           body: reviewBody,
         });
-        setReviewBody("");
+        setReviewDraft((draft) => draft?.key === submittedKey ? null : draft);
         await refreshDetail();
         toast.success("Review submitted");
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "Review failed");
+      } finally {
+        setReviewPending(false);
       }
     },
-    [detail, refreshDetail, reviewBody, rpc],
+    [detail, refreshDetail, reviewBody, reviewPending, rpc],
   );
   const sendAgent = useCallback(async () => {
     if (!detail) return;
@@ -2066,7 +2087,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   );
   const repoOptions = useMemo(() => status?.repos ?? [], [status]);
   const create = useCallback(async () => {
+    if (creatingIssueRef.current) return;
     if (repo === "all") return toast.error("Choose a repository first");
+    creatingIssueRef.current = true;
+    setCreatingIssue(true);
     try {
       const result = await rpc.call("createIssue", {
         repo,
@@ -2074,7 +2098,6 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
         body: newBody,
         assignToMe: fromMyIssues,
       });
-      setNewIssue(false);
       setNewTitle("");
       setNewBody("");
       await loadItems();
@@ -2084,6 +2107,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
       toast.error(
         error instanceof Error ? error.message : "Issue creation failed",
       );
+    } finally {
+      creatingIssueRef.current = false;
+      setCreatingIssue(false);
     }
   }, [fromMyIssues, loadItems, newBody, newTitle, openItem, repo, rpc]);
 
@@ -2124,7 +2150,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           <div className="space-y-3 rounded-lg border border-border bg-card p-4">
             <h2 className="text-lg font-semibold">Create an issue</h2>
             <Select value={repo} onValueChange={setRepo}>
-              <SelectTrigger aria-label="Repository">
+              <SelectTrigger aria-label="Repository" disabled={creatingIssue}>
                 <SelectValue placeholder="Choose a repository" />
               </SelectTrigger>
               <SelectContent>
@@ -2139,23 +2165,26 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               aria-label="Issue title"
               value={newTitle}
               onChange={(event) => setNewTitle(event.target.value)}
+              disabled={creatingIssue}
               placeholder="Issue title"
             />
             <Textarea
               aria-label="Issue description"
               value={newBody}
               onChange={(event) => setNewBody(event.target.value)}
+              disabled={creatingIssue}
               placeholder="Describe the issue"
             />
             <div className="flex justify-end gap-2">
               <Button
                 variant="outline"
+                disabled={creatingIssue}
                 onClick={() => navigate.toPluginPanel("gitea", { subPath: view })}
               >
                 Cancel
               </Button>
               <Button
-                disabled={!newTitle.trim() || repo === "all"}
+                disabled={creatingIssue || !newTitle.trim() || repo === "all"}
                 onClick={() => void create()}
               >
                 Create issue
@@ -2419,13 +2448,17 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   ))}
                   <Textarea
                     value={reviewBody}
-                    onChange={(event) => setReviewBody(event.target.value)}
+                    onChange={(event) => {
+                      if (reviewKey) setReviewDraft({ key: reviewKey, body: event.target.value });
+                    }}
+                    disabled={reviewPending}
                     placeholder="Review summary"
                   />
                   <div className="flex flex-wrap justify-end gap-1">
                     <Button
                       size="sm"
                       variant="outline"
+                      disabled={reviewPending}
                       onClick={() => void submitReview("COMMENT")}
                     >
                       Comment
@@ -2433,12 +2466,14 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                     <Button
                       size="sm"
                       variant="outline"
+                      disabled={reviewPending}
                       onClick={() => void submitReview("REQUEST_CHANGES")}
                     >
                       Request changes
                     </Button>
                     <Button
                       size="sm"
+                      disabled={reviewPending}
                       onClick={() => void submitReview("APPROVED")}
                     >
                       Approve
@@ -2498,7 +2533,6 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
             value={view}
             onValueChange={(value) => {
               navigate.toPluginPanel("gitea", { subPath: value });
-              setNewIssue(false);
               setView(value as View);
             }}
           >
@@ -2781,7 +2815,9 @@ function ChipPicker({
     )
     .slice(0, 8);
   const pick = (value: string) => {
+    if (disabled) return;
     setQuery("");
+    setOpen(false);
     onChange([...selected, value]);
   };
   const dot = (value: string) => {
@@ -2855,6 +2891,7 @@ function ChipPicker({
                 type="button"
                 role="option"
                 aria-selected={false}
+                disabled={disabled}
                 className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-sm hover:bg-muted"
                 onMouseDown={(event) => {
                   event.preventDefault();
@@ -2889,11 +2926,14 @@ function CommentCard({
   const [mode, setMode] = useState<"view" | "edit" | "delete">("view");
   const [draft, setDraft] = useState(comment.body);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const act = async (
     action: () => Promise<unknown>,
     done: string,
     failed: string,
   ) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       await action();
@@ -2903,6 +2943,7 @@ function CommentCard({
     } catch (error) {
       toast.error(errorText(error, failed));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -2955,11 +2996,12 @@ function CommentCard({
             value={draft}
             autoFocus
             onChange={(event) => setDraft(event.target.value)}
+            disabled={busy}
             onKeyDown={(event) => {
-              if (event.key === "Escape") setMode("view");
+              if (event.key === "Escape" && !busyRef.current) setMode("view");
               if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                 event.preventDefault();
-                if (draft.trim()) void save();
+                if (!busyRef.current && draft.trim()) void save();
               }
             }}
           />
@@ -3059,8 +3101,10 @@ function CommentComposer({
   const rpc = useRpc<typeof giteaRpcContract>();
   const [draft, setDraft] = useState("");
   const [posting, setPosting] = useState(false);
+  const postingRef = useRef(false);
   const submit = async () => {
-    if (!draft.trim()) return;
+    if (postingRef.current || !draft.trim()) return;
+    postingRef.current = true;
     setPosting(true);
     try {
       await rpc.call("comment", {
@@ -3068,12 +3112,13 @@ function CommentComposer({
         number: item.number,
         body: draft,
       });
-      setDraft("");
+      setDraft((current) => current === draft ? "" : current);
       await onPosted();
       toast.success("Comment added");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Comment failed");
     } finally {
+      postingRef.current = false;
       setPosting(false);
     }
   };
@@ -3081,6 +3126,7 @@ function CommentComposer({
     <div className="space-y-2">
       <Textarea
         value={draft}
+        disabled={posting}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {

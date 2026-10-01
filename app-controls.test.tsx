@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 import { afterEach, expect, it } from "vitest";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 
@@ -92,4 +92,34 @@ it("shows Auto-fix and Auto-merge controls for a Pull requests row", async () =>
   expect(controls.querySelectorAll("button")).toHaveLength(2);
   expect(controls.textContent).toContain("Auto-fix");
   expect(controls.textContent).toContain("Auto-merge");
+});
+
+it("disables metadata suggestions while the save is pending", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const slot = renderSlot(app.navPanels[0]!, { subPath: "pulls/acme/widgets/42" }, {
+    rpc: {
+      status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
+      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution: { providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default" } }),
+      listMyPullRequests: () => ({ ...list, items: [] }),
+      listMyIssues: () => ({ ...list, items: [] }),
+      conversation: () => ({
+        freshness, threadId: null,
+        conversation: {
+          ...item, comments: [], commentsTruncated: false, headRefName: "feature",
+          baseRefName: "main", revision: { head: "a".repeat(40), base: "b".repeat(40) },
+          changedFiles: 1, checks: [], checksTruncated: false, reviews: [], reviewsTruncated: false,
+          reviewComments: [],
+        },
+      }),
+      repoOptions: () => ({ labels: [{ name: "bug", color: "" }, { name: "help wanted", color: "" }], assignees: [] }),
+      updateMetadata: async () => { await held; return { ok: true }; },
+    },
+  });
+  const input = await screen.findByLabelText("Add labels");
+  fireEvent.change(input, { target: { value: "bug" } });
+  fireEvent.mouseDown(await screen.findByRole("option", { name: "bug" }));
+  expect(screen.queryByRole("listbox", { name: "Labels" })).toBeNull();
+  expect(slot.rpcCalls.filter(call => call.method === "updateMetadata")).toHaveLength(1);
+  await act(async () => release());
 });
