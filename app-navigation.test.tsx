@@ -27,6 +27,7 @@ afterEach(() => cleanup());
 
 const app = await loadPluginApp(() => import("./app"));
 const panel = app.navPanels[0]!;
+const Panel = panel.component;
 const overlay = app.appOverlays[0]!;
 
 const preferences = {
@@ -86,7 +87,7 @@ function mine(
 }
 
 function status(account = work) {
-  return { ready: true, error: null, login: "dev", account, repos: [] };
+  return { state: "connected", login: "dev", account, repos: [] };
 }
 
 const settings = {
@@ -552,10 +553,8 @@ it("forgets every remembered filter on an auth rejection and ignores a reply tha
   const early = held();
   let calls = 0;
   const rejected = {
-    ready: false,
+    state: "unavailable" as const,
     error: 'Gitea rejected tea login profile "work".',
-    login: null,
-    account: null,
     repos: [],
   };
   const returned = renderSlot(
@@ -658,10 +657,11 @@ function conversation(title: string) {
       baseRefName: "main",
       revision: { head: "a".repeat(40), base: "b".repeat(40) },
       changedFiles: 1,
-      checks: [],
-      checksTruncated: false,
+      draft: false,
+      checks: { state: "loaded", values: [], truncated: false },
       reviews: [],
       reviewsTruncated: false,
+      reviewComments: [],
     },
   };
 }
@@ -695,4 +695,69 @@ it("hides a pull request from the previous display scope until it reloads", asyn
   expect(screen.queryByText("Work account change")).toBeNull();
   await reread.release();
   expect(await screen.findByText("Ops account change")).toBeTruthy();
+});
+
+it("shows a conversation error with a way back to the list", async () => {
+  renderSlot(
+    panel,
+    { subPath: "pulls/acme/widgets/10" },
+    {
+      settings,
+      rpc: {
+        status: () => status(),
+        getAutoFixerPreferences: () => preferences,
+        conversation: () => Promise.reject(new Error("Gitea is unavailable")),
+      },
+    },
+  );
+
+  expect(await screen.findByText("Gitea is unavailable")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Back to list" })).toBeTruthy();
+});
+
+it("replaces the new issue form when navigation changes to an issue detail", async () => {
+  const slot = renderSlot(panel, { subPath: "my-issues/new" }, {
+    settings,
+    rpc: {
+      status: () => status(),
+      getAutoFixerPreferences: () => preferences,
+      listMyIssues: () => ({ ...mine([]), account: work }),
+      conversation: () => conversation("Issue detail after navigation"),
+    },
+  });
+  expect(await screen.findByLabelText("Issue title")).toBeTruthy();
+  slot.lifecycle.rerender(<Panel subPath="issues/acme/widgets/10" />);
+  expect(await screen.findByText("Issue detail after navigation")).toBeTruthy();
+  expect(screen.queryByLabelText("Issue title")).toBeNull();
+});
+
+it("keeps a review draft scoped to its pull request", async () => {
+  const slot = renderSlot(panel, { subPath: "pulls/acme/widgets/10" }, {
+    settings,
+    rpc: {
+      status: () => status(),
+      getAutoFixerPreferences: () => preferences,
+      conversation: ({ number }: { number: number }) => conversation(`PR ${number}`),
+    },
+  });
+  const draft = await screen.findByPlaceholderText("Review summary");
+  fireEvent.change(draft, { target: { value: "Private draft for PR A" } });
+  slot.lifecycle.rerender(<Panel subPath="pulls/acme/widgets/11" />);
+  expect(await screen.findByPlaceholderText("Review summary")).toHaveProperty("value", "");
+});
+
+it("does not load an item list on the Auto-fixers tab", async () => {
+  const slot = renderSlot(panel, { subPath: "auto-fixers" }, {
+    settings,
+    rpc: {
+      status: () => status(),
+      getAutoFixerPreferences: () => preferences,
+      listAutoFixerSessions: () => ({ sessions: [] }),
+      listMyPullRequests: () => mine([]),
+      listMyIssues: () => mine([]),
+      listItems: () => mine([]),
+    },
+  });
+  expect(await screen.findByText(/No auto-fixers yet/)).toBeTruthy();
+  expect(slot.rpcCalls.some(call => call.method === "listItems")).toBe(false);
 });

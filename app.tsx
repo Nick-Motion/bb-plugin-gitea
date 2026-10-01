@@ -53,7 +53,6 @@ import {
   fileCounts,
   fileLabel,
 } from "./pull-files-view.js";
-import { isDraftTitle } from "./draft-title.js";
 
 type Item = PluginRpcResult<
   (typeof giteaRpcContract)["listItems"]
@@ -77,20 +76,24 @@ type AutoFixerView = MyPulls["items"][number]["autoFixer"];
 type AutoFixerSessions = PluginRpcResult<
   (typeof giteaRpcContract)["listAutoFixerSessions"]
 >["sessions"];
-type View = "my-prs" | "my-issues" | "auto-fixers" | "issues" | "pulls";
+type ListView = "my-prs" | "my-issues" | "issues" | "pulls";
+type View = ListView | "auto-fixers";
+type Route =
+  | { kind: "list"; view: View }
+  | { kind: "new-issue"; from: "issues" | "my-issues" }
+  | { kind: "item"; item: ItemRef };
 type DetailSection = "conversation" | "files";
 type Status = PluginRpcResult<(typeof giteaRpcContract)["status"]>;
-type ItemState = "open" | "closed" | "all";
+type StateFilter = "open" | "closed" | "all";
 type ListFilters = {
-  view: View;
-  state: ItemState;
+  view: ListView;
+  state: StateFilter;
   repo: string;
   query: string;
 };
 type ItemList = {
   account: string;
   items: Item[];
-  autoFixers: Map<string, AutoFixerView>;
   truncated: boolean;
   errors: Array<{ repo: string; message: string }>;
   freshness: Freshness;
@@ -120,7 +123,7 @@ function holdsPrivate(memory: DisplayMemory) {
   return (
     memory.scope.state === "verified" ||
     memory.lists.size > 0 ||
-    memory.status?.ready === true
+    memory.status?.state === "connected"
   );
 }
 
@@ -160,7 +163,10 @@ function trust(memory: DisplayMemory, account: string): DisplayMemory {
   return {
     ...base,
     scope: { state: "verified", account },
-    status: base.status?.account === account ? base.status : null,
+    status:
+      base.status?.state === "connected" && base.status.account === account
+        ? base.status
+        : null,
     lists: new Map(
       [...base.lists].filter(([, list]) => list.account === account),
     ),
@@ -188,7 +194,7 @@ function nextMemory(memory: DisplayMemory, event: ScopeEvent): DisplayMemory {
     case "status": {
       if (event.epoch !== memory.epoch) return memory;
       const { status } = event;
-      return status.ready && status.account !== null
+      return status.state === "connected"
         ? { ...trust(memory, status.account), status }
         : revoke(memory, status);
     }
@@ -234,9 +240,17 @@ function trustedList(
 function trustedStatus(memory: DisplayMemory, settings: string | null) {
   const { status } = memory;
   if (!status) return undefined;
-  return !status.ready || status.account === trustedAccount(memory, settings)
+  return status.state === "unavailable" || status.account === trustedAccount(memory, settings)
     ? status
     : undefined;
+}
+
+function connectionNotice(status: Status | null | undefined) {
+  return status?.state === "unavailable"
+    ? status.error
+    : status
+      ? null
+      : "Checking Gitea configuration…";
 }
 
 let displayMemory: DisplayMemory = {
@@ -307,7 +321,8 @@ function useScopeWatch() {
     dispatch({ type: "doubt" });
   }, [connection]);
   const onChange = useCallback((payload: unknown) => {
-    if (changedItem(payload) === null) dispatch({ type: "revoke" });
+    if (parseDisplayChange(payload)?.scope === "all")
+      dispatch({ type: "revoke" });
   }, []);
   useRealtime("display-changed", onChange);
   return settings;
@@ -342,9 +357,7 @@ const openMyIssues: ListFilters = {
 };
 
 function listKey({ view, state, repo, query }: ListFilters) {
-  return view === "auto-fixers"
-    ? null
-    : JSON.stringify([view, repo, state, query]);
+  return JSON.stringify([view, repo, state, query]);
 }
 
 function useIsDarkTheme() {
@@ -383,7 +396,12 @@ type PullConversation = Extract<
   ConversationView["conversation"],
   { kind: "pr" }
 >;
-type Check = PullConversation["checks"][number];
+type Check = Extract<PullConversation["checks"], { state: "loaded" }>["values"][number];
+type ItemState = PullConversation["state"];
+const stateDot: Record<ItemState, string> = {
+  open: "bg-green-500",
+  closed: "bg-purple-500",
+};
 type ReviewComment = PullConversation["reviewComments"][number];
 type ConversationComment = ConversationView["conversation"]["comments"][number];
 type RepoOptions = PluginRpcResult<(typeof giteaRpcContract)["repoOptions"]>;
@@ -771,11 +789,20 @@ function itemTag(item: Pick<Item, "repo" | "number">) {
   return `${item.repo.toLowerCase()}#${item.number}`;
 }
 
-function changedItem(payload: unknown): string | null | undefined {
+type DisplayChange =
+  | { scope: "all"; files: boolean }
+  | { scope: "lists" }
+  | { scope: "item"; tag: string; files: boolean };
+
+function parseDisplayChange(payload: unknown): DisplayChange | null {
   if (typeof payload !== "object" || payload === null || !("item" in payload))
-    return undefined;
+    return null;
   const { item } = payload;
-  return item === null || typeof item === "string" ? item : undefined;
+  const files = "files" in payload && payload.files === true;
+  if (item === null) return { scope: "all", files };
+  if (typeof item !== "string") return null;
+  if (item === "lists") return { scope: "lists" };
+  return { scope: "item", tag: item, files };
 }
 
 function changedSettings(payload: unknown) {
@@ -806,15 +833,6 @@ function useCoalesced(run: () => void, delayMs: number) {
   }, [delayMs]);
 }
 
-function changedFiles(payload: unknown) {
-  return (
-    typeof payload === "object" &&
-    payload !== null &&
-    "files" in payload &&
-    payload.files === true
-  );
-}
-
 function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
@@ -827,45 +845,23 @@ async function readItemList(
   refresh: boolean,
 ): Promise<ItemList> {
   const input = { state, query, refresh, ...(repo === "all" ? {} : { repo }) };
-  if (view === "my-issues") {
-    const { account, items, truncated, errors, freshness } = await rpc.call(
-      "listMyIssues",
-      input,
-    );
-    return { account, items, truncated, errors, freshness, autoFixers: new Map() };
+  switch (view) {
+    case "my-issues": {
+      const { account, items, truncated, errors, freshness } = await rpc.call("listMyIssues", input);
+      return { account, items, truncated, errors, freshness };
+    }
+    case "my-prs": {
+      const { account, items, truncated, errors, freshness } = await rpc.call("listMyPullRequests", input);
+      return { account, items, truncated, errors, freshness };
+    }
+    case "issues":
+    case "pulls": {
+      const { account, items, truncated, errors, freshness } = await rpc.call(
+        "listItems", { kind: view === "issues" ? "issue" : "pr", ...input },
+      );
+      return { account, items, truncated, errors, freshness };
+    }
   }
-  if (view === "my-prs") {
-    const { account, items, truncated, errors, freshness } = await rpc.call(
-      "listMyPullRequests",
-      input,
-    );
-    return {
-      account,
-      items,
-      autoFixers: new Map(
-        items.map((item) => [itemKey(item), item.autoFixer] as const),
-      ),
-      truncated,
-      errors,
-      freshness,
-    };
-  }
-  const { account, items, truncated, errors, freshness } = await rpc.call(
-    "listItems",
-    { kind: view === "issues" ? "issue" : "pr", ...input },
-  );
-  return {
-    account,
-    items,
-    autoFixers: new Map(
-      items.flatMap((item) =>
-        item.autoFixer ? [[itemKey(item), item.autoFixer] as const] : [],
-      ),
-    ),
-    truncated,
-    errors,
-    freshness,
-  };
 }
 
 function useItemList(
@@ -873,9 +869,10 @@ function useItemList(
   memory: DisplayMemory,
   settings: string | null,
   onFailure: () => void,
+  enabled = true,
 ) {
   const rpc = useRpc<typeof giteaRpcContract>();
-  const key = listKey(filters);
+  const key = enabled ? listKey(filters) : null;
   const { view, state, repo, query } = filters;
   const { epoch } = memory;
   const [failure, setFailure] = useState<{
@@ -922,7 +919,7 @@ function useItemList(
   }, [load]);
   const onChange = useCallback(
     (payload: unknown) => {
-      if (changedItem(payload) === "lists") void load(false);
+      if (parseDisplayChange(payload)?.scope === "lists") void load(false);
     },
     [load],
   );
@@ -1025,11 +1022,12 @@ function useItemDisplay(target: ItemRef | null, wantFiles: boolean) {
   }, [loadFiles, wantFiles]);
   const onChange = useCallback(
     (payload: unknown) => {
-      const item = changedItem(payload);
-      if (item === undefined || !target) return;
-      if (item !== null && item !== itemTag(target)) return;
-      if (!changedFiles(payload)) void loadConversation(false);
-      if (wantFiles && (item === null || changedFiles(payload)))
+      const change = parseDisplayChange(payload);
+      if (!change || change.scope === "lists" || !target) return;
+      if (change.scope === "item" && change.tag !== itemTag(target)) return;
+      if (change.scope === "all" || !change.files)
+        void loadConversation(false);
+      if (wantFiles && (change.scope === "all" || change.files))
         void loadFiles(false);
     },
     [loadConversation, loadFiles, target, wantFiles],
@@ -1424,19 +1422,30 @@ function ChangedFiles({
   );
 }
 
-function parseSubPath(
-  subPath: string,
-): { kind: "issue" | "pr"; repo: string; number: number } | null {
-  const parts = subPath.split("/").filter(Boolean);
-  if ((parts[0] !== "issues" && parts[0] !== "pulls") || parts.length !== 4)
+function parseRoute(subPath: string): Route | null {
+  switch (subPath) {
+    case "": case "my-prs": return { kind: "list", view: "my-prs" };
+    case "my-issues": return { kind: "list", view: "my-issues" };
+    case "auto-fixers": return { kind: "list", view: "auto-fixers" };
+    case "issues": return { kind: "list", view: "issues" };
+    case "pulls": return { kind: "list", view: "pulls" };
+    case "new": return { kind: "new-issue", from: "issues" };
+    case "my-issues/new": return { kind: "new-issue", from: "my-issues" };
+  }
+  const match = /^(issues|pulls)\/([^/]+)\/([^/]+)\/([1-9]\d*)$/.exec(subPath);
+  if (!match)
     return null;
-  const number = Number(parts[3]);
-  if (!Number.isSafeInteger(number) || number < 1) return null;
-  return {
-    kind: parts[0] === "issues" ? "issue" : "pr",
-    repo: `${parts[1]}/${parts[2]}`,
-    number,
-  };
+  const number = Number(match[4]);
+  if (!Number.isSafeInteger(number)) return null;
+  return { kind: "item", item: { kind: match[1] === "issues" ? "issue" : "pr", repo: `${match[2]}/${match[3]}`, number } };
+}
+
+function routePath(route: Route): string {
+  switch (route.kind) {
+    case "list": return route.view;
+    case "new-issue": return route.from === "my-issues" ? "my-issues/new" : "new";
+    case "item": return `${route.item.kind === "pr" ? "pulls" : "issues"}/${route.item.repo}/${route.item.number}`;
+  }
 }
 
 const autoFixerLabels = {
@@ -1650,13 +1659,9 @@ function AgentExecutionControl() {
 
 function AutoFixerPreferencesControl() {
   const rpc = useRpc<typeof giteaRpcContract>();
-  const [loaded, setLoaded] = useState<
-    | { state: "loading" }
-    | { state: "ready"; preferences: Preferences }
-    | { state: "error"; message: string }
-  >(() =>
+  const [loaded, setLoaded] = useState<Loadable<Preferences>>(() =>
     panelMemory.preferences
-      ? { state: "ready", preferences: panelMemory.preferences }
+      ? { state: "ready", value: panelMemory.preferences }
       : { state: "loading" },
   );
   const [saving, setSaving] = useState(false);
@@ -1665,7 +1670,7 @@ function AutoFixerPreferencesControl() {
       .call("getAutoFixerPreferences", null)
       .then((preferences) => {
         panelMemory.preferences = preferences;
-        setLoaded({ state: "ready", preferences });
+        setLoaded({ state: "ready", value: preferences });
       })
       .catch((error: unknown) =>
         setLoaded({
@@ -1703,10 +1708,10 @@ function AutoFixerPreferencesControl() {
         </Button>
       </div>
     );
-  const { preferences } = loaded;
+  const preferences = loaded.value;
   const setPreferences = (next: Preferences) => {
     panelMemory.preferences = next;
-    setLoaded({ state: "ready", preferences: next });
+    setLoaded({ state: "ready", value: next });
   };
   const save = async (
     update: () => Promise<Preferences>,
@@ -1782,33 +1787,30 @@ function AutoFixerPreferencesControl() {
 function AutoFixerList() {
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
-  const [sessions, setSessions] = useState<AutoFixerSessions | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<Loadable<AutoFixerSessions>>(loading);
   const load = useCallback(() => {
     void rpc
       .call("listAutoFixerSessions", null)
       .then((result) => {
-        setSessions(result.sessions);
-        setError(null);
+        setSessions({ state: "ready", value: result.sessions });
       })
       .catch((reason: unknown) =>
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Could not load auto-fixers",
-        ),
+        setSessions({
+          state: "error",
+          message: errorText(reason, "Could not load auto-fixers"),
+        }),
       );
   }, [rpc]);
   useEffect(load, [load]);
   useRealtime("auto-fixer-changed", useCoalesced(load, 500));
-  if (error)
+  if (sessions.state === "error")
     return (
       <div role="alert" className="p-8 text-center text-muted-foreground">
-        {error}
+        {sessions.message}
       </div>
     );
-  if (!sessions) return <Skeleton className="h-24 w-full" />;
-  if (!sessions.length)
+  if (sessions.state === "loading") return <Skeleton className="h-24 w-full" />;
+  if (!sessions.value.length)
     return (
       <div className="rounded-lg border border-border bg-card p-8 text-center text-muted-foreground">
         No auto-fixers yet. Turn on Auto-fix or Auto-merge from My PRs.
@@ -1816,7 +1818,7 @@ function AutoFixerList() {
     );
   return (
     <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
-      {sessions.map((session) => (
+      {sessions.value.map((session) => (
         <div
           key={`${session.repo}#${session.number}`}
           data-testid="auto-fixer-session"
@@ -1826,7 +1828,7 @@ function AutoFixerList() {
             className="flex min-w-0 flex-1 cursor-pointer flex-col items-start text-left"
             onClick={() =>
               navigate.toPluginPanel("gitea", {
-                subPath: `pulls/${session.repo}/${session.number}`,
+                subPath: routePath({ kind: "item", item: { kind: "pr", repo: session.repo, number: session.number } }),
               })
             }
           >
@@ -1862,36 +1864,18 @@ const viewLabels: Record<View, string> = {
   pulls: "Pull requests",
 };
 
-function listView(subPath: string): View | null {
-  switch (subPath) {
-    case "":
-    case "my-prs":
-      return "my-prs";
-    case "my-issues":
-    case "my-issues/new":
-      return "my-issues";
-    case "auto-fixers":
-      return "auto-fixers";
-    case "issues":
-    case "new":
-      return "issues";
-    case "pulls":
-      return "pulls";
-    default:
-      return null;
-  }
-}
-
 function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const rpc = useRpc<typeof giteaRpcContract>();
   const navigate = useBbNavigate();
-  const [view, setView] = useState(listView(subPath) ?? panelMemory.filters.view);
+  const route = useMemo(() => parseRoute(subPath), [subPath]);
+  const [view, setView] = useState<View>(route?.kind === "list" ? route.view : panelMemory.filters.view);
+  const listView = view === "auto-fixers" ? panelMemory.filters.view : view;
   const [state, setState] = useState(panelMemory.filters.state);
   const [repo, setRepo] = useState(panelMemory.filters.repo);
   const [query, setQuery] = useState(panelMemory.filters.query);
   const searchQuery = useDebouncedValue(query, 250);
   useEffect(() => {
-    panelMemory.filters = { view, state, repo, query: searchQuery };
+    panelMemory.filters = { view: listView, state, repo, query: searchQuery };
   }, [view, state, repo, searchQuery]);
   const settings = useScopeWatch();
   const memory = useDisplayMemory();
@@ -1907,15 +1891,16 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   }, [rpc]);
   const verify = useCallback(() => void loadStatus(), [loadStatus]);
   const itemList = useItemList(
-    { view, state, repo, query: searchQuery },
+    { view: listView, state, repo, query: searchQuery },
     memory,
     settings,
     verify,
+    view !== "auto-fixers",
   );
   const { list, load: loadList } = itemList;
   const openMine = useItemList(openMyPullRequests, memory, settings, verify);
   const openIssues = useItemList(openMyIssues, memory, settings, verify);
-  const fromMyIssues = subPath === "my-issues/new";
+  const fromMyIssues = route?.kind === "new-issue" && route.from === "my-issues";
   const [newTitle, setNewTitle] = useState("");
   const [newBody, setNewBody] = useState("");
   const [creatingIssue, setCreatingIssue] = useState(false);
@@ -1924,18 +1909,17 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const [reviewPending, setReviewPending] = useState(false);
   const [detailSection, setDetailSection] =
     useState<DetailSection>("conversation");
-  const route = useMemo(() => parseSubPath(subPath), [subPath]);
-  const newIssue = subPath === "new" || fromMyIssues;
-  const display = useItemDisplay(route, detailSection === "files");
+  const newIssue = route?.kind === "new-issue";
+  const display = useItemDisplay(route?.kind === "item" ? route.item : null, detailSection === "files");
   const shown = display.conversation;
   const detail = useMemo(
     () =>
       shown.state === "ready"
-        ? { ...shown.value.conversation, threadId: shown.value.threadId }
+        ? shown.value.conversation
         : null,
     [shown],
   );
-  const detailError = shown.state === "error" ? shown.message : null;
+  const threadId = shown.state === "ready" ? shown.value.threadId : null;
   const [labelsDraft, setLabelsDraft] = useState<string[]>([]);
   const [assigneesDraft, setAssigneesDraft] = useState<string[]>([]);
   const [savingMetadata, setSavingMetadata] = useState(false);
@@ -1944,12 +1928,13 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
     setAssigneesDraft(detail?.assignees ?? []);
   }, [detail]);
   const pickerOptions = useRepoOptions(detail?.repo ?? null);
+  const loadedRepoOptions = pickerOptions.state === "ready" ? pickerOptions.value : null;
   const labelColors = useMemo(
     () =>
       new Map(
-        (pickerOptions?.labels ?? []).map((label) => [label.name, label.color]),
+        (loadedRepoOptions?.labels ?? []).map((label) => [label.name, label.color]),
       ),
-    [pickerOptions],
+    [loadedRepoOptions],
   );
 
   const loadItems = useCallback(() => loadList(false), [loadList]);
@@ -1964,22 +1949,24 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const openItem = useCallback(
     async (item: Item) => {
       navigate.toPluginPanel("gitea", {
-        subPath: `${item.kind === "pr" ? "pulls" : "issues"}/${item.repo}/${item.number}`,
+        subPath: routePath({ kind: "item", item }),
       });
     },
     [navigate],
   );
   const { reload: refreshDetail } = display;
-  const reviewKey = detail ? `${detail.repo}#${detail.number}` : null;
+  const reviewKey = route?.kind === "item"
+    ? `${route.item.kind}:${route.item.repo}#${route.item.number}`
+    : null;
   const reviewBody = reviewDraft?.key === reviewKey ? reviewDraft.body : "";
   useEffect(() => {
-    if (!route) {
-      const nextView = listView(subPath);
-      if (nextView) setView(nextView);
+    if (route?.kind !== "item") {
+      if (route?.kind === "list") setView(route.view);
+      else if (route?.kind === "new-issue") setView(route.from);
       return;
     }
     setDetailSection("conversation");
-  }, [route, subPath]);
+  }, [route]);
   const refresh = useCallback(async () => {
     await Promise.all([loadStatus(), loadList(true)]);
   }, [loadList, loadStatus]);
@@ -2022,7 +2009,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
   const submitReview = useCallback(
     async (event: "APPROVED" | "REQUEST_CHANGES" | "COMMENT") => {
       if (!detail || detail.kind !== "pr" || reviewPending) return;
-      const submittedKey = `${detail.repo}#${detail.number}`;
+      const submittedKey = `${detail.kind}:${detail.repo}#${detail.number}`;
       setReviewPending(true);
       try {
         await rpc.call("review", {
@@ -2142,9 +2129,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
             </Button>
             <span>New issue</span>
           </div>
-          {!status?.ready && (
+          {connectionNotice(status) && (
             <div className="rounded-md border border-border bg-muted/30 p-3 text-muted-foreground">
-              {status?.error ?? "Checking Gitea configuration…"}
+              {connectionNotice(status)}
             </div>
           )}
           <div className="space-y-3 rounded-lg border border-border bg-card p-4">
@@ -2195,34 +2182,40 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
       </div>
     );
   }
-  const detailRoute = parseSubPath(subPath);
-  if (detailRoute && !detail) {
+  if (route?.kind === "item" && shown.state === "loading") {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto p-4 text-sm md:p-5">
         <div className="mx-auto w-full max-w-5xl space-y-4">
-          {detailError ? (
-            <div className="space-y-3 rounded-lg border border-border bg-card p-4 text-muted-foreground">
-              <p>{detailError}</p>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => navigate.toPluginPanel("gitea", { subPath: view })}
-              >
-                Back to list
-              </Button>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <Skeleton className="h-6 w-2/3" />
-              <Skeleton className="h-24 w-full" />
-              <Skeleton className="h-48 w-full" />
-            </div>
-          )}
+          <div className="space-y-3">
+            <Skeleton className="h-6 w-2/3" />
+            <Skeleton className="h-24 w-full" />
+            <Skeleton className="h-48 w-full" />
+          </div>
         </div>
       </div>
     );
   }
-  if (detailRoute && detail) {
+  if (route?.kind === "item" && shown.state === "error") {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 text-sm md:p-5">
+        <div className="mx-auto w-full max-w-5xl space-y-4">
+          <div className="space-y-3 rounded-lg border border-border bg-card p-4 text-muted-foreground">
+            <p>{shown.message}</p>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => navigate.toPluginPanel("gitea", { subPath: view })}
+            >
+              Back to list
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (route?.kind === "item" && shown.state === "ready") {
+    const detail = shown.value.conversation;
+    const threadId = shown.value.threadId;
     const header = (
       <div className="shrink-0 px-4 pt-4 md:px-5 md:pt-5">
         <div className="mx-auto w-full max-w-5xl space-y-3">
@@ -2239,12 +2232,10 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               {detail.repo} · #{detail.number}
             </span>
             <span className="flex-1" />
-            {shown.state === "ready" && (
-              <FreshnessNote
-                freshness={shown.value.freshness}
-                onRefresh={() => void display.refresh()}
-              />
-            )}
+            <FreshnessNote
+              freshness={shown.value.freshness}
+              onRefresh={() => void display.refresh()}
+            />
             {detail.url && (
               <UrlLink
                 href={detail.url}
@@ -2254,8 +2245,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               </UrlLink>
             )}
           </div>
-          {shown.state === "ready" &&
-            shown.value.freshness.state === "stale-error" && (
+          {shown.value.freshness.state === "stale-error" && (
               <p
                 role="status"
                 className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
@@ -2285,9 +2275,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => void setDraft(!isDraftTitle(detail.title))}
+                onClick={() => void setDraft(!detail.draft)}
               >
-                {isDraftTitle(detail.title) ? "Mark ready" : "Convert to draft"}
+                {detail.draft ? "Mark ready" : "Convert to draft"}
               </Button>
             )}
             <AgentExecutionControl />
@@ -2298,11 +2288,11 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
           <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <Badge variant="outline" className="gap-1.5 font-normal">
               <span
-                className={`size-2 rounded-full ${detail.state === "open" ? "bg-green-500" : "bg-purple-500"}`}
+                className={`size-2 rounded-full ${stateDot[detail.state]}`}
               />
-              {detail.state.toLowerCase()}
+              {detail.state}
             </Badge>
-            {detail.kind === "pr" && isDraftTitle(detail.title) && (
+            {detail.kind === "pr" && detail.draft && (
               <Badge variant="outline" className="font-normal">
                 draft
               </Badge>
@@ -2315,12 +2305,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                 {detail.baseRefName} ← {detail.headRefName}
               </span>
             )}
-            {detail.threadId && (
+            {threadId && (
               <Button
                 size="sm"
                 variant="link"
                 className="h-auto px-1"
-                onClick={() => navigate.toThread(detail.threadId!)}
+                onClick={() => navigate.toThread(threadId)}
               >
                 Open linked BB thread
               </Button>
@@ -2364,7 +2354,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   key={comment.id}
                   item={detail}
                   comment={comment}
-                  mine={sameLogin(comment.author, status?.login)}
+                  mine={sameLogin(comment.author, status?.state === "connected" ? status.login : null)}
                   onChanged={refreshDetail}
                   className="rounded-md border border-border p-3"
                 />
@@ -2384,7 +2374,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               <ChipPicker
                 label="Labels"
                 options={
-                  pickerOptions?.labels.map((label) => label.name) ?? null
+                  loadedRepoOptions?.labels.map((label) => label.name) ?? null
                 }
                 colors={labelColors}
                 selected={labelsDraft}
@@ -2393,7 +2383,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
               />
               <ChipPicker
                 label="Assignees"
-                options={pickerOptions?.assignees ?? null}
+                options={loadedRepoOptions?.assignees ?? null}
                 selected={assigneesDraft}
                 disabled={savingMetadata}
                 onChange={(assignees) =>
@@ -2407,13 +2397,18 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                   <h3 className="border-b border-border bg-muted/50 px-3 py-2 text-xs font-semibold text-muted-foreground">
                     Checks
                   </h3>
-                  {detail.checksTruncated && (
+                  {detail.checks.state === "unavailable" ? (
+                    <p role="status" className="p-3 text-xs text-muted-foreground">
+                      Checks unavailable.
+                    </p>
+                  ) : <>
+                  {detail.checks.truncated && (
                     <p className="px-3 pt-2 text-xs text-muted-foreground">
                       Check list may be incomplete.
                     </p>
                   )}
-                  {detail.checks.length ? (
-                    detail.checks.map((check, index) => (
+                  {detail.checks.values.length ? (
+                    detail.checks.values.map((check, index) => (
                       <CheckRow key={`${check.name}-${index}`} check={check} />
                     ))
                   ) : (
@@ -2421,6 +2416,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                       No checks reported.
                     </p>
                   )}
+                  </>}
                 </section>
                 <section className="space-y-2 rounded-lg border border-border bg-card p-3">
                   <h3 className="text-xs font-semibold text-muted-foreground">
@@ -2562,7 +2558,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
             <Button
               size="sm"
               onClick={() =>
-                navigate.toPluginPanel("gitea", { subPath: view === "my-issues" ? "my-issues/new" : "new" })
+                navigate.toPluginPanel("gitea", { subPath: routePath({ kind: "new-issue", from: view === "my-issues" ? "my-issues" : "issues" }) })
               }
             >
               New issue
@@ -2572,9 +2568,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-4 md:p-5">
         <div className="mx-auto w-full max-w-5xl space-y-4">
-          {!status?.ready && (
+          {connectionNotice(status) && (
             <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              {status?.error ?? "Checking Gitea configuration…"}
+              {connectionNotice(status)}
             </div>
           )}
           {shownList && shownList.errors.length > 0 && (
@@ -2678,9 +2674,9 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                               className="gap-1.5 font-normal"
                             >
                               <span
-                                className={`size-2 shrink-0 rounded-full ${item.state === "open" ? "bg-green-500" : "bg-purple-500"}`}
+                                className={`size-2 shrink-0 rounded-full ${stateDot[item.state]}`}
                               />
-                              {item.state.toLowerCase()}
+                              {item.state}
                             </Badge>
                             <span className="shrink-0 font-mono text-xs text-muted-foreground">
                               #{item.number}
@@ -2704,12 +2700,12 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                             ))}
                           </span>
                         </button>
-                        {shownList?.autoFixers.has(itemKey(item)) && (
+                        {item.autoFixer && (
                           <span className="px-3 pb-3 sm:p-0">
                             <AutoFixerControls
                               repo={item.repo}
                               number={item.number}
-                              view={shownList.autoFixers.get(itemKey(item))!}
+                              view={item.autoFixer}
                               onChanged={reloadAutoFixers}
                             />
                           </span>
@@ -2718,7 +2714,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                     ))
                   ) : (
                     <div className="p-8 text-center text-muted-foreground">
-                      {(view === "my-prs" || view === "my-issues") && !status?.login
+                      {(view === "my-prs" || view === "my-issues") && status?.state !== "connected"
                         ? "Install tea and sign in with a matching Gitea login profile to see your pull requests."
                         : view === "my-prs"
                           ? "No pull requests authored by you in tracked repositories."
@@ -2751,7 +2747,7 @@ function useViewerLogin() {
     void rpc
       .call("status", null)
       .then((value) => {
-        if (current) setLogin(value.login);
+        if (current) setLogin(value.state === "connected" ? value.login : null);
       })
       .catch(() => {});
     return () => {
@@ -2763,19 +2759,24 @@ function useViewerLogin() {
 
 function useRepoOptions(repo: string | null) {
   const rpc = useRpc<typeof giteaRpcContract>();
-  const [options, setOptions] = useState<RepoOptions | null>(null);
+  const [options, setOptions] = useState<Loadable<RepoOptions>>(loading);
   useEffect(() => {
-    setOptions(null);
-    if (!repo) return;
+    if (!repo) {
+      setOptions({ state: "loading" });
+      return;
+    }
+    setOptions(loading);
     let current = true;
     void rpc
       .call("repoOptions", { repo })
       .then((value) => {
-        if (current) setOptions(value);
+        if (current) setOptions({ state: "ready", value });
       })
       .catch((error: unknown) => {
-        if (current)
+        if (current) {
+          setOptions({ state: "error", message: errorText(error, "Could not load labels and assignees") });
           toast.error(errorText(error, "Could not load labels and assignees"));
+        }
       });
     return () => {
       current = false;
@@ -3150,25 +3151,21 @@ function CommentComposer({
 
 function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
   const rpc = useRpc<typeof giteaRpcContract>();
-  const [item, setItem] = useState<ItemRef | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [linked, setLinked] = useState<Loadable<ItemRef>>(loading);
   useEffect(() => {
     let current = true;
-    setItem(null);
-    setError(null);
+    setLinked(loading);
     void rpc
       .call("threadItem", { threadId })
       .then((linked) => {
         if (!current) return;
-        if (linked) setItem(linked);
-        else
-          setError(
-            "This BB thread is not linked to a Gitea issue or pull request.",
-          );
+        setLinked(linked
+          ? { state: "ready", value: linked }
+          : { state: "error", message: "This BB thread is not linked to a Gitea issue or pull request." });
       })
       .catch((reason: unknown) => {
         if (current)
-          setError(errorText(reason, "Could not load the linked Gitea item."));
+          setLinked({ state: "error", message: errorText(reason, "Could not load the linked Gitea item.") });
       });
     return () => {
       current = false;
@@ -3177,18 +3174,19 @@ function GiteaThreadPanel({ threadId }: PluginThreadPanelProps) {
   const [section, setSection] = useState<DetailSection>("conversation");
   useEffect(() => setSection("conversation"), [threadId]);
   const viewer = useViewerLogin();
+  const item = linked.state === "ready" ? linked.value : null;
   const display = useItemDisplay(
     item,
     item?.kind === "pr" && section === "files",
   );
   const shown = display.conversation;
-  if (error || shown.state === "error")
+  if (linked.state === "error" || shown.state === "error")
     return (
       <div className="p-4 text-sm text-muted-foreground">
-        {error ?? (shown.state === "error" ? shown.message : "")}
+        {linked.state === "error" ? linked.message : shown.state === "error" ? shown.message : ""}
       </div>
     );
-  if (shown.state === "loading")
+  if (linked.state === "loading" || shown.state === "loading")
     return (
       <div className="p-4 text-sm text-muted-foreground">
         Loading Gitea item…

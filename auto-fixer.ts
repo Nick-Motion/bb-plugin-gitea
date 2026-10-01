@@ -77,8 +77,11 @@ export const defaultAutoFixerPreferences: AutoFixerPreferences = {
   },
 };
 
+export const repositoryPattern = /^[\w.-]+\/[\w.-]+$/;
+export const repositorySchema = z.string().regex(repositoryPattern);
+
 const sessionBase = z.object({
-  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+  repo: repositorySchema,
   number: z.number().int().positive(),
   threadId: z.string().min(1),
   hostId: z.string().min(1).optional(),
@@ -148,6 +151,14 @@ export type PullLifecycle =
   | { state: "merged"; mergedAt: string }
   | { state: "closed"; closedAt: string };
 export type LifecycleFact = PullLifecycle | { state: "unknown"; error: string };
+export const unrecognizedPullState =
+  "Gitea returned an unrecognized pull request state.";
+
+export function requireLifecycle(pull: unknown): PullLifecycle {
+  const lifecycle = parseLifecycle(pull);
+  if (!lifecycle) throw new Error(unrecognizedPullState);
+  return lifecycle;
+}
 
 type Marker = "merged" | "closed" | "needs_you" | "failed";
 const maxMessageLength = 4000;
@@ -203,8 +214,24 @@ export function sessionActions(session: AutoFixerSession): AutoFixerAction[] {
   }
 }
 
-export function pullKey(repo: string, number: number): string {
-  return `${repo.toLowerCase()}#${number}`;
+export function repoKey(repo: string): string {
+  return repo.toLowerCase();
+}
+
+export function itemKey(repo: string, number: number): string {
+  return `${repoKey(repo)}#${number}`;
+}
+
+export function parseItemRef(
+  raw: string,
+): { repo: string; number: number } | null {
+  const at = raw.lastIndexOf("#");
+  const repo = raw.slice(0, at);
+  const rawNumber = raw.slice(at + 1);
+  const number = Number(rawNumber);
+  return at > 0 && repositoryPattern.test(repo) && /^[1-9]\d*$/.test(rawNumber)
+    ? { repo, number }
+    : null;
 }
 
 export type StartRejection = "merged" | "closed" | "no-project";
@@ -279,7 +306,7 @@ export type AutomationDecision =
       cleanupFirst: boolean;
     }
   | { kind: "reject"; reason: "merged" };
-type WatchingSession = Extract<AutoFixerSession, { status: "watching" }>;
+export type WatchingSession = Extract<AutoFixerSession, { status: "watching" }>;
 
 export function decideAutomation(
   session: AutoFixerSession | null,
@@ -405,12 +432,11 @@ export function confirmedTerminal(
 }
 
 export function onIdle(
-  session: AutoFixerSession,
+  session: WatchingSession,
   lastText: string | null,
   lifecycle: LifecycleFact,
   now: string,
-): AutoFixerSession | null {
-  if (session.status !== "watching") return null;
+): AutoFixerSession {
   const marker = parseMarker(lastText);
   const summary = lastText?.trim() ?? "";
   if (lifecycle.state === "merged" || lifecycle.state === "closed")
@@ -452,20 +478,18 @@ export function onIdle(
 }
 
 export function onFailed(
-  session: AutoFixerSession,
+  session: WatchingSession,
   error: string | null,
   now: string,
-): AutoFixerSession | null {
-  return session.status === "watching"
-    ? failed(session, error?.trim() || "Gitean auto-fixer thread failed.", now)
-    : null;
+): AutoFixerSession {
+  return failed(session, error?.trim() || "Gitean auto-fixer thread failed.", now);
 }
 
 export function onArchived(
-  session: AutoFixerSession,
+  session: WatchingSession,
   now: string,
-): AutoFixerSession | null {
-  return session.status === "watching" ? stopped(session, now, false) : null;
+): Extract<AutoFixerSession, { status: "stopped" }> {
+  return stopped(session, now, false);
 }
 
 export function onCleanupFailed(
@@ -498,10 +522,10 @@ export function watching(
   return { ...retained(session, now), policy, status: "watching" };
 }
 
-export function sameSession(
-  left: AutoFixerSession,
+export function sameSession<S extends AutoFixerSession>(
+  left: S,
   right: AutoFixerSession | null,
-): right is AutoFixerSession {
+): right is S {
   return (
     right !== null &&
     right.repo === left.repo &&
@@ -526,8 +550,8 @@ export function autoStartTargets<
       pull.state === "open" &&
       pull.author === input.login &&
       decideStart({
-        session: input.sessions.get(pullKey(pull.repo, pull.number)) ?? null,
-        projectId: input.projects.get(pull.repo.toLowerCase()) ?? null,
+        session: input.sessions.get(itemKey(pull.repo, pull.number)) ?? null,
+        projectId: input.projects.get(repoKey(pull.repo)) ?? null,
         lifecycle: { state: "open" },
       }).kind === "spawn",
   );
@@ -613,8 +637,7 @@ export const pullWatchDefaultTimeoutMs = 240_000;
 export const pullWatchMaxTimeoutMs = 600_000;
 
 export type PullSignal = {
-  state: string;
-  merged: boolean;
+  lifecycle: PullLifecycle["state"] | "unknown";
   head: string;
   base: string;
   mergeable: boolean | null;
@@ -645,8 +668,7 @@ export function pullSignal(pull: unknown, combined: unknown): PullSignal {
   ) as Record<string, unknown>;
   const statuses = Array.isArray(status.statuses) ? status.statuses : [];
   return {
-    state: nonEmpty(entry.state) ?? "",
-    merged: entry.merged === true,
+    lifecycle: parseLifecycle(pull)?.state ?? "unknown",
     head: sha(entry.head),
     base: sha(entry.base),
     mergeable: typeof entry.mergeable === "boolean" ? entry.mergeable : null,
@@ -673,8 +695,7 @@ export function signalToken(signal: PullSignal): string {
 }
 
 export function describeSignal(signal: PullSignal): string {
-  const state = signal.merged ? "merged" : signal.state || "unknown";
   const mergeable =
     signal.mergeable === null ? "unknown" : signal.mergeable ? "yes" : "no";
-  return `state ${state} · head ${signal.head.slice(0, 12) || "unknown"} · checks ${signal.checks || "none"} · mergeable ${mergeable} · updated ${signal.updatedAt || "unknown"}`;
+  return `state ${signal.lifecycle} · head ${signal.head.slice(0, 12) || "unknown"} · checks ${signal.checks || "none"} · mergeable ${mergeable} · updated ${signal.updatedAt || "unknown"}`;
 }

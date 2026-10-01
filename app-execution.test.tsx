@@ -19,7 +19,7 @@ const emptyList = { items: [], truncated: false, errors: [], account, freshness,
 it("ignores repeated normalized model selections on an issue but saves real changes", async () => {
   const slot = renderSlot(app.navPanels[0]!, { subPath: "issues/acme/widgets/10" }, {
     rpc: {
-      status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution }),
       getAgentExecution: () => ({ execution }),
       setAgentExecution: () => ({ ok: true }),
@@ -62,6 +62,27 @@ it("ignores repeated normalized model selections on an issue but saves real chan
   expect(writes()).toHaveLength(1);
 });
 
+it("does not save an equivalent auto-fixer model and saves a real change once", async () => {
+  const slot = renderSlot(app.navPanels[0]!, { subPath: "auto-fixers" }, {
+    rpc: {
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
+      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution }),
+      setAutoFixerExecution: (next: typeof execution) => ({ autoFix: false, autoMerge: false, execution: next }),
+      listMyPullRequests: () => emptyList,
+      listMyIssues: () => emptyList,
+      listItems: () => emptyList,
+    },
+  });
+  const apply = await screen.findByRole("button", { name: "Apply execution selection" });
+  fireEvent.change(screen.getByLabelText("Service tier"), { target: { value: "" } });
+  await act(async () => fireEvent.click(apply));
+  const writes = () => slot.rpcCalls.filter(call => call.method === "setAutoFixerExecution");
+  expect(writes()).toHaveLength(0);
+  fireEvent.change(screen.getByLabelText("Model"), { target: { value: "another-model" } });
+  await act(async () => fireEvent.click(apply));
+  expect(writes()).toHaveLength(1);
+});
+
 it("creates an issue once while the request is pending and locks the draft", async () => {
   const scrollIntoView = Element.prototype.scrollIntoView;
   Element.prototype.scrollIntoView = vi.fn();
@@ -69,7 +90,7 @@ it("creates an issue once while the request is pending and locks the draft", asy
   const held = new Promise<void>((resolve) => (release = resolve));
   const slot = renderSlot(app.navPanels[0]!, { subPath: "new" }, {
     rpc: {
-      status: () => ({ ready: true, error: null, login: "dev", account, repos: [{ repo: "acme/widgets", projectId: null }] }),
+      status: () => ({ state: "connected", login: "dev", account, repos: [{ repo: "acme/widgets", projectId: null }] }),
       listMyPullRequests: () => emptyList,
       listMyIssues: () => emptyList,
       listItems: () => emptyList,
@@ -94,7 +115,7 @@ it("guards comment keyboard submission and locks the composer while posting", as
   const held = new Promise<void>((resolve) => (release = resolve));
   const slot = renderSlot(app.navPanels[0]!, { subPath: "issues/acme/widgets/10" }, {
     rpc: {
-      status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution }),
       listMyPullRequests: () => emptyList,
       listMyIssues: () => emptyList,

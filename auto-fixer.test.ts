@@ -10,11 +10,14 @@ import {
   decideRetry,
   decideStart,
   decideStop,
+  describeSignal,
   onArchived,
   onCleanupFailed,
   onFailed,
   onIdle,
   parseLifecycle,
+  requireLifecycle,
+  parseItemRef,
   parseMarker,
   parseStoredPreferences,
   parseStoredSession,
@@ -24,6 +27,16 @@ import {
   type AutoFixerPolicy,
   type AutoFixerSession,
 } from "./auto-fixer";
+
+it("parses only positive owner/repository item references", () => {
+  expect(parseItemRef("Acme/Widgets#42")).toEqual({
+    repo: "Acme/Widgets",
+    number: 42,
+  });
+  for (const value of ["a/b#0", "a#1", "a/b/c#1", "a/b#01"]) {
+    expect(parseItemRef(value)).toBeNull();
+  }
+});
 
 const now = "2026-09-28T00:00:00Z";
 const watching: AutoFixerSession = {
@@ -62,6 +75,13 @@ describe("parseLifecycle", () => {
     expect(parseLifecycle({ merged: true })).toBeNull();
     expect(parseLifecycle({ merged: false, state: "draft" })).toBeNull();
     expect(parseLifecycle(null)).toBeNull();
+  });
+
+  it("requires a recognized pull lifecycle at spawn and resume boundaries", () => {
+    expect(requireLifecycle({ merged: false, state: "open" })).toEqual(open);
+    expect(() => requireLifecycle({ merged: false, state: "draft" })).toThrow(
+      "Gitea returned an unrecognized pull request state.",
+    );
   });
 });
 
@@ -242,11 +262,7 @@ describe("transitions", () => {
     });
   });
 
-  it("ignores lifecycle events for sessions that are no longer watching", () => {
-    const halted = stopped(watching, now, false);
-    expect(onIdle(halted, "BB_GITEA_AUTO_FIX: MERGED", merged, now)).toBeNull();
-    expect(onFailed(halted, "boom", now)).toBeNull();
-    expect(onArchived(halted, now)).toBeNull();
+  it("settles lifecycle events for watching sessions", () => {
     expect(onArchived(watching, now)).toMatchObject({ status: "stopped" });
     expect(onFailed(watching, null, now)).toMatchObject({
       status: "failed",
@@ -611,5 +627,18 @@ describe("pull change signal", () => {
       "bb gitea pr-watch acme/widgets 42 --since <token>",
     );
     expect(prompt).not.toMatch(/sleep \d/);
+  });
+
+  it("uses parsed lifecycle in the change token and description", () => {
+    const openSignal = pullSignal(pull, combined);
+    const mergedPull = {
+      ...pull,
+      state: "closed",
+      merged: true,
+      merged_at: now,
+    };
+    const mergedSignal = pullSignal(mergedPull, combined);
+    expect(signalToken(mergedSignal)).not.toBe(signalToken(openSignal));
+    expect(describeSignal(mergedSignal)).toContain("state merged");
   });
 });

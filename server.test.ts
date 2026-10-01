@@ -210,7 +210,7 @@ it("discovers only matching Gitea HTTPS and SSH remotes under the configured pat
     })),
   });
   const result = await status(host);
-  expect(result).toMatchObject({ ready: true, error: null, login: "dev" });
+  expect(result).toMatchObject({ state: "connected", login: "dev" });
   expect(result.repos).toEqual([
     { repo: "acme/widgets", projectId: "project-1" },
     { repo: "ops/api", projectId: "project-2" },
@@ -244,6 +244,25 @@ it("reads a second issue page and reports repository failures without losing acc
       "/api/v1/repos/acme/widgets/issues?state=open&type=issues&limit=50&page=2",
     ]),
   );
+});
+
+it("rejects item lists when every configured repository is unreachable", async () => {
+  const { host } = await start(
+    ({ endpoint }) =>
+      endpoint.endsWith("/api/v1/user")
+        ? { json: { login: "dev" } }
+        : { status: 403 },
+    { settings: { extraRepos: "broken/repo" } },
+  );
+  await expect(listItems(host, {})).rejects.toThrow(
+    "Gitea API returned HTTP 403.",
+  );
+  await expect(
+    rpc(host, "listMyIssues", { state: "open", query: "" }),
+  ).rejects.toThrow("Gitea API returned HTTP 403.");
+  await expect(
+    rpc(host, "listMyPullRequests", { state: "open", query: "" }),
+  ).rejects.toThrow("Gitea API returned HTTP 403.");
 });
 
 it("paginates pull request comments, files, and reviews and stops on a short page", async () => {
@@ -602,7 +621,7 @@ it("coalesces aliases for one account and requires a profile choice when account
   });
   await expect(
     host.harness.behavior.callRpc("status", null),
-  ).resolves.toMatchObject({ ready: true, login: "dev" });
+  ).resolves.toMatchObject({ state: "connected", login: "dev" });
   expect(calls.map((call) => call.login)).toEqual(["alpha"]);
 
   const ambiguous = await start(() => ({ json: { login: "dev" } }), {
@@ -614,15 +633,14 @@ it("coalesces aliases for one account and requires a profile choice when account
   await expect(
     ambiguous.host.harness.behavior.callRpc("status", null),
   ).resolves.toMatchObject({
-    ready: false,
-    login: null,
+    state: "unavailable",
     error: expect.stringContaining("belong to different users"),
   });
   expect(ambiguous.calls).toEqual([]);
   await ambiguous.host.harness.behavior.setSettings({ teaProfile: "bot" });
   await expect(
     ambiguous.host.harness.behavior.callRpc("status", null),
-  ).resolves.toMatchObject({ ready: true });
+  ).resolves.toMatchObject({ state: "connected" });
   expect(ambiguous.calls.map((call) => call.login)).toEqual(["bot"]);
 });
 
@@ -637,14 +655,14 @@ it("never routes through an explicitly selected profile for another instance", a
   await expect(
     host.harness.behavior.callRpc("status", null),
   ).resolves.toMatchObject({
-    ready: false,
+    state: "unavailable",
     error: expect.stringContaining("different Gitea instance"),
   });
   await host.harness.behavior.setSettings({ teaProfile: "missing" });
   await expect(
     host.harness.behavior.callRpc("status", null),
   ).resolves.toMatchObject({
-    ready: false,
+    state: "unavailable",
     error: expect.stringContaining('"missing" was not found'),
   });
   expect(calls).toEqual([]);
@@ -839,13 +857,13 @@ it("reports a missing tea executable as a readiness problem", async () => {
   });
   cleanups.push(() => host.harness.lifecycle.dispose());
   await plugin(host.bb);
-  await expect(
-    host.harness.behavior.callRpc("status", null),
-  ).resolves.toMatchObject({
-    ready: false,
-    login: null,
+  const result = await host.harness.behavior.callRpc("status", null);
+  expect(result).toMatchObject({
+    state: "unavailable",
     error: expect.stringContaining("Gitea CLI tea was not found"),
   });
+  expect(result).not.toHaveProperty("account");
+  expect(result).not.toHaveProperty("login");
 });
 
 it("exposes the validated read and write handlers through bb gitea commands", async () => {
@@ -944,6 +962,17 @@ async function pullDetail(host: Host) {
     }),
   );
 }
+
+it("preserves unavailable checks in pull request detail", async () => {
+  const { host } = await start(({ endpoint }) => {
+    if (endpoint.includes("/statuses/")) return { status: 500, json: {} };
+    return diffApi([], () => ({ json: "" }))({
+      args: [], login: "", method: "GET", endpoint, body: null,
+    });
+  });
+  const detail = await pullDetail(host);
+  expect(detail.checks).toEqual({ state: "unavailable" });
+});
 
 const rawHunk = "@@ -1 +1 @@\n-old\n+new";
 const rawDiff = [
@@ -1144,6 +1173,17 @@ const readsFiles = (call: TeaCall) =>
   call.endpoint.includes("/pulls/9/files") ||
   call.endpoint.endsWith("/pulls/9.diff");
 
+it("finds a legacy thread key when the repository casing differs", async () => {
+  const { host } = await start(
+    diffApi(rawFiles, () => ({ raw: rawDiff }), () => pullJson()),
+  );
+  await host.bb.storage.kv.set("thread:Acme/Widgets:9", "legacy-thread");
+
+  await expect(conversation(host)).resolves.toMatchObject({
+    threadId: "legacy-thread",
+  });
+});
+
 it("reads the pull request conversation without files, loads files on request, and serves repeats from cache", async () => {
   const { host, calls } = await start(
     diffApi(
@@ -1182,6 +1222,24 @@ it("reads the pull request conversation without files, loads files on request, a
   const fileCalls = calls.length;
   await files(host, { revision: { head: headSha, base: baseSha } });
   expect(calls).toHaveLength(fileCalls);
+});
+
+it("keeps the conversation when statuses fail and normalizes item state and draft once", async () => {
+  const { host } = await start(({ endpoint }) => {
+    if (endpoint.endsWith("/issues/9"))
+      return { json: { ...issue(9, "WIP: Needs review"), state: "unexpected" } };
+    if (endpoint.endsWith("/pulls/9")) return { json: pullJson() };
+    if (endpoint.includes(`/statuses/${headSha}`)) return { status: 500 };
+    if (endpoint.includes("/comments")) return { json: [] };
+    return { json: [] };
+  });
+  const result = await conversation(host);
+  expect(result.conversation).toMatchObject({
+    kind: "pr",
+    state: "closed",
+    draft: true,
+    checks: { state: "unavailable" },
+  });
 });
 
 it("keeps revision-bound files cached when a comment changes the conversation", async () => {
@@ -1590,14 +1648,13 @@ it("rereads pull request lists after Refresh, list-changing mutations, account c
   expect(other.account).not.toBe(first.account);
   expect(calls.filter(readsList).at(-1)?.login).toBe("ops");
   await expect(status(host)).resolves.toMatchObject({
-    ready: true,
+    state: "connected",
     account: other.account,
   });
 
   rejected = true;
   await expect(status(host)).resolves.toMatchObject({
-    ready: false,
-    account: null,
+    state: "unavailable",
   });
   await expect(myPulls(host)).rejects.toThrow("Gitea rejected tea login");
 });
@@ -2945,6 +3002,19 @@ it("starts send-agent threads with the chosen model or the project default", asy
     ...execution,
     executionInputSources: { model: "explicit" },
   });
+});
+
+it("finds send-agent threads when the repository spelling changes case", async () => {
+  const { host } = await startAutoFixers();
+  await rpc(host, "sendAgent", { repo: "Acme/Widgets", number: 42, kind: "pr" });
+  await expect(
+    rpc(host, "conversation", {
+      repo: "acme/widgets",
+      number: 42,
+      kind: "pr",
+      refresh: false,
+    }),
+  ).resolves.toMatchObject({ threadId: expect.any(String) });
 });
 
 it("waits for cheap pull request change signals with pr-watch", async () => {

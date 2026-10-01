@@ -23,7 +23,7 @@ import {
   type PullRevision,
   type RawPullDiff,
 } from "./pull-diff.js";
-import { draftTitle } from "./draft-title.js";
+import { draftTitle, isDraftTitle } from "./draft-title.js";
 import {
   activePolicy,
   applyAutomationPatch,
@@ -53,10 +53,16 @@ import {
   onFailed,
   onIdle,
   parseLifecycle,
+  requireLifecycle,
+  unrecognizedPullState,
   parseStoredPreferences,
   parseStoredSession,
-  pullKey,
+  itemKey,
+  parseItemRef,
+  repoKey,
+  repositorySchema,
   sameSession,
+  type WatchingSession,
   sessionView,
   setsAutomationOption,
   startError,
@@ -71,13 +77,12 @@ import {
 } from "./auto-fixer.js";
 const execFileAsync = promisify(execFile);
 
-const repositorySchema = z.string().regex(/^[\w.-]+\/[\w.-]+$/);
 const itemSchema = z.object({
   repo: repositorySchema,
   number: z.number().int().positive(),
   kind: z.enum(["issue", "pr"]),
   title: z.string(),
-  state: z.string(),
+  state: z.enum(["open", "closed"]),
   author: z.string(),
   labels: z.array(z.string()),
   assignees: z.array(z.string()),
@@ -91,10 +96,7 @@ const listOutputSchema = z.object({
   errors: z.array(z.object({ repo: repositorySchema, message: z.string() })),
 });
 type ListItem = z.infer<typeof itemSchema>;
-type ItemPage = z.infer<typeof listOutputSchema> & {
-  reachable: number;
-  failures: unknown[];
-};
+type ItemPage = z.infer<typeof listOutputSchema>;
 const commentSchema = z.object({
   id: z.number().int().positive(),
   author: z.string(),
@@ -114,6 +116,10 @@ const checkSchema = z.object({
   status: z.enum(["success", "failure", "pending", "neutral"]),
   url: z.string(),
 });
+const checksSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("loaded"), values: z.array(checkSchema), truncated: z.boolean() }),
+  z.object({ state: z.literal("unavailable") }),
+]);
 const reviewSchema = z.object({
   author: z.string(),
   state: z.string(),
@@ -135,8 +141,7 @@ const detailSchema = itemSchema.extend({
   comments: z.array(commentSchema),
   commentsTruncated: z.boolean(),
   files: z.array(fileSchema),
-  checksTruncated: z.boolean(),
-  checks: z.array(checkSchema),
+  checks: checksSchema,
   reviews: z.array(reviewSchema),
   filesTruncated: z.boolean(),
   reviewsTruncated: z.boolean(),
@@ -157,8 +162,8 @@ const conversationSchema = z.discriminatedUnion("kind", [
     baseRefName: z.string(),
     revision: revisionSchema,
     changedFiles: z.number().int().nonnegative().nullable(),
-    checks: z.array(checkSchema),
-    checksTruncated: z.boolean(),
+    draft: z.boolean(),
+    checks: checksSchema,
     reviews: z.array(reviewSchema),
     reviewsTruncated: z.boolean(),
     reviewComments: z.array(reviewCommentSchema),
@@ -183,6 +188,9 @@ type Conversation = z.infer<typeof conversationSchema>;
 type PullFiles = z.infer<typeof pullFilesSchema>;
 type FileView = z.infer<typeof fileSchema>;
 type Check = z.infer<typeof checkSchema>;
+type Checks =
+  | { state: "loaded"; values: Check[]; truncated: boolean }
+  | { state: "unavailable" };
 type ReviewComment = z.infer<typeof reviewCommentSchema>;
 const okSchema = z.object({ ok: z.literal(true) });
 const pullRefSchema = z.object({
@@ -194,15 +202,23 @@ const threadIdSchema = z.object({ threadId: z.string().min(1) });
 export const giteaRpcContract = defineRpcContract({
   status: {
     input: z.null(),
-    output: z.object({
-      ready: z.boolean(),
-      error: z.string().nullable(),
-      login: z.string().nullable(),
-      account: z.string().nullable(),
-      repos: z.array(
-        z.object({ repo: repositorySchema, projectId: z.string().nullable() }),
-      ),
-    }),
+    output: z.discriminatedUnion("state", [
+      z.object({
+        state: z.literal("connected"),
+        login: z.string().nullable(),
+        account: z.string(),
+        repos: z.array(
+          z.object({ repo: repositorySchema, projectId: z.string().nullable() }),
+        ),
+      }),
+      z.object({
+        state: z.literal("unavailable"),
+        error: z.string(),
+        repos: z.array(
+          z.object({ repo: repositorySchema, projectId: z.string().nullable() }),
+        ),
+      }),
+    ]),
   },
   listItems: {
     input: z.object({
@@ -495,19 +511,18 @@ function sameInstance(raw: string, base: URL): boolean {
 }
 
 class TeaProcessError extends Error {
-  readonly missingLogin: boolean;
-  readonly interrupted: boolean;
-  readonly overflow: boolean;
+  readonly reason: "overflow" | "missing-login" | "timeout" | "failed";
   constructor(error: ExecFileException, stderr: string) {
     super("tea exited unsuccessfully.");
-    this.missingLogin = /login name '.*' does not exist/.test(stderr);
-    this.overflow = error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
-    this.interrupted = error.killed === true || error.signal != null;
+    this.reason =
+      error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+        ? "overflow"
+        : /login name '.*' does not exist/.test(stderr)
+          ? "missing-login"
+          : error.killed === true || error.signal != null
+            ? "timeout"
+            : "failed";
   }
-}
-
-function displayTag(repo: string, number: number) {
-  return `${repo.toLowerCase()}#${number}`;
 }
 
 function freshnessView(freshness: Display<unknown>["freshness"]) {
@@ -541,13 +556,7 @@ function checkStatus(state: string): Check["status"] {
   return "neutral";
 }
 
-class GiteaAccessError extends Error {
-  readonly scope: "account" | "item";
-  constructor(message: string, scope: "account" | "item") {
-    super(message);
-    this.scope = scope;
-  }
-}
+class GiteaAccessError extends Error {}
 
 function safeLink(base: URL, value: unknown): string {
   if (typeof value !== "string") return "";
@@ -603,7 +612,7 @@ function mapItem(
     number: row.number,
     kind,
     title: text(row.title),
-    state: text(row.state),
+    state: text(row.state).toLowerCase() === "open" ? "open" : "closed",
     author: text(user.login),
     labels: strings(row.labels),
     assignees: Array.isArray(row.assignees)
@@ -748,7 +757,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (removed.includes(true)) publishDisplay(null);
   }
   function forgetDisplayItem(repo: string, number: number) {
-    const tag = displayTag(repo, number);
+    const tag = itemKey(repo, number);
     conversations.invalidate(tag);
     publishDisplay(tag);
   }
@@ -966,20 +975,21 @@ export default async function plugin(bb: BbPluginApi) {
       });
     } catch (error) {
       if (signal?.aborted || !(error instanceof TeaProcessError)) throw error;
-      if (error.overflow) return { kind: "too-large" };
-      if (error.missingLogin) {
-        loginLookup = null;
-        forgetDisplay();
-        throw new GiteaAccessError(
-          `tea login profile "${login}" is no longer available. ${teaHint}`,
-          "account",
-        );
+      switch (error.reason) {
+        case "overflow":
+          return { kind: "too-large" };
+        case "missing-login": {
+          loginLookup = null;
+          forgetDisplay();
+          throw new GiteaAccessError(
+            `tea login profile "${login}" is no longer available. ${teaHint}`,
+          );
+        }
+        case "timeout":
+          throw new Error("The tea request to Gitea timed out. Try again later.");
+        case "failed":
+          throw new Error("The tea request to Gitea failed. Check network access and server availability, then try again.");
       }
-      throw new Error(
-        error.interrupted
-          ? "The tea request to Gitea timed out. Try again later."
-          : "The tea request to Gitea failed. Check network access and server availability, then try again.",
-      );
     }
     const status = Number(
       output.stderr.match(/^HTTP\/[\d.]+ (\d{3})\b/m)?.[1] ?? Number.NaN,
@@ -990,11 +1000,10 @@ export default async function plugin(bb: BbPluginApi) {
       forgetDisplay();
       throw new GiteaAccessError(
         `Gitea rejected tea login profile "${login}". Sign in again with \`tea login add\`.`,
-        "account",
       );
     }
     if (status === 403 || status === 404)
-      throw new GiteaAccessError(`Gitea API returned HTTP ${status}.`, "item");
+      throw new GiteaAccessError(`Gitea API returned HTTP ${status}.`);
     if (status < 200 || status >= 300)
       throw new Error(`Gitea API returned HTTP ${status}.`);
     return { kind: "body", body: output.stdout };
@@ -1095,7 +1104,7 @@ export default async function plugin(bb: BbPluginApi) {
     return JSON.stringify([
       await displayAccount(),
       scope,
-      repo.toLowerCase(),
+      repoKey(repo),
       number,
     ]);
   }
@@ -1197,19 +1206,21 @@ export default async function plugin(bb: BbPluginApi) {
     repo: string,
     head: string,
     signal: AbortSignal | undefined,
-  ): Promise<{ checks: Check[]; truncated: boolean }> {
+  ): Promise<Checks> {
     const base = cleanBaseUrl(config.baseUrl);
     const statuses = await paginated(
       repoPath(repo, `statuses/${encodeURIComponent(head)}`),
       signal,
       2,
     ).catch((error: unknown) => {
-      if (signal?.aborted || error instanceof GiteaAccessError) throw error;
-      return { values: [], truncated: false };
+      if (signal?.aborted) throw error;
+      return { state: "unavailable" as const };
     });
+    if ("state" in statuses) return statuses;
     return {
+      state: "loaded",
       truncated: statuses.truncated,
-      checks: statuses.values.slice(0, 100).map((entry) => {
+      values: statuses.values.slice(0, 100).map((entry) => {
         const status = record(entry);
         return {
           name: text(status.context),
@@ -1258,8 +1269,8 @@ export default async function plugin(bb: BbPluginApi) {
         typeof loaded.pull.changed_files === "number"
           ? loaded.pull.changed_files
           : null,
-      checks: loaded.checks.checks,
-      checksTruncated: loaded.checks.truncated,
+      draft: isDraftTitle(item.title),
+      checks: loaded.checks,
       reviews: reviewPage.reviews,
       reviewsTruncated: reviewPage.truncated,
       reviewComments: reviewPage.reviewComments,
@@ -1327,8 +1338,8 @@ export default async function plugin(bb: BbPluginApi) {
               { timeout: 5000, maxBuffer: 4096 },
             );
             const repo = repositoryFromRemote(stdout.trim(), base);
-            if (repo && !found.has(repo.toLowerCase()))
-              found.set(repo.toLowerCase(), {
+            if (repo && !found.has(repoKey(repo)))
+              found.set(repoKey(repo), {
                 repo,
                 projectId: project.id,
                 hostId: source.hostId,
@@ -1338,9 +1349,9 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {}
     for (const repo of config.extraRepos
       .split(/[\s,]+/)
-      .filter((value) => /^[\w.-]+\/[\w.-]+$/.test(value))) {
-      if (!found.has(repo.toLowerCase()))
-        found.set(repo.toLowerCase(), { repo, projectId: null });
+      .filter((value) => repositorySchema.safeParse(value).success)) {
+      if (!found.has(repoKey(repo)))
+        found.set(repoKey(repo), { repo, projectId: null });
     }
     return [...found.values()];
   }
@@ -1410,13 +1421,11 @@ export default async function plugin(bb: BbPluginApi) {
     );
     const result: ListItem[] = [];
     const errors: Array<{ repo: string; message: string }> = [];
-    const failures: unknown[] = [];
     let truncated = discovered.length > candidates.length;
     for (let index = 0; index < settled.length; index += 1) {
       const outcome = settled[index]!;
       const name = candidates[index]!.repo;
       if (outcome.status === "rejected") {
-        failures.push(outcome.reason);
         errors.push({
           repo: name,
           message:
@@ -1439,12 +1448,19 @@ export default async function plugin(bb: BbPluginApi) {
           ),
       );
     }
+    if (candidates.length > 0 && errors.length === candidates.length) {
+      const failures = settled.flatMap((outcome) =>
+        outcome.status === "rejected" ? [outcome.reason] : [],
+      );
+      throw (
+        failures.find((failure) => failure instanceof GiteaAccessError) ??
+        new Error(errors[0]!.message)
+      );
+    }
     return {
       items: result,
       truncated,
       errors,
-      reachable: candidates.length - errors.length,
-      failures,
     };
   }
   async function listItems(
@@ -1456,22 +1472,6 @@ export default async function plugin(bb: BbPluginApi) {
   ) {
     return pickItems(await fetchItems(kind, repo, state, signal), query);
   }
-  async function readItemPage(
-    kind: "issue" | "pr",
-    repo: string | undefined,
-    state: "open" | "closed" | "all",
-    signal: AbortSignal,
-  ): Promise<ItemPage> {
-    const page = await fetchItems(kind, repo, state, signal);
-    if (page.reachable === 0 && page.errors.length > 0) {
-      const accessError = page.failures.find(
-        (failure): failure is GiteaAccessError =>
-          failure instanceof GiteaAccessError,
-      );
-      throw accessError ?? new Error(page.errors[0]!.message);
-    }
-    return page;
-  }
   async function fetchMyIssues(
     repo: string | undefined,
     state: "open" | "closed" | "all",
@@ -1479,8 +1479,6 @@ export default async function plugin(bb: BbPluginApi) {
   ) {
     const login = await currentLogin(signal);
     const page = await fetchItems("issue", repo, state, signal, undefined, login);
-    if (page.reachable === 0 && page.errors.length > 0)
-      throw new Error(page.errors[0]!.message);
     return {
       login,
       page: {
@@ -1496,8 +1494,6 @@ export default async function plugin(bb: BbPluginApi) {
   ) {
     const login = await currentLogin(signal);
     const page = await fetchItems("pr", repo, state, signal, login);
-    if (page.reachable === 0 && page.errors.length > 0)
-      throw new Error(page.errors[0]!.message);
     return {
       login,
       page: {
@@ -1520,7 +1516,7 @@ export default async function plugin(bb: BbPluginApi) {
     const key = JSON.stringify([
       account,
       scope,
-      repo?.toLowerCase() ?? null,
+      repo ? repoKey(repo) : null,
       state,
     ]);
     const display = await cache.read(key, listTag, load, {
@@ -1538,7 +1534,24 @@ export default async function plugin(bb: BbPluginApi) {
   const autoFixerIntervalMs = 30_000;
   const autoStartIntervalMs = 5 * 60_000;
   const autoFixerKey = (repo: string, number: number) =>
-    `${autoFixerPrefix}${pullKey(repo, number)}`;
+    `${autoFixerPrefix}${itemKey(repo, number)}`;
+  const threadKey = (repo: string, number: number) =>
+    `thread:${itemKey(repo, number)}`;
+  async function readThreadId(repo: string, number: number) {
+    const key = threadKey(repo, number);
+    const threadId = await bb.storage.kv.get<string>(key);
+    if (threadId !== undefined) return threadId;
+    const keys = await bb.storage.kv.list("thread:");
+    const match = keys.find((storedKey) => {
+      if (storedKey === key) return false;
+      const separator = storedKey.lastIndexOf(":");
+      return (
+        storedKey.slice(separator + 1) === String(number) &&
+        repoKey(storedKey.slice("thread:".length, separator)) === repoKey(repo)
+      );
+    });
+    return match ? bb.storage.kv.get<string>(match) : undefined;
+  }
   const autoFixerThreadKey = (threadId: string) =>
     `auto-fixer-thread:${threadId}`;
   const autoFixerRefSchema = z.object({
@@ -1613,23 +1626,21 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
   ): Promise<
     | { state: "deleted" }
-    | {
-        state: "present";
-        archived: boolean;
-        canRestoreEnvironment: boolean;
-        status: string;
-      }
+    | { state: "archived"; canRestoreEnvironment: boolean }
+    | { state: "idle" | "error" | "running"; canRestoreEnvironment: boolean }
   > {
     try {
       const thread = await bb.sdk.threads.get({ threadId });
-      return thread.deletedAt
-        ? { state: "deleted" }
-        : {
-            state: "present",
-            archived: Boolean(thread.archivedAt),
-            canRestoreEnvironment: Boolean(thread.canRestoreEnvironment),
-            status: thread.status,
-          };
+      if (thread.deletedAt) return { state: "deleted" };
+      const canRestoreEnvironment = Boolean(thread.canRestoreEnvironment);
+      if (thread.archivedAt) return { state: "archived", canRestoreEnvironment };
+      return {
+        state:
+          thread.status === "idle" || thread.status === "error"
+            ? thread.status
+            : "running",
+        canRestoreEnvironment,
+      };
     } catch (error) {
       if (
         typeof error === "object" &&
@@ -1690,9 +1701,9 @@ export default async function plugin(bb: BbPluginApi) {
         await api(repoPath(repo, `pulls/${number}`), { signal }),
       );
       return (
-        lifecycle ?? {
-          state: "unknown",
-          error: "Gitea returned an unrecognized pull request state.",
+          lifecycle ?? {
+            state: "unknown",
+            error: unrecognizedPullState,
         }
       );
     } catch (error) {
@@ -1736,7 +1747,7 @@ export default async function plugin(bb: BbPluginApi) {
         return { ...result, outcome: "inactive" as const };
       if (since === null || token !== since)
         return { ...result, outcome: "changed" as const };
-      if (signal.merged || signal.state !== "open")
+      if (signal.lifecycle !== "open")
         return { ...result, outcome: "changed" as const };
       if (Date.now() + pullWatchIntervalMs > deadline)
         return { ...result, outcome: "unchanged" as const };
@@ -1751,7 +1762,7 @@ export default async function plugin(bb: BbPluginApi) {
       tracked.flatMap((entry) =>
         entry.projectId === null
           ? []
-          : [[entry.repo.toLowerCase(), entry.projectId] as const],
+          : [[repoKey(entry.repo), entry.projectId] as const],
       ),
     );
   }
@@ -1759,7 +1770,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function projectFor(repo: string): Promise<Repo | null> {
     return (
       (await repos()).find(
-        (entry) => entry.repo.toLowerCase() === repo.toLowerCase(),
+        (entry) => repoKey(entry.repo) === repoKey(repo),
       ) ?? null
     );
   }
@@ -1819,8 +1830,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function settle(
-    observed: AutoFixerSession,
-    decide: (current: AutoFixerSession) => Promise<AutoFixerSession | null>,
+    observed: WatchingSession,
+    decide: (current: WatchingSession) => Promise<AutoFixerSession>,
     event: "idle" | "failed",
     detail: string | null,
   ) {
@@ -1828,7 +1839,7 @@ export default async function plugin(bb: BbPluginApi) {
       const current = await getSession(observed.repo, observed.number);
       if (!sameSession(observed, current)) return null;
       const next = await decide(current);
-      if (!next || !(await writeIfCurrent(current, next))) return null;
+      if (!(await writeIfCurrent(current, next))) return null;
       const cleanup = await archiveAndStop(next.threadId);
       if (!cleanup.ok)
         await writeIfCurrent(next, onCleanupFailed(next, cleanup.error, now()));
@@ -1875,8 +1886,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function handleArchived(threadId: string) {
     const current = await getSessionByThread(threadId);
-    const next = current && onArchived(current, now());
-    if (current && next) await writeIfCurrent(current, next);
+    if (current?.status !== "watching") return;
+    await writeIfCurrent(current, onArchived(current, now()));
   }
 
   function serialized<T>(
@@ -1884,7 +1895,7 @@ export default async function plugin(bb: BbPluginApi) {
     number: number,
     run: () => Promise<T>,
   ): Promise<T> {
-    const key = pullKey(repo, number);
+    const key = itemKey(repo, number);
     const result = (autoFixerQueues.get(key) ?? Promise.resolve()).then(run);
     const tail = result.then(
       () => undefined,
@@ -1924,9 +1935,7 @@ export default async function plugin(bb: BbPluginApi) {
       api(repoPath(repo, `pulls/${number}`)).then(record),
       projectFor(repo),
     ]);
-    const lifecycle = parseLifecycle(pull);
-    if (!lifecycle)
-      throw new Error("Gitea returned an unrecognized pull request state.");
+    const lifecycle = requireLifecycle(pull);
     const decision =
       replacement !== null &&
       lifecycle.state === "open" &&
@@ -2045,16 +2054,14 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const pull = record(await api(repoPath(repo, `pulls/${number}`)));
-    const lifecycle = parseLifecycle(pull);
-    if (!lifecycle)
-      throw new Error("Gitea returned an unrecognized pull request state.");
+    const lifecycle = requireLifecycle(pull);
     const done = confirmedTerminal(session, lifecycle, now());
     if (done) {
       await writeIfCurrent(session, done);
       return result;
     }
     try {
-      if (presence.archived || cleanupFirst)
+      if (presence.state === "archived" || cleanupFirst)
         await bb.sdk.threads.unarchive({ threadId: session.threadId });
       await withdrawQueued(session.threadId);
       if (!sameSession(session, await getSession(repo, number))) return result;
@@ -2151,19 +2158,28 @@ export default async function plugin(bb: BbPluginApi) {
   function setAutomation(repo: string, number: number, patch: AutomationPatch) {
     return serialized(repo, number, async () => {
       const decision = decideAutomation(await getSession(repo, number), patch);
-      if (decision.kind === "reject")
-        throw new Error(startError(`${repo}#${number}`, decision.reason));
-      if (decision.kind === "stop") await stopAutoFixer(repo, number);
-      if (decision.kind === "start")
-        await spawnAutoFixer(repo, number, decision.policy);
-      if (decision.kind === "update")
-        await updateLiveAutoFixer(decision.session, decision.policy);
-      if (decision.kind === "resume")
-        await resumeAutoFixer(
-          decision.session,
-          decision.policy,
-          decision.cleanupFirst,
-        );
+      switch (decision.kind) {
+        case "unchanged":
+          break;
+        case "reject":
+          throw new Error(startError(`${repo}#${number}`, decision.reason));
+        case "stop":
+          await stopAutoFixer(repo, number);
+          break;
+        case "start":
+          await spawnAutoFixer(repo, number, decision.policy);
+          break;
+        case "update":
+          await updateLiveAutoFixer(decision.session, decision.policy);
+          break;
+        case "resume":
+          await resumeAutoFixer(
+            decision.session,
+            decision.policy,
+            decision.cleanupFirst,
+          );
+          break;
+      }
       return await autoFixerStatus(repo, number);
     });
   }
@@ -2217,7 +2233,7 @@ export default async function plugin(bb: BbPluginApi) {
           item.state === "open"
             ? {
                 lifecycle: { state: "open" as const },
-                projectId: projects.get(item.repo.toLowerCase()) ?? null,
+                projectId: projects.get(repoKey(item.repo)) ?? null,
               }
             : null,
         ),
@@ -2270,7 +2286,7 @@ export default async function plugin(bb: BbPluginApi) {
       projects: trackedProjects(tracked),
       sessions: new Map(
         sessions.map((session) => [
-          pullKey(session.repo, session.number),
+          itemKey(session.repo, session.number),
           session,
         ]),
       ),
@@ -2311,20 +2327,29 @@ export default async function plugin(bb: BbPluginApi) {
               await finishStop(current);
           });
         else if (session.status !== "watching") continue;
-        else if (thread.archived) await handleArchived(session.threadId);
-        else if (thread.status === "idle")
-          await handleIdle(
-            session.threadId,
-            (await bb.sdk.threads.output({ threadId: session.threadId }))
-              .output,
-            session,
-          );
-        else if (thread.status === "error")
-          await handleFailed(
-            session.threadId,
-            "The auto-fixer thread ended in error while the Gitea plugin was not observing it.",
-            session,
-          );
+        else if (session.status === "watching")
+          switch (thread.state) {
+            case "archived":
+              await handleArchived(session.threadId);
+              break;
+            case "idle":
+              await handleIdle(
+                session.threadId,
+                (await bb.sdk.threads.output({ threadId: session.threadId }))
+                  .output,
+                session,
+              );
+              break;
+            case "error":
+              await handleFailed(
+                session.threadId,
+                "The auto-fixer thread ended in error while the Gitea plugin was not observing it.",
+                session,
+              );
+              break;
+            case "running":
+              break;
+          }
       } catch (error) {
         bb.log.warn(
           `Could not reconcile Gitean auto-fixer ${session.threadId}: ${message(error)}`,
@@ -2382,21 +2407,18 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const user = record(await api("user", { signal }));
         return {
-          ready: true,
-          error: null,
+          state: "connected" as const,
           login: text(user.login) || null,
           account: await displayAccount(),
           repos: discovered,
         };
       } catch (error) {
         return {
-          ready: false,
+          state: "unavailable" as const,
           error:
             error instanceof Error
               ? error.message
               : "Could not authenticate to Gitea.",
-          login: null,
-          account: null,
           repos: discovered,
         };
       }
@@ -2411,7 +2433,7 @@ export default async function plugin(bb: BbPluginApi) {
         repo,
         state,
         refresh,
-        (loadSignal) => readItemPage(kind, repo, state, loadSignal),
+        (loadSignal) => fetchItems(kind, repo, state, loadSignal),
         signal,
       );
       const page = pickItems(list.value, query);
@@ -2445,7 +2467,7 @@ export default async function plugin(bb: BbPluginApi) {
               ),
             ])
           : null,
-        bb.storage.kv.get<string>(`thread:${repo}:${number}`),
+        readThreadId(repo, number),
       ]);
       const item = mapItem(repo, issue, kind, base);
       const common = {
@@ -2459,8 +2481,7 @@ export default async function plugin(bb: BbPluginApi) {
           ...common,
           files: [],
           filesTruncated: false,
-          checks: [],
-          checksTruncated: false,
+          checks: { state: "unavailable" },
           reviews: [],
           reviewsTruncated: false,
           reviewComments: [],
@@ -2472,8 +2493,7 @@ export default async function plugin(bb: BbPluginApi) {
         ...common,
         files: bound.value.files,
         filesTruncated: bound.value.filesTruncated,
-        checks: bound.checks.checks,
-        checksTruncated: bound.checks.truncated,
+        checks: bound.checks,
         reviews: reviewPage.reviews,
         reviewsTruncated: reviewPage.truncated,
         reviewComments: reviewPage.reviewComments,
@@ -2485,7 +2505,7 @@ export default async function plugin(bb: BbPluginApi) {
       { repo, number, kind, refresh },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      const tag = displayTag(repo, number);
+      const tag = itemKey(repo, number);
       if (refresh) {
         conversations.invalidate(tag);
         pullFiles.invalidate(tag);
@@ -2498,7 +2518,7 @@ export default async function plugin(bb: BbPluginApi) {
           (loadSignal) => readConversation(repo, number, kind, loadSignal),
           { policy: conversationPolicy, signal },
         ),
-        bb.storage.kv.get<string>(`thread:${repo}:${number}`),
+        readThreadId(repo, number),
       ]);
       return {
         freshness: freshnessView(display.freshness),
@@ -2510,7 +2530,7 @@ export default async function plugin(bb: BbPluginApi) {
       { repo, number, revision, refresh },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      const tag = displayTag(repo, number);
+      const tag = itemKey(repo, number);
       if (refresh) pullFiles.invalidate(tag);
       const key = await displayKey("files", repo, number);
       const display = await pullFiles.read(
@@ -2658,7 +2678,7 @@ export default async function plugin(bb: BbPluginApi) {
       const key = JSON.stringify([
         cleanBaseUrl(config.baseUrl).href,
         config.teaProfile.trim(),
-        repo.toLowerCase(),
+        repoKey(repo),
       ]);
       const cached = repoOptionCache.get(key);
       if (cached && Date.now() - cached.at < repoOptionTtlMs)
@@ -2712,9 +2732,7 @@ export default async function plugin(bb: BbPluginApi) {
       { repo, number, kind },
       { experimental_signal: signal }: RpcContext = {},
     ) => {
-      const known = (await repos()).find(
-        (entry) => entry.repo.toLowerCase() === repo.toLowerCase(),
-      );
+      const known = await projectFor(repo);
       if (!known?.projectId)
         throw new Error(
           `No BB project is associated with ${repo}. Attach a project checkout or use another repository.`,
@@ -2775,7 +2793,7 @@ export default async function plugin(bb: BbPluginApi) {
           },
         }),
       });
-      await bb.storage.kv.set(`thread:${repo}:${number}`, thread.id);
+      await bb.storage.kv.set(threadKey(repo, number), thread.id);
       await bb.storage.kv.set(`thread-link:${thread.id}`, {
         repo,
         number,
@@ -2899,7 +2917,7 @@ export default async function plugin(bb: BbPluginApi) {
       undefined,
       "open",
       false,
-      (signal) => readItemPage(kind, undefined, "open", signal),
+      (signal) => fetchItems(kind, undefined, "open", signal),
       undefined,
     );
     return pickItems(list.value, query).items
@@ -2911,11 +2929,10 @@ export default async function plugin(bb: BbPluginApi) {
       }));
   }
   async function mentionContext(kind: "issue" | "pr", itemId: string) {
-    const match = itemId.match(/^([\w.-]+\/[\w.-]+)#([1-9]\d*)$/);
-    if (!match)
+    const ref = parseItemRef(itemId);
+    if (!ref)
       throw new Error("Expected a Gitea reference in owner/repo#number form.");
-    const repo = repositorySchema.parse(match[1]);
-    const number = Number(match[2]);
+    const { repo, number } = ref;
     const item = mapItem(
       repo,
       await api(repoPath(repo, `issues/${number}`)),
@@ -3180,7 +3197,7 @@ export default async function plugin(bb: BbPluginApi) {
           const value = await handlers.status(null);
           return succeed(
             value,
-            `${value.ready ? `Connected as ${value.login ?? "user"}` : (value.error ?? "Not connected")}\n${value.repos.map((entry) => entry.repo).join("\n")}`,
+            `${value.state === "connected" ? `Connected as ${value.login ?? "user"}` : value.error}\n${value.repos.map((entry) => entry.repo).join("\n")}`,
           );
         }
         if (command === "repos") {

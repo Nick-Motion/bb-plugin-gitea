@@ -38,7 +38,7 @@ const list = {
 it.each([false, true])("shows the My Issues badge and opens assigned issues (truncated: %s)", async (truncated) => {
   renderSlot(app.navPanels[0]!, { subPath: "" }, {
     rpc: {
-      status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({
         autoFix: false,
         autoMerge: false,
@@ -69,7 +69,7 @@ it.each([false, true])("shows the My Issues badge and opens assigned issues (tru
 it("shows Auto-fix and Auto-merge controls for a Pull requests row", async () => {
   renderSlot(app.navPanels[0]!, { subPath: "" }, {
     rpc: {
-      status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({
         autoFix: false,
         autoMerge: false,
@@ -99,7 +99,7 @@ it("disables metadata suggestions while the save is pending", async () => {
   const held = new Promise<void>((resolve) => (release = resolve));
   const slot = renderSlot(app.navPanels[0]!, { subPath: "pulls/acme/widgets/42" }, {
     rpc: {
-      status: () => ({ ready: true, error: null, login: "dev", account, repos: [] }),
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution: { providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default" } }),
       listMyPullRequests: () => ({ ...list, items: [] }),
       listMyIssues: () => ({ ...list, items: [] }),
@@ -108,7 +108,7 @@ it("disables metadata suggestions while the save is pending", async () => {
         conversation: {
           ...item, comments: [], commentsTruncated: false, headRefName: "feature",
           baseRefName: "main", revision: { head: "a".repeat(40), base: "b".repeat(40) },
-          changedFiles: 1, checks: [], checksTruncated: false, reviews: [], reviewsTruncated: false,
+          changedFiles: 1, draft: true, checks: { state: "unavailable" }, reviews: [], reviewsTruncated: false,
           reviewComments: [],
         },
       }),
@@ -116,6 +116,8 @@ it("disables metadata suggestions while the save is pending", async () => {
       updateMetadata: async () => { await held; return { ok: true }; },
     },
   });
+  expect(await screen.findByRole("button", { name: "Mark ready" })).toBeTruthy();
+  expect(await screen.findByText("Checks unavailable.")).toBeTruthy();
   const input = await screen.findByLabelText("Add labels");
   fireEvent.change(input, { target: { value: "bug" } });
   fireEvent.mouseDown(await screen.findByRole("option", { name: "bug" }));
