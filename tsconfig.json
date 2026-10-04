@@ -22,6 +22,10 @@
   },
   "include": [
     "server.ts",
+    "host.ts",
+    "branch-*.ts",
+    "worktree-git.ts",
+    "environment-picker.tsx",
     "auto-fixer.ts",
     "draft-title.ts",
     "pull-diff.ts",

@@ -24,6 +24,9 @@ import {
   type RawPullDiff,
 } from "./pull-diff.js";
 import { draftTitle, isDraftTitle } from "./draft-title.js";
+import { branchRpcMethods } from "./branch-contract.js";
+import { registerBranchProvider } from "./branch-provider.js";
+import type { PullStatus } from "./branch-order.js";
 import {
   archived,
   activePolicy,
@@ -444,6 +447,7 @@ export const giteaRpcContract = defineRpcContract({
     input: autoFixerExecutionSchema,
     output: autoFixerPreferencesSchema,
   },
+  ...branchRpcMethods,
 });
 
 type Repo = { repo: string; projectId: string | null; hostId?: string };
@@ -464,6 +468,7 @@ const pageSize = 50;
 const maxPages = 10;
 const maxReviewCommentReads = 50;
 const maxListRepositories = 50;
+const maxMergedPullPages = 2;
 const conversationPolicy: FreshnessPolicy = {
   freshMs: 15_000,
   retainMs: 10 * 60_000,
@@ -555,6 +560,21 @@ function checkStatus(state: string): Check["status"] {
   if (state === "failure" || state === "error") return "failure";
   if (state === "pending") return "pending";
   return "neutral";
+}
+
+/** Badge state of an open pull request from its head commit's combined status. */
+export function pullCiStatus(combined: Record<string, unknown>): PullStatus {
+  if (Number(combined.total_count) === 0) return "none";
+  switch (checkStatus(text(combined.state))) {
+    case "success":
+      return "passing";
+    case "failure":
+      return "failing";
+    case "pending":
+      return "running";
+    default:
+      return "none";
+  }
 }
 
 class GiteaAccessError extends Error {}
@@ -2420,7 +2440,119 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const branchHandlers = registerBranchProvider(bb, {
+    repoFromRemote(remote) {
+      try {
+        return repositoryFromRemote(remote, cleanBaseUrl(config.baseUrl));
+      } catch {
+        return null;
+      }
+    },
+    async repoFromCheckout(path) {
+      try {
+        const { stdout } = await execFileAsync(
+          "git",
+          ["-C", path, "remote", "get-url", "origin"],
+          { timeout: 5000, maxBuffer: 4096 },
+        );
+        return repositoryFromRemote(stdout.trim(), cleanBaseUrl(config.baseUrl));
+      } catch {
+        return null;
+      }
+    },
+    login: async () => (await teaLogin()).user,
+    async readRemoteBranches(repo, signal) {
+      const base = cleanBaseUrl(config.baseUrl);
+      // Branch and pull request fields can be missing, for example the head
+      // repository of a pull request from a deleted fork.
+      const field = (value: unknown): Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value)
+          ? (value as Record<string, unknown>)
+          : {};
+      const [branchPage, openPage, closedPage] = await Promise.all([
+        paginated(repoPath(repo, "branches"), signal, maxPages, 4),
+        paginated(repoPath(repo, "pulls?state=open"), signal, maxPages, 4),
+        // Merged badges cover the most recently updated closed pull requests only.
+        paginated(
+          repoPath(repo, "pulls?state=closed&sort=recentupdate"),
+          signal,
+          maxMergedPullPages,
+          maxMergedPullPages,
+        ),
+      ]);
+      const branches = branchPage.values.flatMap((entry) => {
+        const branch = field(entry);
+        const commit = field(branch.commit);
+        const name = text(branch.name);
+        if (!name) return [];
+        return [
+          {
+            name,
+            authors: [
+              text(field(commit.author).username),
+              text(field(commit.committer).username),
+            ].filter(Boolean),
+            updatedAt: text(commit.timestamp),
+          },
+        ];
+      });
+      const branchNames = new Set(branches.map((branch) => branch.name));
+      const pulls = [...openPage.values, ...closedPage.values].flatMap((entry) => {
+        const pull = field(entry);
+        const head = field(pull.head);
+        const headBranch = text(head.ref);
+        const merged = pull.merged === true;
+        // Branches from forks live in another repository, so they cannot be checked out from origin.
+        if (
+          repoKey(text(field(head.repo).full_name)) !== repoKey(repo) ||
+          !branchNames.has(headBranch) ||
+          (text(pull.state) !== "open" && !merged)
+        )
+          return [];
+        return [
+          {
+            number: Number(pull.number),
+            title: draftTitle(text(pull.title), false),
+            url: safeLink(base, pull.html_url),
+            author: text(field(pull.user).login),
+            headBranch,
+            updatedAt: text(pull.updated_at),
+            state: merged ? ("merged" as const) : ("open" as const),
+            draft: pull.draft === true || isDraftTitle(text(pull.title)),
+            sha: text(head.sha),
+          },
+        ];
+      });
+      return {
+        truncated: branchPage.truncated || openPage.truncated,
+        branches,
+        pulls: pulls.map(({ draft, ...pull }) => ({
+          ...pull,
+          status:
+            pull.state === "merged"
+              ? ("merged" as const)
+              : draft
+                ? ("draft" as const)
+                : pull.sha
+                  ? ("checking" as const)
+                  : ("none" as const),
+        })),
+      };
+    },
+    async readCiStatus(repo, sha, signal) {
+      const combined = await api(
+        repoPath(repo, `commits/${encodeURIComponent(sha)}/status`),
+        { signal },
+      );
+      return pullCiStatus(
+        typeof combined === "object" && combined !== null && !Array.isArray(combined)
+          ? (combined as Record<string, unknown>)
+          : {},
+      );
+    },
+  });
   const handlers = {
+    ...branchHandlers,
     status: async (
       _input,
       { experimental_signal: signal }: RpcContext = {},

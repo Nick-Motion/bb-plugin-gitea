@@ -17,9 +17,12 @@
     "description": "Gitea issues and pull requests inside BB, backed by the Gitea tea CLI.",
     "branding": {
       "icon": "./icons/teacup.svg",
-      "experimental_icons": { "teacup": "./icons/teacup.svg" }
+      "experimental_icons": {
+        "teacup": "./icons/teacup.svg"
+      }
     },
     "server": "./server.ts",
+    "host": "./host.ts",
     "app": "./app.tsx"
   },
   "scripts": {
@@ -31,6 +34,13 @@
   "files": [
     "dist",
     "server.ts",
+    "host.ts",
+    "branch-contract.ts",
+    "branch-inputs.ts",
+    "branch-order.ts",
+    "branch-provider.ts",
+    "worktree-git.ts",
+    "environment-picker.tsx",
     "pull-diff.ts",
     "display-cache.ts",
     "pull-files-view.ts",
@@ -55,6 +65,7 @@
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.5.29",
     "@pierre/diffs": "^1.2.9",
+    "@radix-ui/react-popover": "^1.1.23",
     "@radix-ui/react-select": "^2.3.3",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^22.0.0",
