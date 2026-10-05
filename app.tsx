@@ -24,6 +24,8 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { PluginRpcClient, PluginRpcResult } from "@get-bb/plugin-sdk/app";
 import type { giteaRpcContract } from "./server.js";
+import { GITEA_BRANCH_ENVIRONMENT_PROVIDER_ID } from "./branch-inputs.js";
+import { GiteaBranchInputsControl } from "./environment-picker.js";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -3313,5 +3315,9 @@ export default definePluginApp((app) => {
   app.slots.experimental_appOverlay({
     id: "display-scope",
     component: DisplayScopeWatch,
+  });
+  app.slots.experimental_environmentProviderInputs({
+    environmentProviderId: GITEA_BRANCH_ENVIRONMENT_PROVIDER_ID,
+    component: GiteaBranchInputsControl,
   });
 });

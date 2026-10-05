@@ -10,7 +10,7 @@ import {
   makeThreadResponse,
   type FakeSdkOverrides,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { giteaRpcContract } from "./server";
+import plugin, { giteaRpcContract, pullCiStatus } from "./server";
 
 type TeaCall = {
   args: string[];
@@ -126,6 +126,7 @@ async function start(
   const calls = await startTea(api, options.profiles ?? defaultProfiles);
   const host = createFakePluginHost({
     pluginId: "gitea",
+    experimental_declaredIconNames: ["teacup"],
     settings: { ...defaultSettings, ...options.settings },
     sdk: {
       projects: { list: async () => options.projects ?? [] },
@@ -562,6 +563,7 @@ it("reuses repository discovery across list requests", async () => {
   await startTea(() => ({ json: [] }), defaultProfiles);
   const host = createFakePluginHost({
     pluginId: "gitea",
+    experimental_declaredIconNames: ["teacup"],
     settings: defaultSettings,
     sdk: {
       projects: {
@@ -852,6 +854,7 @@ it("reports a missing tea executable as a readiness problem", async () => {
   isolateTeaEnvironment(emptyDir);
   const host = createFakePluginHost({
     pluginId: "gitea",
+    experimental_declaredIconNames: ["teacup"],
     settings: defaultSettings,
     sdk: { projects: { list: async () => [] } },
   });
@@ -3127,3 +3130,126 @@ it("reports a stopped auto-fixer as inactive even when the pull request changed"
     expect(state.threads.get("auto-fixer-1")?.archivedAt).toBe(1);
   } finally { retry.controller.abort(); await retry.done; }
  });
+
+it("lists a project's Gitea branches with pull request badges and skips fork pull requests", async () => {
+  const path = gitSource("https://gitea.example/prefix/acme/widgets.git");
+  cleanups.push(() => rmSync(path, { recursive: true, force: true }));
+  const branch = (name: string, timestamp: string, username: string) => ({
+    name,
+    commit: { timestamp, author: { username } },
+  });
+  const pull = (
+    number: number,
+    ref: string,
+    extra: Record<string, unknown> = {},
+    repo = "acme/widgets",
+  ) => ({
+    number,
+    title: `PR ${number}`,
+    state: "open",
+    html_url: `https://gitea.example/prefix/acme/widgets/pulls/${number}`,
+    user: { login: "dev" },
+    updated_at: "2026-09-02T00:00:00Z",
+    head: { ref, sha: `sha-${ref}`, repo: { full_name: repo } },
+    ...extra,
+  });
+  const { host, calls } = await start(
+    ({ endpoint }) => {
+      if (endpoint.includes("/branches?"))
+        return {
+          json: [
+            branch("main", "2026-09-10T00:00:00Z", "ops"),
+            branch("mine", "2026-09-05T00:00:00Z", "dev"),
+            branch("review", "2026-09-01T00:00:00Z", "dev"),
+            branch("wip", "2026-09-03T00:00:00Z", "ops"),
+            branch("shipped", "2026-08-01T00:00:00Z", "ops"),
+            branch("from-fork", "2026-09-20T00:00:00Z", "ops"),
+          ],
+        };
+      if (endpoint.includes("/pulls?state=open"))
+        return {
+          json: [
+            pull(7, "review"),
+            pull(9, "wip", { title: "WIP: not ready", user: { login: "ops" } }),
+            pull(8, "from-fork", {}, "dev/widgets"),
+          ],
+        };
+      if (endpoint.includes("/pulls?state=closed"))
+        return {
+          json: [
+            pull(3, "shipped", { state: "closed", merged: true }),
+            pull(2, "main", { state: "closed", merged: false }),
+          ],
+        };
+      if (endpoint.includes("/commits/sha-review/status"))
+        return { json: { state: "pending", total_count: 2 } };
+      return { json: [] };
+    },
+    { projects: [{ id: "project-1", sources: [{ type: "local_path", path }] }] },
+  );
+  const result = giteaRpcContract.remoteBranches.output.parse(
+    await host.harness.behavior.callRpc("remoteBranches", { projectId: "project-1" }),
+  );
+  const url = (number: number) => `https://gitea.example/prefix/acme/widgets/pulls/${number}`;
+  expect(result).toEqual({
+    repo: "acme/widgets",
+    truncated: false,
+    error: null,
+    branches: [
+      {
+        name: "review",
+        group: "pull",
+        pull: { number: 7, title: "PR 7", url: url(7), status: "checking" },
+        updatedAt: "2026-09-02T00:00:00Z",
+      },
+      { name: "mine", group: "mine", pull: null, updatedAt: "2026-09-05T00:00:00Z" },
+      { name: "from-fork", group: "other", pull: null, updatedAt: "2026-09-20T00:00:00Z" },
+      { name: "main", group: "other", pull: null, updatedAt: "2026-09-10T00:00:00Z" },
+      {
+        name: "wip",
+        group: "other",
+        pull: { number: 9, title: "not ready", url: url(9), status: "draft" },
+        updatedAt: "2026-09-03T00:00:00Z",
+      },
+      {
+        name: "shipped",
+        group: "other",
+        pull: { number: 3, title: "PR 3", url: url(3), status: "merged" },
+        updatedAt: "2026-08-01T00:00:00Z",
+      },
+    ],
+  });
+  const endpoints = calls.map((call) => call.endpoint);
+  expect(endpoints).toEqual(
+    expect.arrayContaining([
+      "/api/v1/repos/acme/widgets/branches?limit=50&page=1",
+      "/api/v1/repos/acme/widgets/pulls?state=open&limit=50&page=1",
+      "/api/v1/repos/acme/widgets/pulls?state=closed&sort=recentupdate&limit=50&page=1",
+    ]),
+  );
+  const statusCalls = () => calls.filter((call) => call.endpoint.endsWith("/status"));
+  expect(statusCalls()).toHaveLength(0);
+
+  const statuses = () =>
+    host.harness.behavior
+      .callRpc("remotePullStatuses", { projectId: "project-1" })
+      .then((output) => giteaRpcContract.remotePullStatuses.output.parse(output));
+  await expect(statuses()).resolves.toEqual({ statuses: [{ number: 7, status: "running" }] });
+  expect(statusCalls().map((call) => call.endpoint)).toEqual([
+    "/api/v1/repos/acme/widgets/commits/sha-review/status",
+  ]);
+  await statuses();
+  expect(statusCalls()).toHaveLength(1);
+});
+
+it.each([
+  [{ state: "success", total_count: 3 }, "passing"],
+  [{ state: "failure", total_count: 3 }, "failing"],
+  [{ state: "error", total_count: 1 }, "failing"],
+  [{ state: "pending", total_count: 1 }, "running"],
+  [{ state: "pending", total_count: 0 }, "none"],
+  [{ state: "", total_count: 0 }, "none"],
+  [{}, "none"],
+])("maps the combined commit status %j to the %s badge", (combined, status) => {
+  expect(pullCiStatus(combined)).toBe(status);
+});
