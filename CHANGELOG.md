@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.2 - 2026-10-08
+
+### Fixed
+
+- Replace separate request and cancellation buttons with one accessible Auto-merge on/off toggle.
+- Remember successful native merge requests per account, repository, and PR across reloads and restarts; clear the selection only after confirmed closure or merger. Failed cancellation or PR reads preserve the selection.
+- Opening or reloading pages never schedules merges. The selection records BB requests; outside-BB queue changes cannot be reflected because the deployed Gitea API does not expose queue state.
+
 ## 1.1.1 - 2026-10-08
 
 ### Changed
