@@ -38,6 +38,18 @@ it("parses only positive owner/repository item references", () => {
   }
 });
 
+it("drops saved bulk merge without losing auto-fix or execution preferences", () => {
+  const preferences = {
+    autoFix: true,
+    execution: {
+      providerId: "codex", model: "gpt-6.1-sol",
+      reasoningLevel: "medium", serviceTier: "default",
+    },
+  };
+  expect(parseStoredPreferences({ ...preferences, autoMerge: true }))
+    .toEqual(preferences);
+});
+
 const now = "2026-09-28T00:00:00Z";
 const watching: AutoFixerSession = {
   repo: "acme/widgets",
@@ -384,17 +396,15 @@ describe("views and automation", () => {
     expect(prompt).toContain(
       "tea pulls --login work --repo acme/widgets --comments 42",
     );
-    expect(prompt).toContain(
-      "tea pulls merge --login work --repo acme/widgets --style <style> 42",
-    );
-    expect(prompt).toContain("no auto-merge setting");
+    expect(prompt).not.toContain("tea pulls merge");
+    expect(prompt).toContain("Never merge this pull request");
     expect(prompt).toContain(
       "tea pulls edit --login work --repo acme/widgets --ready 42",
     );
     expect(prompt).not.toMatch(/\bgh\s+pr\b/);
   });
 
-  it("grants code changes only with Auto-fix and merging only with Auto-merge", () => {
+  it("never grants merge authority, including with legacy merge policies", () => {
     const prompt = (policy: AutoFixerPolicy) =>
       buildAutoFixerPrompt({
         repo: "acme/widgets",
@@ -410,15 +420,15 @@ describe("views and automation", () => {
     expect(fixOnly).toContain(pushGrant);
     expect(fixOnly).not.toContain(mergeCommand);
     expect(fixOnly).toContain(
-      "Auto-merge is off. Never merge this pull request",
+      "Never merge this pull request",
     );
     const mergeOnly = prompt({ fix: false, merge: true });
     expect(mergeOnly).not.toContain(pushGrant);
     expect(mergeOnly).toContain("Auto-fix is off. Do not change code");
-    expect(mergeOnly).toContain(mergeCommand);
+    expect(mergeOnly).not.toContain(mergeCommand);
     const both = prompt({ fix: true, merge: true });
     expect(both).toContain(pushGrant);
-    expect(both).toContain(mergeCommand);
+    expect(both).not.toContain(mergeCommand);
     for (const text of [fixOnly, mergeOnly, both])
       expect(text).toContain("replace any earlier instructions in this thread");
   });

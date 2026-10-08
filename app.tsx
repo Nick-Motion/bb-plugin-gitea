@@ -1461,21 +1461,6 @@ const autoFixerLabels = {
   stopped: "stopped",
 } as const;
 
-const automationToggles = [
-  {
-    option: "fix",
-    label: "Auto-fix",
-    description:
-      "Fix CI failures and address review feedback. Auto-fix never merges.",
-  },
-  {
-    option: "merge",
-    label: "Auto-merge",
-    description:
-      "Merge with your tea login once checks, approvals and branch rules allow it. Auto-merge never changes code.",
-  },
-] as const;
-
 function autoFixerDetail(view: AutoFixerView) {
   if (view.status === "archived") return `PR ${view.outcome}. Auto-fixer archived.`;
   if (view.status === "merged" || view.status === "closed") return `PR ${view.status}. BB cleanup pending; retrying automatically.`;
@@ -1487,6 +1472,7 @@ function autoFixerDetail(view: AutoFixerView) {
 }
 
 function AutoFixerControls({
+  open,
   repo,
   number,
   view,
@@ -1494,6 +1480,7 @@ function AutoFixerControls({
 }: {
   repo: string;
   number: number;
+  open: boolean;
   view: AutoFixerView;
   onChanged: () => void;
 }) {
@@ -1539,28 +1526,43 @@ function AutoFixerControls({
           Thread
         </Button>
       )}
-      {automationToggles.map(({ option, label }) => {
-        const on = view.automation[option];
-        return (
-          <Button
-            key={option}
-            size="sm"
-            variant={on ? "default" : "outline"}
-            className="h-7"
-            aria-pressed={on}
-            disabled={busy || !changeable}
-            onClick={() =>
-              void run(
-                () =>
-                  rpc.call("setAutomation", { repo, number, [option]: !on }),
-                `${label} ${on ? "off" : "on"}`,
-              )
-            }
-          >
-            {label}
-          </Button>
-        );
-      })}
+      <Button
+        size="sm"
+        variant={view.automation.fix ? "default" : "outline"}
+        className="h-7"
+        aria-pressed={view.automation.fix}
+        disabled={busy || !changeable}
+        onClick={() => void run(
+          () => rpc.call("setAutomation", { repo, number, fix: !view.automation.fix }),
+          `Auto-fix ${view.automation.fix ? "off" : "on"}`,
+        )}
+      >
+        Auto-fix
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-7"
+        disabled={busy || !open}
+        onClick={() => void run(
+          () => rpc.call("setAutoMerge", { repo, number, enabled: true }),
+          "Auto-merge requested in Gitea",
+        )}
+      >
+        Auto-merge
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-7"
+        disabled={busy}
+        onClick={() => void run(
+          () => rpc.call("setAutoMerge", { repo, number, enabled: false }),
+          "Auto-merge cancellation confirmed by Gitea",
+        )}
+      >
+        Cancel auto-merge
+      </Button>
       {view.actions.includes("retry") && (
         <Button
           size="sm"
@@ -1737,33 +1739,26 @@ function AutoFixerPreferencesControl() {
     }
   };
   const execution: ExperimentalProviderModelPickerValue = preferences.execution;
-  const fields = { fix: "autoFix", merge: "autoMerge" } as const;
   return (
     <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-      {automationToggles.map(({ option, label, description }) => {
-        const field = fields[option];
-        return (
-          <label
-            key={option}
-            title={description}
-            className="flex items-center gap-2"
-          >
-            <input
-              type="checkbox"
-              checked={preferences[field]}
-              disabled={saving}
-              onChange={(event) => {
-                const enabled = event.target.checked;
-                void save(
-                  () => rpc.call("setAutoAutomation", { [option]: enabled }),
-                  { ...preferences, [field]: enabled },
-                );
-              }}
-            />
-            {label} all
-          </label>
-        );
-      })}
+      <label
+        title="Fix CI failures and review feedback for your open pull requests."
+        className="flex items-center gap-2"
+      >
+        <input
+          type="checkbox"
+          checked={preferences.autoFix}
+          disabled={saving}
+          onChange={(event) => {
+            const fix = event.target.checked;
+            void save(
+              () => rpc.call("setAutoAutomation", { fix }),
+              { ...preferences, autoFix: fix },
+            );
+          }}
+        />
+        Auto-fix all
+      </label>
       <ProviderModelPicker
         value={execution}
         disabled={saving}
@@ -1855,6 +1850,7 @@ function AutoFixerList() {
             repo={session.repo}
             number={session.number}
             view={session}
+            open={!["archived", "merged", "closed"].includes(session.status)}
             onChanged={load}
           />
         </div>
@@ -2713,6 +2709,7 @@ function GiteaPanel({ subPath }: PluginNavPanelProps) {
                               repo={item.repo}
                               number={item.number}
                               view={item.autoFixer}
+                              open={item.state === "open"}
                               onChanged={reloadAutoFixers}
                             />
                           </span>

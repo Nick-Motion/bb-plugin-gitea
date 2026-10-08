@@ -35,13 +35,38 @@ const list = {
   freshness,
 };
 
+it("opens My PRs without changing automation and offers only bulk auto-fix", async () => {
+  const preferences = {
+    autoFix: false,
+    execution: {
+      providerId: "codex", model: "gpt-5.6-luna",
+      reasoningLevel: "medium", serviceTier: "default",
+    },
+  };
+  const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+    rpc: {
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
+      getAutoFixerPreferences: () => preferences,
+      listMyPullRequests: () => ({ ...list, login: "dev", preferences }),
+      listMyIssues: () => ({ ...list, items: [], login: "dev" }),
+      setAutoAutomation: ({ fix }: { fix: boolean }) => ({ ...preferences, autoFix: fix }),
+    },
+  });
+  const autoFix = await screen.findByRole("checkbox", { name: "Auto-fix all" });
+  expect((autoFix as HTMLInputElement).checked).toBe(false);
+  expect(screen.queryByRole("checkbox", { name: "Auto-merge all" })).toBeNull();
+  expect(slot.rpcCalls.filter(call => ["setAutoAutomation", "setAutomation", "setAutoMerge"].includes(call.method))).toEqual([]);
+  await act(async () => fireEvent.click(autoFix));
+  expect(slot.rpcCalls.filter(call => call.method === "setAutoAutomation"))
+    .toMatchObject([{ input: { fix: true } }]);
+});
+
 it.each([false, true])("shows the My Issues badge and opens assigned issues (truncated: %s)", async (truncated) => {
   renderSlot(app.navPanels[0]!, { subPath: "" }, {
     rpc: {
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({
         autoFix: false,
-        autoMerge: false,
         execution: {
           providerId: "codex",
           model: "gpt-5.6-luna",
@@ -72,7 +97,6 @@ it("shows Auto-fix and Auto-merge controls for a Pull requests row", async () =>
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({
         autoFix: false,
-        autoMerge: false,
         execution: {
           providerId: "codex",
           model: "gpt-5.6-luna",
@@ -89,9 +113,31 @@ it("shows Auto-fix and Auto-merge controls for a Pull requests row", async () =>
   });
   expect(await screen.findByText(item.title)).toBeTruthy();
   const controls = screen.getByTestId("auto-fixer-controls");
-  expect(controls.querySelectorAll("button")).toHaveLength(2);
+  expect(controls.querySelectorAll("button")).toHaveLength(3);
   expect(controls.textContent).toContain("Auto-fix");
   expect(controls.textContent).toContain("Auto-merge");
+});
+
+it("schedules and cancels a PR merge without calling agent automation", async () => {
+  const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+    rpc: {
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
+      getAutoFixerPreferences: () => ({ autoFix: false, execution: {
+        providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default",
+      } }),
+      listMyPullRequests: () => ({ ...list, login: "dev" }),
+      listMyIssues: () => ({ ...list, items: [], login: "dev" }),
+      listItems: () => list,
+      setAutoMerge: () => ({ ok: true }),
+    },
+  });
+  await act(async () => fireEvent.click(await screen.findByRole("button", { name: "Auto-merge" })));
+  await act(async () => fireEvent.click(await screen.findByRole("button", { name: "Cancel auto-merge" })));
+  expect(slot.rpcCalls.filter(call => call.method === "setAutoMerge")).toMatchObject([
+    { input: { repo: "acme/widgets", number: 42, enabled: true } },
+    { input: { repo: "acme/widgets", number: 42, enabled: false } },
+  ]);
+  expect(slot.rpcCalls.filter(call => call.method === "setAutomation")).toEqual([]);
 });
 
 it("disables metadata suggestions while the save is pending", async () => {
@@ -100,7 +146,7 @@ it("disables metadata suggestions while the save is pending", async () => {
   const slot = renderSlot(app.navPanels[0]!, { subPath: "pulls/acme/widgets/42" }, {
     rpc: {
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
-      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution: { providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default" } }),
+      getAutoFixerPreferences: () => ({ autoFix: false, execution: { providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default" } }),
       listMyPullRequests: () => ({ ...list, items: [] }),
       listMyIssues: () => ({ ...list, items: [] }),
       conversation: () => ({
@@ -130,7 +176,7 @@ it("hides archived auto-fixers until history is requested", async () => {
   renderSlot(app.navPanels[0]!, { subPath: "" }, {
     rpc: {
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
-      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution: { providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default" } }),
+      getAutoFixerPreferences: () => ({ autoFix: false, execution: { providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default" } }),
       listMyPullRequests: () => ({ ...list, items: [], login: "dev" }),
       listAutoFixerSessions: () => ({ sessions: [{ ...item.autoFixer, ...item, status: "archived", outcome: "merged", threadId: "archived-thread", archivedAt: item.updatedAt, policy: { fix: true, merge: false }, actions: [], automation: { fix: false, merge: false } }] }),
     },

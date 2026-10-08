@@ -61,14 +61,12 @@ export function applyAutomationPatch(
 export const autoFixerPreferencesSchema = z
   .object({
     autoFix: z.boolean(),
-    autoMerge: z.boolean(),
     execution: autoFixerExecutionSchema,
   })
   .strict();
 export type AutoFixerPreferences = z.infer<typeof autoFixerPreferencesSchema>;
 export const defaultAutoFixerPreferences: AutoFixerPreferences = {
   autoFix: false,
-  autoMerge: false,
   execution: {
     providerId: "codex",
     model: "gpt-5.6-luna",
@@ -118,7 +116,7 @@ export function parseStoredSession(raw: unknown): AutoFixerSession | null {
 }
 
 export function parseStoredPreferences(raw: unknown): AutoFixerPreferences {
-  const parsed = autoFixerPreferencesSchema.safeParse(raw);
+  const parsed = autoFixerPreferencesSchema.strip().safeParse(raw);
   return parsed.success ? parsed.data : defaultAutoFixerPreferences;
 }
 
@@ -576,7 +574,6 @@ export function autoStartTargets<
 function policyInstructions(
   policy: AutoFixerPolicy,
   flags: string,
-  api: string,
   number: number,
 ): string[] {
   const fix = policy.fix
@@ -589,16 +586,10 @@ function policyInstructions(
         "Auto-fix is off. Do not change code, commit, push, rebase, reply to or resolve review comments, or edit the pull request.",
         "If a required check fails, changes are requested, or the branch conflicts with its base, finish with NEEDS_YOU and say what blocks the merge.",
       ];
-  const merge = policy.merge
-    ? [
-        "Auto-merge is on. Gitea has no auto-merge setting that you may enable; do not try to schedule one.",
-        `Merge only with \`tea pulls merge ${flags} --style <style> ${number}\`, and only when your Gitea permissions allow it, branch protection is satisfied, every required status check passes, and required approvals are present.`,
-        `Use the repository's default merge style (\`default_merge_style\` from \`${api}\`). Use squash only if the repository or a human requires it.`,
-      ]
-    : [
-        "Auto-merge is off. Never merge this pull request, and do not enable or schedule a merge. A human merges it; keep watching until Gitea reports it merged or closed.",
-      ];
-  return [...fix, ...merge];
+  return [
+    ...fix,
+    "Never merge this pull request or enable, cancel, or schedule a merge. Auto-merge is managed by Gitea through the plugin, never by this agent. Keep watching until Gitea reports the PR merged or closed.",
+  ];
 }
 
 export function buildAutoFixerPrompt(input: {
@@ -633,7 +624,7 @@ export function buildAutoFixerPrompt(input: {
     "Do not use `sleep` to wait for Gitea.",
     "",
     "These Auto-fix and Auto-merge settings replace any earlier instructions in this thread:",
-    ...policyInstructions(input.policy, flags, api, input.number),
+    ...policyInstructions(input.policy, flags, input.number),
     "Only missing credentials, missing permissions, destructive choices, and product or scope decisions require a human.",
     "Stay in this turn until the PR is merged, closed, manually stopped, or requires a human.",
     "",

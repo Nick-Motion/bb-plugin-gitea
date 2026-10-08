@@ -1730,6 +1730,8 @@ async function startAutoFixers() {
   const pulls = new Map<string, Record<string, unknown>>();
   const gitea = {
     pullFailure: null as number | null,
+    mergeFailure: null as number | null,
+    mergeStyle: "rebase",
     listGate: null as Promise<void> | null,
     listRequests: 0,
     pulls,
@@ -1849,8 +1851,12 @@ async function startAutoFixers() {
     },
   };
   const { host, calls } = await start(
-    ({ endpoint }) => {
+    ({ endpoint, method }) => {
       const path = endpoint.split("?")[0]!;
+      if (/\/repos\/[^/]+\/[^/]+\/$/.test(path)) return { json: { default_merge_style: gitea.mergeStyle } };
+      if (path.endsWith("/merge") && (method === "POST" || method === "DELETE"))
+        return { status: gitea.mergeFailure ?? (method === "POST" ? 201 : 204), raw: "" };
+
       if (path === "/api/v1/user") return { json: { login: "dev" } };
       const list = path.match(/^\/api\/v1\/repos\/([^/]+\/[^/]+)\/issues$/);
       if (list) {
@@ -1936,11 +1942,11 @@ async function setAutomation(
 }
 
 function enable(host: Host, ref: { repo: string; number: number }) {
-  return setAutomation(host, ref, { fix: true, merge: true });
+  return setAutomation(host, ref, { fix: true });
 }
 
 function disable(host: Host, ref: { repo: string; number: number }) {
-  return setAutomation(host, ref, off);
+  return setAutomation(host, ref, { fix: false });
 }
 
 async function autoFixerStatus(host: Host, ref = pr42) {
@@ -1971,7 +1977,7 @@ it("lists authored pull requests and starts one hidden pinned auto-fixer for con
       .filter(({ endpoint }) => /\/issues\?/.test(endpoint))
       .every(({ endpoint }) => endpoint.includes("created_by=dev")),
   ).toBe(true);
-  expect(mine.preferences).toMatchObject({ autoFix: false, autoMerge: false });
+  expect(mine.preferences).toMatchObject({ autoFix: false });
   const allPulls = giteaRpcContract.listItems.output.parse(
     await rpc(host, "listItems", { kind: "pr", state: "open", query: "" }),
   );
@@ -2003,7 +2009,7 @@ it("lists authored pull requests and starts one hidden pinned auto-fixer for con
     updatedAllPulls.items.find((item) => item.number === 42)?.autoFixer,
   ).toMatchObject({
     status: "watching",
-    automation: { fix: true, merge: true },
+    automation: { fix: true, merge: false },
   });
   expect(starts.map((view) => "threadId" in view && view.threadId)).toEqual([
     "auto-fixer-1",
@@ -2011,7 +2017,7 @@ it("lists authored pull requests and starts one hidden pinned auto-fixer for con
   ]);
   await expect(enable(host, pr42)).resolves.toMatchObject({
     threadId: "auto-fixer-1",
-    automation: { fix: true, merge: true },
+    automation: { fix: true, merge: false },
   });
   const spawns = host.harness.sdk.callsTo("threads.spawn");
   expect(spawns).toHaveLength(1);
@@ -2071,10 +2077,9 @@ it("keeps automatic auto-fixing off by default and starts only eligible authored
     rpc(host, "setAutoFixerExecution", sol),
     rpc(host, "setAutoAutomation", { fix: true }),
   ]);
-  expect(enabled).toEqual({ autoFix: true, autoMerge: false, execution: sol });
+  expect(enabled).toEqual({ autoFix: true, execution: sol });
   await expect(rpc(host, "getAutoFixerPreferences")).resolves.toEqual({
     autoFix: true,
-    autoMerge: false,
     execution: sol,
   });
   const spawned = host.harness.sdk
@@ -2090,7 +2095,7 @@ it("keeps automatic auto-fixing off by default and starts only eligible authored
     automation: { fix: true, merge: false },
   });
   await rpc(host, "setAutoAutomation", { fix: false });
-  await rpc(host, "setAutoAutomation", { fix: true, merge: true });
+  await rpc(host, "setAutoAutomation", { fix: true });
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
   expect(calls.every((call) => call.method === "GET")).toBe(true);
 });
@@ -2290,9 +2295,9 @@ it("reports cleanup failures and cleans up before resuming or stopping", async (
 
 it("never lets Retry restore authority that was turned off", async () => {
   const { host } = await startAutoFixers();
-  await setAutomation(host, pr42, { merge: true });
+  await setAutomation(host, pr42, { fix: true });
   await expect(
-    setAutomation(host, pr42, { merge: false }),
+    setAutomation(host, pr42, { fix: false }),
   ).resolves.toMatchObject({
     status: "stopped",
     automation: off,
@@ -2388,230 +2393,106 @@ it("reports Gitea API failures without spawning or guessing a terminal state", a
   });
 });
 
-it("exposes Auto-fix and Auto-merge through bb gitea commands", async () => {
-  const { host } = await startAutoFixers();
+it("exposes Auto-fix and native Auto-merge through bb gitea commands", async () => {
+  const { host, calls } = await startAutoFixers();
   const cli = (argv: string[]) => host.harness.behavior.runCli(argv);
   await expect(cli(["automation-defaults"])).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining(
-      "Turn on Auto-fix for my PRs: off\nTurn on Auto-merge for my PRs: off",
-    ),
+    exitCode: 0, stdout: expect.stringContaining("Turn on Auto-fix for my PRs: off"),
   });
-  await expect(cli(["my-prs"])).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining(
-      "acme/widgets#42 open fix:off merge:off auto-fixer:idle",
-    ),
+  await expect(cli(["auto-merge", "acme/widgets", "42", "on"])).resolves.toMatchObject({
+    exitCode: 0, stdout: "acme/widgets#42: Auto-merge requested in Gitea",
   });
-  await expect(
-    cli(["auto-merge", "acme/widgets", "42", "on"]),
-  ).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining(
-      "acme/widgets#42 watching · Auto-fix off · Auto-merge on thread auto-fixer-1",
-    ),
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+  await expect(cli(["auto-merge", "acme/widgets", "42", "off"])).resolves.toMatchObject({
+    exitCode: 0, stdout: "acme/widgets#42: Auto-merge cancellation confirmed by Gitea",
   });
-  await expect(
-    cli(["auto-fix", "acme/widgets", "42", "on", "--json"]),
-  ).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining('"automation":{"fix":true,"merge":true}'),
+  expect(calls.filter(call => call.method === "DELETE")).toHaveLength(1);
+  await expect(cli(["auto-fix", "acme/widgets", "42", "on", "--json"])).resolves.toMatchObject({
+    exitCode: 0, stdout: expect.stringContaining('"automation":{"fix":true,"merge":false}'),
   });
-  await expect(
-    cli(["auto-fixer-thread", "auto-fixer-1"]),
-  ).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining(
-      "acme/widgets#42 watching · Auto-fix on · Auto-merge on",
-    ),
+  await expect(cli(["auto-fix", "acme/widgets", "42", "off"])).resolves.toMatchObject({
+    exitCode: 0, stdout: expect.stringContaining("stopped · Auto-fix off"),
   });
-  await expect(
-    cli(["auto-fix", "acme/widgets", "42", "maybe"]),
-  ).resolves.toMatchObject({ exitCode: 1 });
-  await cli(["auto-fix", "acme/widgets", "42", "off"]);
-  await expect(
-    cli(["auto-merge", "acme/widgets", "42", "off"]),
-  ).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining(
-      "acme/widgets#42 stopped · Auto-fix off · Auto-merge off",
-    ),
-  });
-  await expect(cli(["auto-fixers"])).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining("acme/widgets#42 stopped"),
-  });
-  await expect(
-    cli(["automation-defaults", "merge", "off"]),
-  ).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining("Turn on Auto-merge for my PRs: off"),
-  });
-  await expect(
-    cli(["automation-defaults", "land", "on"]),
-  ).resolves.toMatchObject({ exitCode: 1 });
-  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
-  await expect(
-    cli(["auto-fixer-execution", "codex", "gpt-5.6-sol", "medium", "fast"]),
-  ).resolves.toMatchObject({
-    exitCode: 0,
-    stdout: expect.stringContaining("Execution: codex gpt-5.6-sol medium fast"),
-  });
-  await expect(
-    cli(["auto-fixer-execution", "codex", "gpt-5.6-sol", "extreme"]),
-  ).resolves.toMatchObject({ exitCode: 1 });
-  await expect(cli(["auto-fixer-execution", "codex"])).resolves.toMatchObject({
-    exitCode: 1,
-    stderr:
-      "auto-fixer-execution requires: provider model reasoning [fast|default]",
+  await expect(cli(["auto-fix", "acme/widgets", "42", "maybe"])).resolves.toMatchObject({ exitCode: 1 });
+  await expect(cli(["automation-defaults", "merge", "off"])).resolves.toMatchObject({ exitCode: 1 });
+  await expect(cli(["auto-fixer-execution", "codex", "gpt-5.6-sol", "medium", "fast"])).resolves.toMatchObject({
+    exitCode: 0, stdout: expect.stringContaining("Execution: codex gpt-5.6-sol medium fast"),
   });
 });
 
-it("grants each auto-fixer only the authority its Auto-fix and Auto-merge options give", async () => {
-  const { host } = await startAutoFixers();
-  const pr44 = { repo: "acme/widgets", number: 44 };
-  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
-    { status: "watching", automation: { fix: true, merge: false } },
-  );
-  await expect(
-    setAutomation(host, pr44, { merge: true }),
-  ).resolves.toMatchObject({
-    status: "watching",
-    automation: { fix: false, merge: true },
-  });
-  const prompts = host.harness.sdk
-    .callsTo("threads.spawn")
-    .map((call) => (call[0] as { prompt: string }).prompt);
-  expect(prompts[0]).toContain("You can fix, commit, push");
-  expect(prompts[0]).not.toContain("tea pulls merge");
-  expect(prompts[1]).toContain("tea pulls merge");
-  expect(prompts[1]).toContain("Auto-fix is off. Do not change code");
-
-  await expect(rpc(host, "setAutomation", { ...pr42 })).rejects.toThrow();
-  await expect(
-    rpc(host, "setAutomation", { ...pr42, fix: true, land: true }),
-  ).rejects.toThrow();
-  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
-});
-
-it("updates a running auto-fixer's authority in place and stops it when both options are off", async () => {
-  const { host } = await startAutoFixers();
-  await enable(host, pr42);
-  await expect(
-    setAutomation(host, pr42, { merge: false }),
-  ).resolves.toMatchObject({
-    status: "watching",
-    threadId: "auto-fixer-1",
-    policy: { fix: true, merge: false },
-  });
-  const sends = host.harness.sdk.callsTo("threads.send");
-  expect(sends).toHaveLength(1);
-  expect(sends[0]?.[0]).toMatchObject({
-    threadId: "auto-fixer-1",
-    mode: "steer",
-    input: [
-      {
-        type: "text",
-        text: expect.stringContaining(
-          "Auto-merge is off. Never merge this pull request",
-        ),
-      },
-    ],
-  });
-  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
-    { status: "watching" },
-  );
-  expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1);
-  await expect(
-    setAutomation(host, pr42, { fix: false }),
-  ).resolves.toMatchObject({ status: "stopped", automation: off });
-  expect(host.harness.sdk.callsTo("threads.archive")).toHaveLength(1);
-  await expect(
-    setAutomation(host, pr42, { merge: true }),
-  ).resolves.toMatchObject({
-    status: "watching",
-    threadId: "auto-fixer-1",
-    policy: { fix: false, merge: true },
-  });
-  expect(host.harness.sdk.callsTo("threads.send")[1]?.[0]).toMatchObject({
-    mode: "start",
-    input: [
-      { text: expect.stringContaining("Auto-fix is off. Do not change code") },
-    ],
-  });
-  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
-});
-
-it("stops a running auto-fixer whose authority change cannot be delivered", async () => {
-  const { host, state } = await startAutoFixers();
-  await enable(host, pr42);
-  state.sendGate = Promise.reject(new Error("host offline"));
-  state.sendGate.catch(() => undefined);
-  await expect(setAutomation(host, pr42, { merge: false })).rejects.toThrow(
-    "Could not deliver the automation change, so the auto-fixer was stopped: host offline",
-  );
-  await expect(autoFixerStatus(host)).resolves.toMatchObject({
-    status: "stopped",
-    automation: off,
-  });
-});
-
-it("withdraws a queued authority change and stops the auto-fixer", async () => {
-  const { host, state } = await startAutoFixers();
-  await enable(host, pr42);
-  state.queueSends = true;
-  await expect(setAutomation(host, pr42, { merge: false })).rejects.toThrow(
-    "could not take the automation change immediately, so it was stopped",
-  );
-  expect(host.harness.sdk.callsTo("threads.queuedMessages.delete")).toEqual([
-    [{ threadId: "auto-fixer-1", queuedMessageId: "queued-auto-fixer-1-1" }],
-  ]);
-  expect(state.queued.get("auto-fixer-1")).toEqual([]);
-  await expect(autoFixerStatus(host)).resolves.toMatchObject({
-    status: "stopped",
-    cleanupPending: false,
-    automation: off,
-  });
-});
-
-it("keeps Auto-merge running when enabling Auto-fix queues the expanded authority", async () => {
-  const { host, state } = await startAutoFixers();
-  await setAutomation(host, pr42, { merge: true });
-  state.queueSends = true;
-  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
-    {
-      status: "watching",
-      automation: { fix: true, merge: true },
+it("schedules and cancels native merge through tea without creating or steering an agent", async () => {
+  const { host, calls } = await startAutoFixers();
+  await rpc(host, "setAutoMerge", { ...pr42, enabled: true });
+  const merge = calls.find(call => call.method === "POST");
+  expect(merge).toMatchObject({
+    login: "work", endpoint: "/api/v1/repos/acme/widgets/pulls/42/merge",
+    body: {
+      do: "rebase", head_commit_id: "a".repeat(40), merge_when_checks_succeed: true,
+      force_merge: false, delete_branch_after_merge: false,
     },
-  );
-  expect(state.queued.get("auto-fixer-1")?.[0]?.text).toContain(
-    "Auto-fix is on. Fix failing CI checks",
-  );
+  });
+  await enable(host, pr42);
+  await rpc(host, "setAutoMerge", { ...pr42, enabled: false });
+  expect(calls.filter(call => call.method === "DELETE")).toMatchObject([
+    { endpoint: "/api/v1/repos/acme/widgets/pulls/42/merge" },
+  ]);
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
   expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(0);
 });
 
-it("keeps cleanup pending until a queued authority change is withdrawn", async () => {
-  const { host, state } = await startAutoFixers();
+it("does not schedule a closed pull request or invent a merge style", async () => {
+  const { host, calls, settle, gitea } = await startAutoFixers();
+  settle("acme/widgets#42", true);
+  await expect(rpc(host, "setAutoMerge", { ...pr42, enabled: true })).rejects.toThrow("Only open");
+  gitea.mergeStyle = "manually-merged";
+  await expect(rpc(host, "setAutoMerge", { repo: "acme/widgets", number: 44, enabled: true })).rejects.toThrow();
+  expect(calls.some(call => call.method === "POST")).toBe(false);
+});
+
+it.each([403, 405, 409, 500])("reports native merge errors without falling back to an agent (HTTP %s)", async (mergeFailure) => {
+  const { host, gitea } = await startAutoFixers();
+  gitea.mergeFailure = mergeFailure;
+  for (const enabled of [true, false]) {
+    await expect(rpc(host, "setAutoMerge", { ...pr42, enabled })).rejects.toThrow(`HTTP ${mergeFailure}`);
+  }
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+});
+
+it("rejects agent merge authority and never grants it to an auto-fixer", async () => {
+  const { host } = await startAutoFixers();
+  for (const patch of [{ merge: true }, { fix: true, merge: true }, {}]) {
+    await expect(rpc(host, "setAutomation", { ...pr42, ...patch })).rejects.toThrow();
+  }
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
   await enable(host, pr42);
-  state.queueSends = true;
-  state.withdrawFailures = 1;
-  await expect(setAutomation(host, pr42, { merge: false })).rejects.toThrow(
-    "Cleanup failed: withdraw: ",
-  );
-  expect(state.queued.get("auto-fixer-1")).toHaveLength(1);
-  await expect(autoFixerStatus(host)).resolves.toMatchObject({
-    status: "stopped",
-    cleanupPending: true,
-    automation: off,
+  const prompt = (host.harness.sdk.callsTo("threads.spawn")[0]?.[0] as { prompt: string }).prompt;
+  expect(prompt).toContain("Never merge this pull request");
+  expect(prompt).not.toContain("tea pulls merge");
+});
+
+it.each(["watching", "needs_you", "failed"])("stops a legacy %s merge agent on startup without scheduling a native merge", async (status) => {
+  const { host, calls } = await startAutoFixers();
+  await enable(host, pr42);
+  const current = await autoFixerStatus(host);
+  await host.bb.storage.kv.set("auto-fixer:acme/widgets#42", {
+    ...current, status, policy: { fix: false, merge: true },
+    ...(status === "needs_you" ? { note: "waiting" } : {}),
+    ...(status === "failed" ? { error: "failed", cleanupPending: false } : {}),
   });
-  state.queueSends = false;
-  await expect(setAutomation(host, pr42, { fix: true })).resolves.toMatchObject(
-    { status: "watching", policy: { fix: true, merge: false } },
-  );
-  expect(state.queued.get("auto-fixer-1")).toEqual([]);
-  expect(
-    host.harness.sdk.callsTo("threads.queuedMessages.delete"),
-  ).toHaveLength(2);
+  const restarted = await host.harness.lifecycle.reload(plugin);
+  cleanups.push(() => restarted.harness.lifecycle.dispose());
+  const service = restarted.harness.behavior.runService("auto-fixers");
+  try {
+    await vi.waitFor(() => expect(autoFixerStatus(restarted)).resolves.toMatchObject({ status: "stopped" }), { timeout: 5000 });
+  } finally {
+    service.controller.abort();
+    await service.done;
+  }
+  expect(restarted.harness.sdk.callsTo("threads.stop")).toHaveLength(1);
+  expect(restarted.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+  expect(calls.every(call => call.method === "GET")).toBe(true);
+  await expect(rpc(restarted, "retryAutoFixer", pr42)).rejects.toThrow("Legacy merge agents cannot be resumed");
 });
 
 it("withdraws a queued resume before the auto-fixer runs under other options", async () => {
@@ -2622,7 +2503,7 @@ it("withdraws a queued resume before the auto-fixer runs under other options", a
   await expect(rpc(host, "retryAutoFixer", pr42)).resolves.toEqual({
     threadId: "auto-fixer-1",
   });
-  expect(state.queued.get("auto-fixer-1")?.[0]?.text).toContain(
+  expect(state.queued.get("auto-fixer-1")?.[0]?.text).not.toContain(
     "tea pulls merge",
   );
   await disable(host, pr42);
@@ -2724,34 +2605,58 @@ it("finishes settling an auto-fixer before Retry resumes it", async () => {
   expect(state.threads.get("auto-fixer-1")?.archivedAt).toBeNull();
   await expect(autoFixerStatus(host)).resolves.toMatchObject({
     status: "watching",
-    policy: { fix: true, merge: true },
+    policy: { fix: true, merge: false },
   });
 });
 
-it("launches automatic auto-fixers under the defaults current at launch time", async () => {
-  const { host, gitea } = await startAutoFixers();
-  let release!: () => void;
-  gitea.listGate = new Promise((resolve) => {
-    release = resolve;
+it("rejects bulk merge through RPC and CLI without starting an auto-fixer", async () => {
+  const { host } = await startAutoFixers();
+  for (const patch of [{ merge: true }, { fix: true, merge: true }]) {
+    await expect(rpc(host, "setAutoAutomation", patch)).rejects.toThrow();
+  }
+  await expect(
+    host.harness.behavior.runCli(["automation-defaults", "merge", "on"]),
+  ).resolves.toMatchObject({ exitCode: 1 });
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+  await expect(rpc(host, "getAutoFixerPreferences")).resolves.toMatchObject({
+    autoFix: false,
   });
-  const mergeOnly = rpc(host, "setAutoAutomation", { merge: true });
-  await vi.waitFor(() => expect(gitea.listRequests).toBeGreaterThan(0));
-  const fixOnly = rpc(host, "setAutoAutomation", { fix: true, merge: false });
-  await vi.waitFor(() =>
-    expect(rpc(host, "getAutoFixerPreferences")).resolves.toMatchObject({
-      autoFix: true,
-      autoMerge: false,
-    }),
+});
+
+it.each([false, true])("ignores legacy bulk merge preferences on startup (auto-fix: %s)", async (autoFix) => {
+  const { host } = await startAutoFixers();
+  const preferences = giteaRpcContract.getAutoFixerPreferences.output.parse(
+    await rpc(host, "getAutoFixerPreferences"),
   );
-  release();
-  await Promise.all([mergeOnly, fixOnly]);
-  const prompts = host.harness.sdk
-    .callsTo("threads.spawn")
-    .map((call) => (call[0] as { prompt: string }).prompt);
-  expect(prompts.length).toBeGreaterThan(0);
-  for (const prompt of prompts) {
-    expect(prompt).toContain("You can fix, commit, push");
-    expect(prompt).not.toContain("tea pulls merge");
+  await host.bb.storage.kv.set("auto-fixer-preferences", {
+    ...preferences, autoFix, autoMerge: true,
+  });
+  const restarted = await host.harness.lifecycle.reload(plugin);
+  cleanups.push(() => restarted.harness.lifecycle.dispose());
+  await expect(rpc(restarted, "getAutoFixerPreferences")).resolves.toEqual({
+    ...preferences, autoFix,
+  });
+  const service = restarted.harness.behavior.runService("auto-fixers");
+  try {
+    if (autoFix) {
+      await vi.waitFor(() =>
+        expect(restarted.harness.sdk.callsTo("threads.spawn")).toHaveLength(2),
+        { timeout: 5000 },
+      );
+      const sessions = giteaRpcContract.listAutoFixerSessions.output.parse(
+        await rpc(restarted, "listAutoFixerSessions"),
+      ).sessions;
+      expect(sessions).toHaveLength(2);
+      for (const session of sessions) {
+        expect(session.automation).toEqual({ fix: true, merge: false });
+      }
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(restarted.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    }
+  } finally {
+    service.controller.abort();
+    await service.done;
   }
 });
 
@@ -2821,7 +2726,7 @@ it("replaces a closed auto-fixer once Gitea reports the pull request reopened", 
     rpc(host, "autoFixerThread", { threadId: "auto-fixer-1" }),
   ).resolves.toBeNull();
 
-  await rpc(host, "setAutoAutomation", { fix: true, merge: true });
+  await rpc(host, "setAutoAutomation", { fix: true });
   await expect(autoFixerStatus(host, pr44)).resolves.toMatchObject({
     status: "watching",
     threadId: "auto-fixer-4",
@@ -2935,7 +2840,7 @@ it("treats repository spellings that differ only in case as one auto-fixer", asy
     status: "watching",
     threadId: "auto-fixer-1",
   });
-  await rpc(host, "setAutoAutomation", { fix: true, merge: true });
+  await rpc(host, "setAutoAutomation", { fix: true });
   expect(
     host.harness.sdk
       .callsTo("threads.spawn")

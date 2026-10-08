@@ -20,7 +20,7 @@ it("ignores repeated normalized model selections on an issue but saves real chan
   const slot = renderSlot(app.navPanels[0]!, { subPath: "issues/acme/widgets/10" }, {
     rpc: {
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
-      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution }),
+      getAutoFixerPreferences: () => ({ autoFix: false, execution }),
       getAgentExecution: () => ({ execution }),
       setAgentExecution: () => ({ ok: true }),
       listMyPullRequests: () => emptyList,
@@ -66,8 +66,8 @@ it("does not save an equivalent auto-fixer model and saves a real change once", 
   const slot = renderSlot(app.navPanels[0]!, { subPath: "auto-fixers" }, {
     rpc: {
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
-      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution }),
-      setAutoFixerExecution: (next: typeof execution) => ({ autoFix: false, autoMerge: false, execution: next }),
+      getAutoFixerPreferences: () => ({ autoFix: false, execution }),
+      setAutoFixerExecution: (next: typeof execution) => ({ autoFix: false, execution: next }),
       listMyPullRequests: () => emptyList,
       listMyIssues: () => emptyList,
       listItems: () => emptyList,
@@ -116,7 +116,7 @@ it("guards comment keyboard submission and locks the composer while posting", as
   const slot = renderSlot(app.navPanels[0]!, { subPath: "issues/acme/widgets/10" }, {
     rpc: {
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
-      getAutoFixerPreferences: () => ({ autoFix: false, autoMerge: false, execution }),
+      getAutoFixerPreferences: () => ({ autoFix: false, execution }),
       listMyPullRequests: () => emptyList,
       listMyIssues: () => emptyList,
       listItems: () => emptyList,

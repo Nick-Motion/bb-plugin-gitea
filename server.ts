@@ -30,9 +30,6 @@ import type { PullStatus } from "./branch-order.js";
 import {
   archived,
   activePolicy,
-  applyAutomationPatch,
-  automationOptions,
-  automationPatchSchema,
   autoStartTargets,
   autoFixerExecutionSchema,
   autoFixerPreferencesSchema,
@@ -68,7 +65,6 @@ import {
   sameSession,
   type WatchingSession,
   sessionView,
-  setsAutomationOption,
   startError,
   stopped,
   watching,
@@ -419,11 +415,12 @@ export const giteaRpcContract = defineRpcContract({
     }),
   },
   setAutomation: {
-    input: pullRefSchema
-      .extend(automationOptions)
-      .strict()
-      .refine(...setsAutomationOption),
+    input: pullRefSchema.extend({ fix: z.boolean() }).strict(),
     output: autoFixerViewSchema,
+  },
+  setAutoMerge: {
+    input: pullRefSchema.extend({ enabled: z.boolean() }).strict(),
+    output: z.object({ ok: z.literal(true) }),
   },
   retryAutoFixer: { input: pullRefSchema, output: threadIdSchema },
   getAutoFixerStatus: { input: pullRefSchema, output: autoFixerViewSchema },
@@ -440,7 +437,7 @@ export const giteaRpcContract = defineRpcContract({
     output: autoFixerPreferencesSchema,
   },
   setAutoAutomation: {
-    input: automationPatchSchema,
+    input: z.object({ fix: z.boolean() }).strict(),
     output: autoFixerPreferencesSchema,
   },
   setAutoFixerExecution: {
@@ -2168,7 +2165,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   function retryAutoFixer(repo: string, number: number) {
     return serialized(repo, number, async () => {
-      const decision = decideRetry(await getSession(repo, number));
+      const previous = await getSession(repo, number);
+      if (previous?.policy.merge) {
+        await stopAutoFixer(repo, number);
+        throw new Error("Legacy merge agents cannot be resumed. Enable Auto-fix or use the native Auto-merge action.");
+      }
+      const decision = decideRetry(previous);
       if (decision.kind === "reject")
         throw new Error(
           decision.reason === "inactive"
@@ -2184,8 +2186,44 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  function setAutoMerge(repo: string, number: number, enabled: boolean) {
+    return serialized(repo, number, async () => {
+      const path = repoPath(repo, `pulls/${number}/merge`);
+      if (enabled) {
+        const pull = record(await api(repoPath(repo, `pulls/${number}`)));
+        if (requireLifecycle(pull).state !== "open")
+          throw new Error("Only open pull requests can be scheduled to merge.");
+        const head = z.string()
+          .regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i)
+          .parse(record(pull.head).sha);
+        const repository = record(await api(repoPath(repo, "")));
+        const style = z.enum([
+          "merge", "rebase", "rebase-merge", "squash", "fast-forward-only",
+        ])
+          .parse(repository.default_merge_style);
+        await api(path, {
+          method: "POST",
+          body: {
+            do: style,
+            head_commit_id: head,
+            merge_when_checks_succeed: true,
+            force_merge: false,
+            delete_branch_after_merge: false,
+          },
+        });
+      } else {
+        await api(path, { method: "DELETE" });
+      }
+      forgetDisplay();
+      bb.realtime.publish("auto-fixer-changed", { repo, number });
+      return { ok: true as const };
+    });
+  }
+
   function setAutomation(repo: string, number: number, patch: AutomationPatch) {
     return serialized(repo, number, async () => {
+      const previous = await getSession(repo, number);
+      if (previous?.policy.merge) await stopAutoFixer(repo, number);
       const decision = decideAutomation(await getSession(repo, number), patch);
       switch (decision.kind) {
         case "unchanged":
@@ -2280,7 +2318,7 @@ export default async function plugin(bb: BbPluginApi) {
     const preferences = await getPreferences();
     return activePolicy({
       fix: preferences.autoFix,
-      merge: preferences.autoMerge,
+      merge: false,
     });
   }
 
@@ -2343,6 +2381,13 @@ export default async function plugin(bb: BbPluginApi) {
       if (signal.aborted) return;
       try {
         if (session.status === "archived") continue;
+        if (
+          session.policy.merge &&
+          (session.status === "watching" || session.status === "needs_you" || session.status === "failed")
+        ) {
+          await serialized(session.repo, session.number, () => stopAutoFixer(session.repo, session.number));
+          continue;
+        }
         const terminal = session.status === "merged" || session.status === "closed"
           ? session
           : confirmedTerminal(session, await readLifecycle(session.repo, session.number), now());
@@ -3032,8 +3077,9 @@ export default async function plugin(bb: BbPluginApi) {
         preferences,
       };
     },
-    setAutomation: ({ repo, number, fix, merge }) =>
-      setAutomation(repo, number, { fix, merge }),
+    setAutomation: ({ repo, number, fix }) =>
+      setAutomation(repo, number, { fix, merge: false }),
+    setAutoMerge: ({ repo, number, enabled }) => setAutoMerge(repo, number, enabled),
     retryAutoFixer: ({ repo, number }) => retryAutoFixer(repo, number),
     getAutoFixerStatus: ({ repo, number }) => autoFixerStatus(repo, number),
     autoFixerThread: async ({ threadId }) => {
@@ -3044,17 +3090,11 @@ export default async function plugin(bb: BbPluginApi) {
       sessions: (await listSessions()).map(sessionView),
     }),
     getAutoFixerPreferences: () => getPreferences(),
-    setAutoAutomation: async (patch) => {
+    setAutoAutomation: async ({ fix }) => {
       const preferences = await withDefaults(() =>
-        updatePreferences((current) => {
-          const next = applyAutomationPatch(
-            { fix: current.autoFix, merge: current.autoMerge },
-            patch,
-          );
-          return { ...current, autoFix: next.fix, autoMerge: next.merge };
-        }),
+        updatePreferences((current) => ({ ...current, autoFix: fix })),
       );
-      if (preferences.autoFix || preferences.autoMerge)
+      if (preferences.autoFix)
         await reconcileAutoAutoFixer().catch((error: unknown) =>
           bb.log.warn(`Automatic Gitea auto-fixing failed: ${message(error)}`),
         );
@@ -3253,7 +3293,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "my-prs",
-        summary: "List your pull requests with Auto-fix and Auto-merge status",
+        summary: "List your pull requests with Auto-fix status",
         usage:
           "bb gitea my-prs [owner/repo] [--state open|closed|all] [--query text] [--json]",
       },
@@ -3266,13 +3306,13 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "auto-merge",
         summary:
-          "Turn Auto-merge on or off for your pull request; it merges when Gitea's rules allow but never changes code",
+          "Request or cancel native Gitea auto-merge through tea; never starts an agent",
         usage: "bb gitea auto-merge <owner/repo> <number> on|off [--json]",
       },
       {
         name: "auto-fixer-status",
         summary:
-          "Show a pull request's Auto-fix, Auto-merge, and auto-fixer state",
+          "Show a pull request's Auto-fix and auto-fixer state",
         usage: "bb gitea auto-fixer-status <owner/repo> <number> [--json]",
       },
       {
@@ -3293,8 +3333,8 @@ export default async function plugin(bb: BbPluginApi) {
       {
         name: "automation-defaults",
         summary:
-          "Show or set whether Auto-fix and Auto-merge turn on automatically for your pull requests",
-        usage: "bb gitea automation-defaults [fix|merge on|off] [--json]",
+          "Show or set whether Auto-fix turns on automatically for your pull requests",
+        usage: "bb gitea automation-defaults [fix on|off] [--json]",
       },
       {
         name: "auto-fixer-execution",
@@ -3560,11 +3600,11 @@ export default async function plugin(bb: BbPluginApi) {
           view: z.infer<typeof autoFixerViewSchema>,
           ref: string,
         ) =>
-          `${ref} ${view.status} · Auto-fix ${onOff(view.automation.fix)} · Auto-merge ${onOff(view.automation.merge)}${"threadId" in view ? ` thread ${view.threadId}` : ""}${view.status === "failed" ? `\n${view.error}` : ""}${view.status === "needs_you" && view.note ? `\n${view.note}` : ""}`;
+          `${ref} ${view.status} · Auto-fix ${onOff(view.automation.fix)}${"threadId" in view ? ` thread ${view.threadId}` : ""}${view.status === "failed" ? `\n${view.error}` : ""}${view.status === "needs_you" && view.note ? `\n${view.note}` : ""}`;
         const pullRef = () =>
           pullRefSchema.parse({ repo: values[0], number: Number(values[1]) });
         const describePreferences = (value: AutoFixerPreferences) =>
-          `Turn on Auto-fix for my PRs: ${onOff(value.autoFix)}\nTurn on Auto-merge for my PRs: ${onOff(value.autoMerge)}\nExecution: ${value.execution.providerId} ${value.execution.model} ${value.execution.reasoningLevel} ${value.execution.serviceTier}`;
+          `Turn on Auto-fix for my PRs: ${onOff(value.autoFix)}\nExecution: ${value.execution.providerId} ${value.execution.model} ${value.execution.reasoningLevel} ${value.execution.serviceTier}`;
         if (command === "my-issues") {
           const input = giteaRpcContract.listMyIssues.input.parse({
             ...(values[0] ? { repo: values[0] } : {}),
@@ -3587,20 +3627,22 @@ export default async function plugin(bb: BbPluginApi) {
           const value = await handlers.listMyPullRequests(input);
           return succeed(
             value,
-            `${value.items.map((entry) => `${entry.repo}#${entry.number} ${entry.state} fix:${onOff(entry.autoFixer.automation.fix)} merge:${onOff(entry.autoFixer.automation.merge)} auto-fixer:${entry.autoFixer.status} ${entry.title}`).join("\n") || "No pull requests authored by you."}${value.truncated ? "\nResults are capped; narrow the repository or query." : ""}${value.errors.map((entry) => `\n${entry.repo}: ${entry.message}`).join("")}`,
+            `${value.items.map((entry) => `${entry.repo}#${entry.number} ${entry.state} fix:${onOff(entry.autoFixer.automation.fix)} auto-fixer:${entry.autoFixer.status} ${entry.title}`).join("\n") || "No pull requests authored by you."}${value.truncated ? "\nResults are capped; narrow the repository or query." : ""}${value.errors.map((entry) => `\n${entry.repo}: ${entry.message}`).join("")}`,
           );
         }
-        if (command === "auto-fix" || command === "auto-merge") {
-          const option = command === "auto-fix" ? "fix" : "merge";
+        if (command === "auto-merge") {
+          const input = giteaRpcContract.setAutoMerge.input.parse({
+            ...pullRef(), enabled: switchValue(values[2]),
+          });
+          const value = await handlers.setAutoMerge(input);
+          return succeed(value, `${input.repo}#${input.number}: ${input.enabled ? "Auto-merge requested in Gitea" : "Auto-merge cancellation confirmed by Gitea"}`);
+        }
+        if (command === "auto-fix") {
           const input = giteaRpcContract.setAutomation.input.parse({
-            ...pullRef(),
-            [option]: switchValue(values[2]),
+            ...pullRef(), fix: switchValue(values[2]),
           });
           const value = await handlers.setAutomation(input);
-          return succeed(
-            value,
-            describe(value, `${input.repo}#${input.number}`),
-          );
+          return succeed(value, describe(value, `${input.repo}#${input.number}`));
         }
         if (command === "auto-fixer-retry") {
           const input = pullRef();
@@ -3668,7 +3710,7 @@ export default async function plugin(bb: BbPluginApi) {
               ? await handlers.getAutoFixerPreferences()
               : await handlers.setAutoAutomation(
                   giteaRpcContract.setAutoAutomation.input.parse({
-                    [z.enum(["fix", "merge"]).parse(values[0])]: switchValue(
+                    [z.literal("fix").parse(values[0])]: switchValue(
                       values[1],
                     ),
                   }),

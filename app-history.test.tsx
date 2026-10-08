@@ -29,7 +29,6 @@ const overlay = app.appOverlays[0]!;
 
 const preferences = {
   autoFix: false,
-  autoMerge: false,
   execution: {
     providerId: "codex",
     model: "gpt-5.6-luna",

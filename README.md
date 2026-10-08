@@ -79,12 +79,13 @@ The environment is available only when the `origin` remote of the project's chec
 
 ## Auto-fix and Auto-merge
 
-Pull request rows in **My PRs** and **Pull requests** have two independent switches, both off by default:
+Pull request rows in **My PRs** and **Pull requests** offer:
 
-- **Auto-fix**: fix CI failures and address review feedback. It may commit, push, rebase, reply to and resolve review comments, and mark a WIP pull request ready. It never merges.
-- **Auto-merge**: merge once permissions, branch protection, required checks, approvals, and conflicts allow. It never changes code.
+- **Auto-fix** starts a hidden BB thread to fix CI failures and address review feedback. It may commit, push, rebase, reply to and resolve review comments, and mark a WIP pull request ready. It never merges. Turning it off stops and archives the thread. **Retry** resumes a failed or needs-you auto-fixer.
+- **Auto-merge** asks Gitea to merge the individual pull request when its checks and branch rules allow, using `tea api` and the repository's default merge style. It may merge immediately if ready. It never starts or steers an agent.
+- **Cancel auto-merge** cancels the native Gitea request through `tea api`.
 
-Turning either on starts an auto-fixer: a hidden BB thread that watches the pull request until it is merged or closed, or until it needs you. Changing a switch updates the same thread. Turning both off stops it and archives the thread. **Retry** resumes a failed or needs-you auto-fixer.
+Gitea owns scheduled merges. Opening the page does not schedule anything. The API does not expose scheduled-merge status, so these are explicit actions rather than a toggle claiming to show the queue state. Native requests survive BB restarts. Errors are shown without retrying through an agent. Existing legacy merge agents are stopped on startup and cannot be retried.
 
 Closed or merged PRs automatically archive their auto-fixers, including paused and failed sessions. BB stops the thread, withdraws plugin-owned queued messages, and retires its terminals and managed environment through the thread archive lifecycle. Failed cleanup retries automatically. Archived sessions are hidden by default; select **Show archived** to view their history. A reopened closed PR can start a new auto-fixer.
 
@@ -92,9 +93,9 @@ Auto-fixers run on the host of the repository checkout discovered by the plugin.
 
 While idle, an auto-fixer waits with `bb gitea pr-watch`, which checks the pull request record and its combined CI status every 30 seconds and returns as soon as either changes. It rereads the full diff and conversation only after a change.
 
-Gitea has no native auto-merge. The auto-fixer acts with your `tea` login's permissions, and the limits above are enforced by its instructions, not by Gitea. A reported merge or close counts only when Gitea confirms it.
+Native merge requests use the BB server's `tea` login. Gitea enforces merge permissions and branch rules. A reported merge or close counts only when Gitea confirms it.
 
-The top of **My PRs** has **Auto-fix all** and **Auto-merge all**. When on, the plugin checks every five minutes, and immediately when switched on, and starts auto-fixers for your open pull requests that have none. The same bar picks the model for new auto-fixers.
+The top of **My PRs** has **Auto-fix all**. When on, the plugin checks every five minutes, and immediately when switched on, and starts auto-fixers for your open pull requests that have none. Bulk auto-merge is not available. Auto-merge must be enabled for each pull request individually. The same bar picks the model for new auto-fixers.
 
 ## CLI
 
@@ -124,7 +125,7 @@ bb gitea auto-fixer-status|auto-fixer-retry <owner/repo> <number>
 bb gitea pr-watch <owner/repo> <number> [--since token] [--timeout seconds]
 bb gitea auto-fixer-thread <thread-id>
 bb gitea auto-fixers
-bb gitea automation-defaults [fix|merge on|off]
+bb gitea automation-defaults [fix on|off]
 bb gitea auto-fixer-execution <provider> <model> <reasoning> [fast|default]
 ```
 
