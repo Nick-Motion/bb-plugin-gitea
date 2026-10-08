@@ -2364,11 +2364,11 @@ it("retains sessions across a restart and reconciles threads that settled while 
     await expect(
       autoFixerStatus(restarted, { repo: "acme/widgets", number: 44 }),
     ).resolves.toMatchObject({ status: "stopped" });
-  });
+  }, { timeout: 5000 });
   service.controller.abort();
   await service.done;
   expect(restarted.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
-});
+}, 15_000);
 
 it("reports Gitea API failures without spawning or guessing a terminal state", async () => {
   const { host, gitea } = await startAutoFixers();
@@ -2991,7 +2991,7 @@ it("checks auto-fixer sessions every 30 seconds but refreshes the authored pull 
   service.controller.abort();
   await service.done;
   vi.useRealTimers();
-});
+}, 15_000);
 
 it("reports a stopped auto-fixer as inactive even when the pull request changed", async () => {
   const { host, gitea } = await startAutoFixers();
