@@ -113,26 +113,32 @@ it("shows Auto-fix and Auto-merge controls for a Pull requests row", async () =>
   });
   expect(await screen.findByText(item.title)).toBeTruthy();
   const controls = screen.getByTestId("auto-fixer-controls");
-  expect(controls.querySelectorAll("button")).toHaveLength(3);
+  expect(controls.querySelectorAll("button")).toHaveLength(2);
   expect(controls.textContent).toContain("Auto-fix");
   expect(controls.textContent).toContain("Auto-merge");
 });
 
 it("schedules and cancels a PR merge without calling agent automation", async () => {
+  let merge = false;
+  const rows = () => ({ ...list, items: [{ ...item, autoFixer: { ...item.autoFixer, automation: { fix: false, merge } } }], login: "dev" });
   const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
     rpc: {
       status: () => ({ state: "connected", login: "dev", account, repos: [] }),
       getAutoFixerPreferences: () => ({ autoFix: false, execution: {
         providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default",
       } }),
-      listMyPullRequests: () => ({ ...list, login: "dev" }),
+      listMyPullRequests: rows,
       listMyIssues: () => ({ ...list, items: [], login: "dev" }),
-      listItems: () => list,
-      setAutoMerge: () => ({ ok: true }),
+      listItems: rows,
+      setAutoMerge: ({ enabled }: { enabled: boolean }) => { merge = enabled; return { ok: true }; },
     },
   });
-  await act(async () => fireEvent.click(await screen.findByRole("button", { name: "Auto-merge" })));
-  await act(async () => fireEvent.click(await screen.findByRole("button", { name: "Cancel auto-merge" })));
+  const toggle = await screen.findByRole("button", { name: "Auto-merge", pressed: false });
+  expect(screen.queryByRole("button", { name: "Cancel auto-merge" })).toBeNull();
+  await act(async () => fireEvent.click(toggle));
+  await screen.findByRole("button", { name: "Auto-merge", pressed: true });
+  await act(async () => fireEvent.click(toggle));
+  await screen.findByRole("button", { name: "Auto-merge", pressed: false });
   expect(slot.rpcCalls.filter(call => call.method === "setAutoMerge")).toMatchObject([
     { input: { repo: "acme/widgets", number: 42, enabled: true } },
     { input: { repo: "acme/widgets", number: 42, enabled: false } },

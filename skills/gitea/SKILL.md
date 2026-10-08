@@ -36,7 +36,7 @@ Auto-fix and native Auto-merge are separate actions.
 
 - Auto-fix starts a hidden BB thread to fix CI failures and review feedback. It may commit, push, rebase, and reply to and resolve review comments. It must never merge or schedule a merge. Turning Auto-fix off stops and archives the thread.
 - Auto-merge calls `tea api` on the BB server to POST `/repos/{owner}/{repo}/pulls/{number}/merge` with `merge_when_checks_succeed: true`, the current head SHA, and the repository's default merge style. Gitea owns the queue and enforces its rules. It may merge immediately if ready. No agent is created or steered.
-- Turning Auto-merge off calls DELETE on that endpoint to cancel the native request. Errors are returned without an agent fallback. The API does not expose queue state; the UI offers explicit request and cancel actions rather than a status toggle.
+- Turning Auto-merge off calls DELETE on that endpoint to cancel the native request. Errors are returned without an agent fallback. The UI has one on/off Auto-merge toggle. Its state records successful plugin requests per account and PR across reloads, and clears when the PR closes. Gitea does not expose queue state, so changes made outside BB are not reflected.
 
 Auto-fix threads run on the repository checkout's host. Install `tea` and sign in there; the BB server's login does not authenticate another host. Native merges use the BB server login and survive BB restarts. Legacy merge agents are stopped on startup and cannot be retried. Never turn on either action without a user request for that pull request.
 

@@ -2186,8 +2186,27 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  async function withNativeMerge<T extends { automation: { fix: boolean; merge: boolean } }>(
+    view: T,
+    repo: string,
+    number: number,
+  ): Promise<T> {
+    const key = await displayKey("native-auto-merge", repo, number);
+    // ponytail: saved BB selection; reconcile external changes when Gitea exposes queue state.
+    let merge = (await bb.storage.kv.get<boolean>(key)) === true;
+    if (merge) {
+      const { state } = await readLifecycle(repo, number);
+      if (state === "closed" || state === "merged") {
+        await bb.storage.kv.delete(key);
+        merge = false;
+      }
+    }
+    return { ...view, automation: { ...view.automation, merge } };
+  }
+
   function setAutoMerge(repo: string, number: number, enabled: boolean) {
     return serialized(repo, number, async () => {
+      const key = await displayKey("native-auto-merge", repo, number);
       const path = repoPath(repo, `pulls/${number}/merge`);
       if (enabled) {
         const pull = record(await api(repoPath(repo, `pulls/${number}`)));
@@ -2214,6 +2233,7 @@ export default async function plugin(bb: BbPluginApi) {
       } else {
         await api(path, { method: "DELETE" });
       }
+      await bb.storage.kv.set(key, enabled);
       forgetDisplay();
       bb.realtime.publish("auto-fixer-changed", { repo, number });
       return { ok: true as const };
@@ -2279,15 +2299,15 @@ export default async function plugin(bb: BbPluginApi) {
   async function autoFixerStatus(repo: string, number: number) {
     const session = await getSession(repo, number);
     if (session !== null && session.status !== "closed" && session.status !== "archived")
-      return autoFixerView(session, null);
+      return withNativeMerge(autoFixerView(session, null), repo, number);
     const [lifecycle, project] = await Promise.all([
       readLifecycle(repo, number),
       projectFor(repo),
     ]);
-    return autoFixerView(session, {
+    return withNativeMerge(autoFixerView(session, {
       lifecycle,
       projectId: project?.projectId ?? null,
-    });
+    }), repo, number);
   }
 
   async function withAutoFixers(items: ListItem[]) {
@@ -2295,7 +2315,7 @@ export default async function plugin(bb: BbPluginApi) {
     return await Promise.all(
       items.map(async (item) => ({
         ...item,
-        autoFixer: autoFixerView(
+        autoFixer: await withNativeMerge(autoFixerView(
           await getSession(item.repo, item.number),
           item.state === "open"
             ? {
@@ -2303,7 +2323,7 @@ export default async function plugin(bb: BbPluginApi) {
                 projectId: projects.get(repoKey(item.repo)) ?? null,
               }
             : null,
-        ),
+        ), item.repo, item.number),
       })),
     );
   }
@@ -3084,10 +3104,12 @@ export default async function plugin(bb: BbPluginApi) {
     getAutoFixerStatus: ({ repo, number }) => autoFixerStatus(repo, number),
     autoFixerThread: async ({ threadId }) => {
       const session = await getSessionByThread(threadId);
-      return session && sessionView(session);
+      return session && withNativeMerge(sessionView(session), session.repo, session.number);
     },
     listAutoFixerSessions: async () => ({
-      sessions: (await listSessions()).map(sessionView),
+      sessions: await Promise.all((await listSessions()).map(session =>
+        withNativeMerge(sessionView(session), session.repo, session.number),
+      )),
     }),
     getAutoFixerPreferences: () => getPreferences(),
     setAutoAutomation: async ({ fix }) => {

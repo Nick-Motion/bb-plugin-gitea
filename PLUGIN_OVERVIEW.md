@@ -14,7 +14,7 @@ Install the `tea` CLI 0.15.1 or newer and sign in with `tea login add`. BB store
 
 ## Costs and permissions
 
-Browsing, commenting, and native Auto-merge use no agent time. Auto-merge and Cancel auto-merge call Gitea through `tea api`; Gitea owns the queue and enforces its merge rules. Auto-fix and `bb gitea send-agent` start BB threads using your configured model. Auto-fix agents never merge. Bulk auto-merge is not available.
+Browsing, commenting, and native Auto-merge use no agent time. The Auto-merge on/off toggle calls Gitea through `tea api`; Gitea owns the queue and enforces its merge rules. Auto-fix and `bb gitea send-agent` start BB threads using your configured model. Auto-fix agents never merge. Bulk auto-merge is not available.
 
 ## Commands
 

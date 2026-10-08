@@ -1541,27 +1541,16 @@ function AutoFixerControls({
       </Button>
       <Button
         size="sm"
-        variant="outline"
+        variant={view.automation.merge ? "default" : "outline"}
         className="h-7"
-        disabled={busy || !open}
+        aria-pressed={view.automation.merge}
+        disabled={busy || (!open && !view.automation.merge)}
         onClick={() => void run(
-          () => rpc.call("setAutoMerge", { repo, number, enabled: true }),
-          "Auto-merge requested in Gitea",
+          () => rpc.call("setAutoMerge", { repo, number, enabled: !view.automation.merge }),
+          `Auto-merge ${view.automation.merge ? "off" : "on"}`,
         )}
       >
         Auto-merge
-      </Button>
-      <Button
-        size="sm"
-        variant="outline"
-        className="h-7"
-        disabled={busy}
-        onClick={() => void run(
-          () => rpc.call("setAutoMerge", { repo, number, enabled: false }),
-          "Auto-merge cancellation confirmed by Gitea",
-        )}
-      >
-        Cancel auto-merge
       </Button>
       {view.actions.includes("retry") && (
         <Button

@@ -2441,6 +2441,42 @@ it("schedules and cancels native merge through tea without creating or steering 
   expect(host.harness.sdk.callsTo("threads.stop")).toHaveLength(0);
 });
 
+it("persists the native merge switch across reloads without rescheduling and clears it on PR closure", async () => {
+  const { host, calls, settle, reopen } = await startAutoFixers();
+  await rpc(host, "setAutoMerge", { ...pr42, enabled: true });
+  const restarted = await host.harness.lifecycle.reload(plugin);
+  cleanups.push(() => restarted.harness.lifecycle.dispose());
+  await expect(autoFixerStatus(restarted)).resolves.toMatchObject({ automation: { merge: true } });
+  const mine = giteaRpcContract.listMyPullRequests.output.parse(await rpc(restarted, "listMyPullRequests", { state: "open", query: "" }));
+  expect(mine.items.find(item => item.number === 42)?.autoFixer.automation.merge).toBe(true);
+  expect(calls.filter(call => call.method === "POST")).toHaveLength(1);
+  settle("acme/widgets#42", false);
+  await expect(autoFixerStatus(restarted)).resolves.toMatchObject({ automation: { merge: false } });
+  reopen("acme/widgets#42");
+  await expect(autoFixerStatus(restarted)).resolves.toMatchObject({ automation: { merge: false } });
+  expect(restarted.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+});
+
+it("keeps a native merge switch on when cancellation fails", async () => {
+  const { host, gitea } = await startAutoFixers();
+  await rpc(host, "setAutoMerge", { ...pr42, enabled: true });
+  gitea.mergeFailure = 500;
+  await expect(rpc(host, "setAutoMerge", { ...pr42, enabled: false })).rejects.toThrow();
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: true } });
+  gitea.mergeFailure = null;
+  await rpc(host, "setAutoMerge", { ...pr42, enabled: false });
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: false } });
+});
+
+it("keeps a native merge switch cancellable when reading the PR fails", async () => {
+  const { host, gitea } = await startAutoFixers();
+  await rpc(host, "setAutoMerge", { ...pr42, enabled: true });
+  gitea.pullFailure = 500;
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: true } });
+  await rpc(host, "setAutoMerge", { ...pr42, enabled: false });
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: false } });
+});
+
 it("does not schedule a closed pull request or invent a merge style", async () => {
   const { host, calls, settle, gitea } = await startAutoFixers();
   settle("acme/widgets#42", true);

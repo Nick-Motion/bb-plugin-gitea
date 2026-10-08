@@ -83,9 +83,9 @@ Pull request rows in **My PRs** and **Pull requests** offer:
 
 - **Auto-fix** starts a hidden BB thread to fix CI failures and address review feedback. It may commit, push, rebase, reply to and resolve review comments, and mark a WIP pull request ready. It never merges. Turning it off stops and archives the thread. **Retry** resumes a failed or needs-you auto-fixer.
 - **Auto-merge** asks Gitea to merge the individual pull request when its checks and branch rules allow, using `tea api` and the repository's default merge style. It may merge immediately if ready. It never starts or steers an agent.
-- **Cancel auto-merge** cancels the native Gitea request through `tea api`.
+- Click **Auto-merge** again to turn it off and cancel the native Gitea request through `tea api`.
 
-Gitea owns scheduled merges. Opening the page does not schedule anything. The API does not expose scheduled-merge status, so these are explicit actions rather than a toggle claiming to show the queue state. Native requests survive BB restarts. Errors are shown without retrying through an agent. Existing legacy merge agents are stopped on startup and cannot be retried.
+Gitea owns scheduled merges. Opening the page does not schedule anything. The Auto-merge button is an on/off toggle. BB remembers successful requests per account and pull request across refreshes and restarts; it clears the selection when the PR closes. Changes made outside BB are not reflected because Gitea does not expose queue state. Native requests survive BB restarts. Errors are shown without retrying through an agent. Existing legacy merge agents are stopped on startup and cannot be retried.
 
 Closed or merged PRs automatically archive their auto-fixers, including paused and failed sessions. BB stops the thread, withdraws plugin-owned queued messages, and retires its terminals and managed environment through the thread archive lifecycle. Failed cleanup retries automatically. Archived sessions are hidden by default; select **Show archived** to view their history. A reopened closed PR can start a new auto-fixer.
 
