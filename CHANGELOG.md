@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1 - 2026-10-08
+
+### Changed
+
+- Remove bulk auto-merge controls, defaults, and scheduling. Persisted bulk merge preferences are ignored, and stale bulk merge requests are rejected.
+- Request and cancel per-PR native Gitea auto-merge through `tea api`, using the repository's default merge style and current head SHA, without forcing merges or deleting branches.
+- Stop legacy merge agents on startup and prevent their retry. Auto-fix agents never merge or schedule merges.
+- Show explicit Auto-merge and Cancel auto-merge actions because the deployed Gitea read API does not expose the native queue state.
+
 ## 1.1.0 - 2026-10-06
 
 ### Added
