@@ -41,7 +41,7 @@ Auto-fix and native Auto-merge are separate actions.
 Auto-fix threads run on the repository checkout's host. Install `tea` and sign in there; the BB server's login does not authenticate another host. Native merges use the BB server login and survive BB restarts. Legacy merge agents are stopped on startup and cannot be retried. Never turn on either action without a user request for that pull request.
 
 - `bb gitea auto-fix|auto-merge <owner/repo> <number> on|off`
-- `bb gitea auto-fixer-status <owner/repo> <number>` shows the auto-fix thread status and available actions. It does not report native Gitea merge queue state.
+- `bb gitea auto-fixer-status <owner/repo> <number>` shows the auto-fix thread status, available actions, and native Auto-merge state. Failed or incomplete native reads include `mergeError`.
 - `bb gitea auto-fixer-retry <owner/repo> <number>` resumes a failed or needs-you auto-fixer with Auto-fix authority only. It starts a replacement thread if the old thread was deleted or its workspace was retired, preserving the archived old thread. It rejects stopped, closed, and missing sessions; turn Auto-fix on instead.
 - `bb gitea auto-fixer-thread <thread-id>` shows the session owned by a thread.
 - `bb gitea auto-fixers` lists sessions.

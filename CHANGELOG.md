@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.3 - 2026-10-08
+
+### Fixed
+
+- Read native auto-merge state from the Gitea timeline, including schedules created outside BB, instead of a saved local selection.
+- Show auto-merge as unavailable when native state cannot be read or the timeline is incomplete.
+- Treat the exact already-scheduled HTTP 409 response as success; preserve other Gitea error messages.
+- Opening or reloading pages reads state without scheduling or cancelling merges.
+
 ## 1.1.2 - 2026-10-08
 
 ### Fixed
