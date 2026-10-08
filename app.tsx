@@ -1543,14 +1543,15 @@ function AutoFixerControls({
         size="sm"
         variant={view.automation.merge ? "default" : "outline"}
         className="h-7"
-        aria-pressed={view.automation.merge}
-        disabled={busy || (!open && !view.automation.merge)}
+        aria-pressed={view.mergeError ? undefined : view.automation.merge}
+        aria-description={view.mergeError}
+        disabled={busy || !!view.mergeError || (!open && !view.automation.merge)}
         onClick={() => void run(
           () => rpc.call("setAutoMerge", { repo, number, enabled: !view.automation.merge }),
           `Auto-merge ${view.automation.merge ? "off" : "on"}`,
         )}
       >
-        Auto-merge
+        {view.mergeError ? "Auto-merge unavailable" : "Auto-merge"}
       </Button>
       {view.actions.includes("retry") && (
         <Button

@@ -137,6 +137,7 @@ export type AutoFixerAction = "start" | "stop" | "retry";
 const actionsSchema = z.object({
   actions: z.array(z.enum(["start", "stop", "retry"])),
   automation: automationSchema,
+  mergeError: z.string().optional(),
 });
 export const autoFixerSessionViewSchema = z.intersection(
   autoFixerSessionSchema,

@@ -1548,7 +1548,7 @@ function authoredPull(number: number, title: string, author = "dev") {
   };
 }
 
-it("serves a remembered pull request list without Gitea reads and refreshes a stale one once in the background", async () => {
+it("caches pull request lists while reading fresh native merge state and refreshes stale lists once", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   cleanups.push(() => {
     vi.useRealTimers();
@@ -1604,7 +1604,9 @@ it("serves a remembered pull request list without Gitea reads and refreshes a st
   });
   const settled = calls.length;
   await myPulls(host);
-  expect(calls).toHaveLength(settled);
+  expect(calls.slice(settled)).toMatchObject([
+    { method: "GET", endpoint: "/api/v1/repos/acme/widgets/issues/4/timeline?limit=50&page=1" },
+  ]);
 });
 
 it("rereads pull request lists after Refresh, list-changing mutations, account changes, and a rejected login", async () => {
@@ -1731,6 +1733,9 @@ async function startAutoFixers() {
   const gitea = {
     pullFailure: null as number | null,
     mergeFailure: null as number | null,
+    mergeMessage: "",
+    timelineFailure: null as number | null,
+    timelines: new Map<string, Array<{ id: number; type: string }>>(),
     mergeStyle: "rebase",
     listGate: null as Promise<void> | null,
     listRequests: 0,
@@ -1854,8 +1859,20 @@ async function startAutoFixers() {
     ({ endpoint, method }) => {
       const path = endpoint.split("?")[0]!;
       if (/\/repos\/[^/]+\/[^/]+\/$/.test(path)) return { json: { default_merge_style: gitea.mergeStyle } };
-      if (path.endsWith("/merge") && (method === "POST" || method === "DELETE"))
-        return { status: gitea.mergeFailure ?? (method === "POST" ? 201 : 204), raw: "" };
+      const timeline = path.match(/^\/api\/v1\/repos\/(.+)\/issues\/(\d+)\/timeline$/);
+      if (timeline) return {
+        status: gitea.timelineFailure ?? 200,
+        json: (gitea.timelines.get(`${timeline[1]}#${timeline[2]}`) ?? []).slice((page(endpoint) - 1) * 50, page(endpoint) * 50),
+      };
+      const merge = path.match(/^\/api\/v1\/repos\/(.+)\/pulls\/(\d+)\/merge$/);
+      if (merge && (method === "POST" || method === "DELETE")) {
+        if (gitea.mergeFailure) return { status: gitea.mergeFailure, json: { message: gitea.mergeMessage } };
+        const key = `${merge[1]}#${merge[2]}`;
+        const events = gitea.timelines.get(key) ?? [];
+        events.push({ id: events.length + 1, type: method === "POST" ? "pull_scheduled_merge" : "pull_cancel_scheduled_merge" });
+        gitea.timelines.set(key, events);
+        return { status: method === "POST" ? 201 : 204, raw: "" };
+      }
 
       if (path === "/api/v1/user") return { json: { login: "dev" } };
       const list = path.match(/^\/api\/v1\/repos\/([^/]+\/[^/]+)\/issues$/);
@@ -2380,6 +2397,7 @@ it("reports Gitea API failures without spawning or guessing a terminal state", a
     status: "idle",
     actions: [],
     automation: off,
+    mergeError: "Auto-merge status unavailable: Gitea API returned HTTP 500.",
   });
   expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
   gitea.pullFailure = null;
@@ -2442,7 +2460,7 @@ it("schedules and cancels native merge through tea without creating or steering 
 });
 
 it("persists the native merge switch across reloads without rescheduling and clears it on PR closure", async () => {
-  const { host, calls, settle, reopen } = await startAutoFixers();
+  const { host, calls, settle, reopen, gitea } = await startAutoFixers();
   await rpc(host, "setAutoMerge", { ...pr42, enabled: true });
   const restarted = await host.harness.lifecycle.reload(plugin);
   cleanups.push(() => restarted.harness.lifecycle.dispose());
@@ -2451,6 +2469,7 @@ it("persists the native merge switch across reloads without rescheduling and cle
   expect(mine.items.find(item => item.number === 42)?.autoFixer.automation.merge).toBe(true);
   expect(calls.filter(call => call.method === "POST")).toHaveLength(1);
   settle("acme/widgets#42", false);
+  gitea.timelines.get("acme/widgets#42")!.push({ id: 2, type: "close" });
   await expect(autoFixerStatus(restarted)).resolves.toMatchObject({ automation: { merge: false } });
   reopen("acme/widgets#42");
   await expect(autoFixerStatus(restarted)).resolves.toMatchObject({ automation: { merge: false } });
@@ -2468,12 +2487,52 @@ it("keeps a native merge switch on when cancellation fails", async () => {
   await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: false } });
 });
 
-it("keeps a native merge switch cancellable when reading the PR fails", async () => {
+it("reads external native merge changes across timeline pages without scheduling anything", async () => {
+  const { host, gitea, calls } = await startAutoFixers();
+  const events = Array.from({ length: 50 }, (_, index) => ({ id: index + 1, type: "comment" }));
+  events.push({ id: 51, type: "pull_scheduled_merge" });
+  gitea.timelines.set("acme/widgets#42", events);
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: true } });
+  events.push({ id: 52, type: "pull_cancel_scheduled_merge" });
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: false } });
+  events.push({ id: 53, type: "pull_scheduled_merge" });
+  const mine = giteaRpcContract.listMyPullRequests.output.parse(await rpc(host, "listMyPullRequests", { state: "open", query: "" }));
+  expect(mine.items.find(item => item.number === 42)?.autoFixer.automation.merge).toBe(true);
+  expect(calls.every(call => call.method === "GET")).toBe(true);
+  expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+});
+
+it("treats only the specific already-scheduled conflict as success", async () => {
+  const { host, gitea } = await startAutoFixers();
+  gitea.mergeFailure = 409;
+  gitea.mergeMessage = "pull request is already scheduled to auto merge when checks succeed [pull_id: 123]";
+  await expect(rpc(host, "setAutoMerge", { ...pr42, enabled: true })).resolves.toEqual({ ok: true });
+  await expect(rpc(host, "setAutoMerge", { ...pr42, enabled: false })).rejects.toThrow("HTTP 409");
+  gitea.mergeMessage = "head out of date";
+  await expect(rpc(host, "setAutoMerge", { ...pr42, enabled: true })).rejects.toThrow("HTTP 409. head out of date");
+});
+
+it("reports unavailable native merge status instead of off when the timeline fails", async () => {
+  const { host, gitea } = await startAutoFixers();
+  gitea.timelineFailure = 500;
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ mergeError: expect.stringContaining("HTTP 500") });
+});
+
+it("refuses to infer native merge state from a truncated timeline", async () => {
+  const { host, gitea } = await startAutoFixers();
+  gitea.timelines.set("acme/widgets#42", Array.from({ length: 501 }, (_, index) => ({
+    id: index + 1, type: index === 500 ? "pull_cancel_scheduled_merge" : "pull_scheduled_merge",
+  })));
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ mergeError: expect.stringContaining("incomplete") });
+});
+
+it("reports unknown native merge state when reading the PR fails", async () => {
   const { host, gitea } = await startAutoFixers();
   await rpc(host, "setAutoMerge", { ...pr42, enabled: true });
   gitea.pullFailure = 500;
-  await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: true } });
+  await expect(autoFixerStatus(host)).resolves.toMatchObject({ mergeError: expect.stringContaining("unavailable") });
   await rpc(host, "setAutoMerge", { ...pr42, enabled: false });
+  gitea.pullFailure = null;
   await expect(autoFixerStatus(host)).resolves.toMatchObject({ automation: { merge: false } });
 });
 

@@ -146,6 +146,37 @@ it("schedules and cancels a PR merge without calling agent automation", async ()
   expect(slot.rpcCalls.filter(call => call.method === "setAutomation")).toEqual([]);
 });
 
+it.each([true, "unavailable"])("shows the server merge state on first load (%s)", async (state) => {
+  const autoFixer = {
+    ...item.autoFixer,
+    automation: { fix: false, merge: state === true },
+    ...(state === "unavailable" ? { mergeError: "Auto-merge status unavailable: HTTP 500" } : {}),
+  };
+  const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+    rpc: {
+      status: () => ({ state: "connected", login: "dev", account, repos: [] }),
+      getAutoFixerPreferences: () => ({ autoFix: false, execution: {
+        providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", serviceTier: "default",
+      } }),
+      listMyPullRequests: () => ({ ...list, items: [{ ...item, autoFixer }], login: "dev" }),
+      listMyIssues: () => ({ ...list, items: [], login: "dev" }),
+      setAutoMerge: () => ({ ok: true }),
+    },
+  });
+  if (state === true) {
+    const toggle = await screen.findByRole("button", { name: "Auto-merge", pressed: true });
+    expect(slot.rpcCalls.filter(call => call.method === "setAutoMerge")).toHaveLength(0);
+    await act(async () => fireEvent.click(toggle));
+    expect(slot.rpcCalls.filter(call => call.method === "setAutoMerge")).toMatchObject([
+      { input: { repo: item.repo, number: item.number, enabled: false } },
+    ]);
+  } else {
+    const toggle = await screen.findByRole("button", { name: "Auto-merge unavailable" });
+    expect(toggle.hasAttribute("disabled")).toBe(true);
+    expect(toggle.hasAttribute("aria-pressed")).toBe(false);
+  }
+});
+
 it("disables metadata suggestions while the save is pending", async () => {
   let release!: () => void;
   const held = new Promise<void>((resolve) => (release = resolve));

@@ -576,6 +576,12 @@ export function pullCiStatus(combined: Record<string, unknown>): PullStatus {
 
 class GiteaAccessError extends Error {}
 
+class GiteaApiError extends Error {
+  constructor(readonly status: number, readonly detail: string) {
+    super(`Gitea API returned HTTP ${status}.${detail ? ` ${detail}` : ""}`);
+  }
+}
+
 function safeLink(base: URL, value: unknown): string {
   if (typeof value !== "string") return "";
   try {
@@ -1022,8 +1028,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (status === 403 || status === 404)
       throw new GiteaAccessError(`Gitea API returned HTTP ${status}.`);
-    if (status < 200 || status >= 300)
-      throw new Error(`Gitea API returned HTTP ${status}.`);
+    if (status < 200 || status >= 300) {
+      let detail = "";
+      try {
+        detail = text(record(JSON.parse(output.stdout)).message).slice(0, 500);
+      } catch { /* Non-JSON error responses still report their status. */ }
+      throw new GiteaApiError(status, detail);
+    }
     return { kind: "body", body: output.stdout };
   }
 
@@ -2190,23 +2201,29 @@ export default async function plugin(bb: BbPluginApi) {
     view: T,
     repo: string,
     number: number,
-  ): Promise<T> {
-    const key = await displayKey("native-auto-merge", repo, number);
-    // ponytail: saved BB selection; reconcile external changes when Gitea exposes queue state.
-    let merge = (await bb.storage.kv.get<boolean>(key)) === true;
-    if (merge) {
-      const { state } = await readLifecycle(repo, number);
-      if (state === "closed" || state === "merged") {
-        await bb.storage.kv.delete(key);
-        merge = false;
+    lifecycle?: { state: "open" | "closed" | "merged" } | { state: "unknown"; error: string },
+  ): Promise<T & { mergeError?: string }> {
+    let merge = false;
+    try {
+      const fact = lifecycle ?? await readLifecycle(repo, number);
+      if (fact.state === "unknown") throw new Error(fact.error);
+      if (fact.state === "open") {
+        const timeline = await paginated(repoPath(repo, `issues/${number}/timeline`), undefined);
+        if (timeline.truncated) throw new Error("The PR timeline is incomplete; auto-merge status is unknown.");
+        const events = z.array(z.object({ id: z.number().int().positive(), type: z.string() })).parse(timeline.values);
+        // Gitea records scheduling and cancellation transactionally with these events.
+        const latest = events.filter(event => ["pull_scheduled_merge", "pull_cancel_scheduled_merge", "close", "merge_pull"].includes(event.type))
+          .sort((a, b) => b.id - a.id)[0];
+        merge = latest?.type === "pull_scheduled_merge";
       }
+    } catch (error) {
+      return { ...view, automation: { ...view.automation, merge: false }, mergeError: `Auto-merge status unavailable: ${message(error)}` };
     }
     return { ...view, automation: { ...view.automation, merge } };
   }
 
   function setAutoMerge(repo: string, number: number, enabled: boolean) {
     return serialized(repo, number, async () => {
-      const key = await displayKey("native-auto-merge", repo, number);
       const path = repoPath(repo, `pulls/${number}/merge`);
       if (enabled) {
         const pull = record(await api(repoPath(repo, `pulls/${number}`)));
@@ -2220,20 +2237,24 @@ export default async function plugin(bb: BbPluginApi) {
           "merge", "rebase", "rebase-merge", "squash", "fast-forward-only",
         ])
           .parse(repository.default_merge_style);
-        await api(path, {
-          method: "POST",
-          body: {
-            do: style,
-            head_commit_id: head,
-            merge_when_checks_succeed: true,
-            force_merge: false,
-            delete_branch_after_merge: false,
-          },
-        });
+        try {
+          await api(path, {
+            method: "POST",
+            body: {
+              do: style,
+              head_commit_id: head,
+              merge_when_checks_succeed: true,
+              force_merge: false,
+              delete_branch_after_merge: false,
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof GiteaApiError && error.status === 409 &&
+            /^pull request is already scheduled to auto merge when checks succeed \[pull_id: \d+\]$/.test(error.detail))) throw error;
+        }
       } else {
         await api(path, { method: "DELETE" });
       }
-      await bb.storage.kv.set(key, enabled);
       forgetDisplay();
       bb.realtime.publish("auto-fixer-changed", { repo, number });
       return { ok: true as const };
@@ -2307,7 +2328,7 @@ export default async function plugin(bb: BbPluginApi) {
     return withNativeMerge(autoFixerView(session, {
       lifecycle,
       projectId: project?.projectId ?? null,
-    }), repo, number);
+    }), repo, number, lifecycle);
   }
 
   async function withAutoFixers(items: ListItem[]) {
@@ -2323,7 +2344,7 @@ export default async function plugin(bb: BbPluginApi) {
                 projectId: projects.get(repoKey(item.repo)) ?? null,
               }
             : null,
-        ), item.repo, item.number),
+        ), item.repo, item.number, { state: item.state }),
       })),
     );
   }
