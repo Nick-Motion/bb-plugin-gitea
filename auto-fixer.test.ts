@@ -609,6 +609,12 @@ describe("pull change signal", () => {
       token(pull, { ...combined, statuses: [...combined.statuses].reverse() }),
     ).toBe(base);
     expect(
+      token(pull, {
+        ...combined,
+        statuses: [{ context: "other", status: "failure", updated_at: "later" }],
+      }),
+    ).toBe(base);
+    expect(
       token({ ...pull, head: { sha: "c".repeat(40) } }, combined),
     ).not.toBe(base);
     expect(token({ ...pull, review_comments: 2 }, combined)).not.toBe(base);

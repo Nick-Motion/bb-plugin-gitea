@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4 - 2026-11-16
+
+### Fixed
+
+- Keep PR watch tokens stable when individual CI status pages change but the combined state stays the same.
+
 ## 1.1.3 - 2026-10-08
 
 ### Fixed

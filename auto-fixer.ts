@@ -653,7 +653,6 @@ export type PullSignal = {
   comments: number;
   reviewComments: number;
   checks: string;
-  statuses: string[];
 };
 
 function count(value: unknown): number {
@@ -674,7 +673,6 @@ export function pullSignal(pull: unknown, combined: unknown): PullSignal {
   const status = (
     typeof combined === "object" && combined !== null ? combined : {}
   ) as Record<string, unknown>;
-  const statuses = Array.isArray(status.statuses) ? status.statuses : [];
   return {
     lifecycle: parseLifecycle(pull)?.state ?? "unknown",
     head: sha(entry.head),
@@ -684,14 +682,6 @@ export function pullSignal(pull: unknown, combined: unknown): PullSignal {
     comments: count(entry.comments),
     reviewComments: count(entry.review_comments),
     checks: nonEmpty(status.state) ?? "",
-    statuses: statuses
-      .map((raw) => {
-        const item = (
-          typeof raw === "object" && raw !== null ? raw : {}
-        ) as Record<string, unknown>;
-        return `${nonEmpty(item.context) ?? ""}=${nonEmpty(item.status) ?? nonEmpty(item.state) ?? ""}@${nonEmpty(item.updated_at) ?? ""}`;
-      })
-      .sort(),
   };
 }
 
