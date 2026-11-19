@@ -647,7 +647,6 @@ export const pullWatchMaxTimeoutMs = 600_000;
 export type PullSignal = {
   lifecycle: PullLifecycle["state"] | "unknown";
   head: string;
-  base: string;
   mergeable: boolean | null;
   updatedAt: string;
   comments: number;
@@ -665,7 +664,11 @@ function sha(value: unknown): string {
     : "";
 }
 
-/** The cheap change signal for one pull request: its record plus the combined head status. */
+/**
+ * The cheap change signal for one pull request: its record plus the combined head status.
+ * The base branch tip is left out: every merge to the base moves it for every open pull
+ * request, and a base move matters only when it makes a conflict, which `mergeable` shows.
+ */
 export function pullSignal(pull: unknown, combined: unknown): PullSignal {
   const entry = (
     typeof pull === "object" && pull !== null ? pull : {}
@@ -676,7 +679,6 @@ export function pullSignal(pull: unknown, combined: unknown): PullSignal {
   return {
     lifecycle: parseLifecycle(pull)?.state ?? "unknown",
     head: sha(entry.head),
-    base: sha(entry.base),
     mergeable: typeof entry.mergeable === "boolean" ? entry.mergeable : null,
     updatedAt: nonEmpty(entry.updated_at) ?? "",
     comments: count(entry.comments),

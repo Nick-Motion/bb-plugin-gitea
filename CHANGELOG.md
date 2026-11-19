@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.5 - 2026-11-19
+
+### Fixed
+
+- Keep PR watch tokens stable when the base branch moves. A merge to the base no longer wakes every watcher of every open pull request; a base move that makes a conflict still changes the token through mergeability.
+
 ## 1.1.4 - 2026-11-16
 
 ### Fixed

@@ -602,9 +602,12 @@ describe("pull change signal", () => {
   };
   const token = (p: unknown, c: unknown) => signalToken(pullSignal(p, c));
 
-  it("changes with the head, comments, mergeability, or CI and ignores unrelated fields", () => {
+  it("changes with the head, comments, mergeability, or CI and ignores a base move and unrelated fields", () => {
     const base = token(pull, combined);
     expect(token({ ...pull, body: "edited" }, combined)).toBe(base);
+    expect(
+      token({ ...pull, base: { sha: "d".repeat(40) } }, combined),
+    ).toBe(base);
     expect(
       token(pull, { ...combined, statuses: [...combined.statuses].reverse() }),
     ).toBe(base);
